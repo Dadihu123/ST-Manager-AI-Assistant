@@ -164,6 +164,15 @@ def test_collect_variables_only_leaves_task_specific_names_out():
     assert missing <= task_specific
 
 
+def test_card_name_is_omitted_when_empty():
+    """必填变量 `card.name` 缺席时，渲染层才能报出 missing_variable。"""
+    assert 'card.name' not in prompt.card_variables({'description': 'x'})
+    assert prompt.card_variables({'name': 'A'})['card.name'] == 'A'
+
+    result = prompt.render_template('{{ card.name }}', prompt.card_variables({'description': 'x'}))
+    assert result['missing_required'] == ['card.name']
+
+
 def test_collect_variables_merges_extra():
     variables = prompt.collect_variables(card={'name': 'A'}, extra={'user.instruction': '改写'})
     assert variables['user.instruction'] == '改写'

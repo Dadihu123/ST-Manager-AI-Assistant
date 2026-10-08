@@ -66,3 +66,15 @@ def load_backend_package():
         sys.modules.pop(name, None)
         raise
     return module
+
+
+def load_backend_submodule(dotted: str):
+    """在 `load_backend_package()` 之后按点分名导入子模块（`backend.llm` → `'llm'`）。
+
+    与主程序一致：模块名前缀 `st_plugin_<id>`，子模块通过包路径解析，
+    因此插件内部的相对导入（`from .core import ...`）能正常工作。
+    """
+    load_backend_package()
+    import importlib as _importlib  # noqa: PLC0415
+
+    return _importlib.import_module(f'stm_ai_backend.{dotted}')
