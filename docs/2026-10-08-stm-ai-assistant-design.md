@@ -870,3 +870,65 @@ def chat(messages, *, provider: dict, api_key: str, extra_headers: dict | None =
 | 概览渲染链路 | `core/api/v1/cards.py:1745-1748`、`core/data/cache.py:776-788` |
 | 卡片选择集合 | `static/js/state.js:765`、`static/js/components/cardGrid.js:116-120` |
 | 插件目录名约束（目录名 = id） | `core/plugins/manifest.py:359-361` |
+
+---
+
+## 附录 D · P0 实现记录（2026-10-08）
+
+### D.1 交付范围
+
+| 项 | 状态 |
+|---|---|
+| manifest（`api_version=1`、`min_app_version=1.0.0`、job `ai.analyze`、9 项权限） | ✅ |
+| 多 provider 管理（**P0 即落地**，Q4 决策） | ✅ |
+| 提示词子系统（档案 CRUD / 模型匹配 / 破限段字段 / 变量校验 / 渲染预览 / 导入导出 / 重置） | ✅ |
+| `ai.analyze` 作业（概览 + 打标 + 幂等 + 审批 + 应用 + 用量记账） | ✅ |
+| 概览 bridge（Q1 方案 A + 降级路径） | ✅ |
+| 前端（工作台 / 结果与审批 / 档案编辑器 / 设置） | ✅ |
+| CLI（`status` / `profiles` / `preview` / `analyze`） | ✅ |
+| 测试（298 项，含主程序交叉验证） | ✅ |
+| `ai.rewrite` / `ai.translate` / `ai.wi_shrink` | ⏳ P1 / P2 |
+
+### D.2 实现中发现并修正的契约细节
+
+| # | 发现 | 处理 |
+|---|---|---|
+| 1 | `PluginAPI.submit_job` 的 `items` / `payload` 是**关键字限定**参数 | 路由改为 `submit_job(job_type, items=..., payload=...)`；`test_routes.py` 锁死该调用形态（首次实现用了位置参数，被集成测试当场抓出） |
+| 2 | `api.get_job()` 固定分页（`items_limit=200`）且无法翻页，审批写回拿不到全部条目 | `apply` 用**只读** SQL 补齐（`SELECT … FROM plugin_job_items WHERE run_id = ?`；`api.db()` 为 Provisional 且仅 SELECT），单次上限 20000 项 |
+| 3 | `plugin_job_items` 没有 `applied_at` 列，审批幂等无处记账 | 幂等台账落在 `card_meta.applied_runs`（每卡保留最近 20 个 `run_id`），与 §6.2 一致 |
+| 4 | 单项参数在 `item['payload']`（`JobItem = {key, payload, seq}`），不在 item 顶层 | `jobs.analyze_one` 从 `item['payload']` 读 `card_id` / `mode` / `content_hash` |
+| 5 | `card.name` 为空时若照常写入变量表，会静默产出「无名字的分析」 | `card_variables()` 在 name 为空时**省略该键** → 渲染层报 `missing_variable`，且不发起 LLM 调用 |
+| 6 | AI 标签直接调 `apply_tags` 会被标签治理静默拦截（`lock_tag_library` 时未知标签被跳过） | 先与标签库求交：已知标签写卡，未知标签一律转为「新标签建议」；`skipped_unknown` / `skipped_blacklist` 计入 result 的 warnings |
+
+### D.3 与设计文档的偏差
+
+无。第 1–12 部分的契约、数据落点、作业流程、错误码表均按文档实现；§12 的 Q1–Q5 决策全部落地。
+
+### D.4 验证结果
+
+**测试**：`python -m pytest tests -q` → **298 passed**。
+
+| 测试文件 | 覆盖重点 |
+|---|---|
+| `test_tokens.py` / `test_hashing.py` / `test_prompt.py` / `test_profiles.py` / `test_parsing.py` / `test_trimming.py` | 纯函数层；`test_tokens.py` 与主程序 `core/utils/text.py` 的公式逐样本交叉验证 |
+| `test_llm.py`(40) | 出站约束、退避重试、401/403 不重试、取消（含流式中断）、流式累积、畸形响应、usage 估算 |
+| `test_store.py`(45) | 档案 CRUD / 版本递增 / 导入导出 / 重置备份、provider 与密钥隔离、元数据裁剪（条数 + 体积）、建议队列、用量台账、C3 回归 |
+| `test_jobs.py`(31) | auto / review / dry-run 三种写回语义、幂等元数据、失败隔离与连续致命失败中止、取消、标签治理、缺变量不发起调用 |
+| `test_routes.py`(41) | HTTP 端到端（Flask test client）：状态 / 健康 / 卡片 / 档案 / provider / 预览 / 提交 / 读取 / 应用（含陈旧与幂等）/ 取消 / 建议 / 用量 |
+| `test_manifest_contract.py` | manifest 白名单与正则、`import backend` 禁令、core 层零依赖、Q5「只有 summary_bridge 可 import core.*」；并用主程序真实校验器交叉验证 |
+| `test_css_scope.py` | CSS 作用域（主程序真实扫描器交叉验证 + 变异测试 + 变量定义检查 + 调色板类禁令） |
+| `test_module_layout.py` | 模拟主程序 `spec_from_file_location` 加载路径、`register()` 装配、路由唯一性、C3 回归 |
+
+**真实加载验收**（插件复制到 `data/plugins/stm-ai-assistant`，主程序 `registry.load_all()`）：
+
+```
+load summary: {"loaded": ["hello-world", "stm-ai-assistant"], "failed": [], "disabled": []}
+loaded = True · load_error = (空) · warnings = []
+GET /status /health /profiles /providers /cards /usage /suggestions → 全部 200 success=true
+POST /prompt/preview（未知卡片）→ 404 card_unreadable
+POST /jobs/analyze（未配置密钥）→ 409 secret_missing（detail 指明 secret_key）
+GET /profiles/builtin-gpt → 200（id=builtin-gpt, model_match=gpt-*）
+```
+
+**前端**：8 个 ES module 全部通过 `node --check`（按 ESM 解析）。
+
