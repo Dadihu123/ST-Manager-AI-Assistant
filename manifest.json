@@ -1,0 +1,158 @@
+{
+  "id": "stm-ai-assistant",
+  "name": "AI 角色卡分析助手",
+  "version": "0.1.0",
+  "api_version": 1,
+  "author": "ST-Manager",
+  "description": "为角色卡生成概览与标签建议：服务端 LLM 调用、按模型分档的提示词工程、批量作业与逐条审批、幂等跳过与成本记账。",
+  "license": "MIT",
+  "min_app_version": "1.0.0",
+  "backend": {
+    "entry": "backend",
+    "register": "register",
+    "jobs": [
+      "ai.analyze"
+    ],
+    "hooks": []
+  },
+  "frontend": {
+    "entry": "frontend/plugin.js",
+    "styles": [
+      "frontend/plugin.css"
+    ]
+  },
+  "permissions": [
+    "cards.read",
+    "cards.write",
+    "worldbook.read",
+    "worldbook.write",
+    "tags.read",
+    "tags.write",
+    "secrets.read",
+    "network.outbound",
+    "jobs.run"
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "default_profile_id": {
+        "type": "string",
+        "title": "默认提示词档案",
+        "description": "未显式指定时使用的档案 id；留空表示按模型自动匹配。",
+        "default": ""
+      },
+      "max_tags": {
+        "type": "integer",
+        "title": "最大标签数",
+        "default": 8,
+        "minimum": 1,
+        "maximum": 20
+      },
+      "summary_max_chars": {
+        "type": "integer",
+        "title": "概览字数上限",
+        "default": 300,
+        "minimum": 50,
+        "maximum": 2000
+      },
+      "confidence_min": {
+        "type": "number",
+        "title": "标签置信度下限",
+        "default": 0.5,
+        "minimum": 0,
+        "maximum": 1
+      },
+      "batch_size": {
+        "type": "integer",
+        "title": "每批张数",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 50
+      },
+      "concurrency": {
+        "type": "integer",
+        "title": "并发数",
+        "description": "同一作业内的 LLM 并发请求数；过大易触发供应商限流。",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 8
+      },
+      "apply_mode": {
+        "type": "enum",
+        "title": "写回方式",
+        "description": "auto：生成后直接写入；review：逐条人工确认后再应用。",
+        "enum": [
+          "auto",
+          "review"
+        ],
+        "default": "review"
+      },
+      "apply_tags": {
+        "type": "boolean",
+        "title": "自动写入标签",
+        "default": true
+      },
+      "skip_unchanged": {
+        "type": "boolean",
+        "title": "跳过内容未变化的卡片",
+        "default": true
+      },
+      "validation_strict": {
+        "type": "boolean",
+        "title": "严格校验",
+        "description": "开启后，输出未通过格式/字数校验的条目直接判失败，不做挽救。",
+        "default": false
+      },
+      "wi_excerpt_ratio": {
+        "type": "number",
+        "title": "世界书节选预算占比",
+        "default": 0.3,
+        "minimum": 0,
+        "maximum": 1
+      },
+      "wi_keywords": {
+        "type": "string",
+        "title": "世界书高价值关键词",
+        "description": "逗号分隔；条目名命中这些词的 content 优先进入提示词。",
+        "default": "世界观,设定,背景,叙事要求,元数据,规则"
+      },
+      "price_per_1k_prompt": {
+        "type": "number",
+        "title": "每千 prompt token 单价",
+        "description": "用于成本预估，留 0 表示不估算金额。",
+        "default": 0
+      },
+      "price_per_1k_completion": {
+        "type": "number",
+        "title": "每千 completion token 单价",
+        "default": 0
+      },
+      "currency": {
+        "type": "string",
+        "title": "计价货币符号",
+        "default": "CNY"
+      }
+    }
+  },
+  "secret_schema": {
+    "type": "object",
+    "properties": {
+      "api_key": {
+        "type": "string",
+        "title": "默认 Provider 的 API Key",
+        "description": "也可在插件工作台的「Provider」页为每个供应商单独配置。",
+        "secret": true
+      },
+      "base_url": {
+        "type": "string",
+        "title": "默认 Provider 的 API 地址",
+        "default": "https://api.openai.com/v1"
+      },
+      "model": {
+        "type": "string",
+        "title": "默认 Provider 的模型",
+        "default": ""
+      }
+    }
+  }
+}
