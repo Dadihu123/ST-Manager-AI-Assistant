@@ -344,7 +344,11 @@ def build_limits(config, profile) -> dict:
 
 
 def card_variables(card) -> dict:
-    """从 `api.read_card()` 的返回构建 `card.*` 变量。"""
+    """从 `api.read_card()` 的返回构建 `card.*` 变量。
+
+    唯一例外：`card.name` 为空时**不放进变量表**——它是必填变量，缺席会让渲染层
+    报 `missing_variable`，比「用一个空名字去分析」更有意义。
+    """
     block = card_data_block(card) if isinstance(card, dict) else {}
 
     tags = block.get('tags') or []
@@ -355,8 +359,7 @@ def card_variables(card) -> dict:
     greetings = block.get('alternate_greetings') or []
     greeting_count = len(greetings) if isinstance(greetings, list) else 0
 
-    return {
-        'card.name': normalize_text(block.get('name')),
+    variables = {
         'card.description': normalize_text(block.get('description')),
         'card.personality': normalize_text(block.get('personality')),
         'card.scenario': normalize_text(block.get('scenario')),
@@ -369,6 +372,12 @@ def card_variables(card) -> dict:
         'card.tags': tag_text,
         'card.alternate_greetings_count': greeting_count,
     }
+
+    name = normalize_text(block.get('name'))
+    if name:
+        variables['card.name'] = name
+
+    return variables
 
 
 def worldbook_variables(excerpt) -> dict:
