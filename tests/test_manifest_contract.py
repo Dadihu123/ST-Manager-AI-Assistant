@@ -54,9 +54,13 @@ KNOWN_MODES = frozenset({
 MAX_ENTRIES_PER_PLUGIN = 16
 ENTRY_ID_PATTERN = re.compile(r'^[a-z][a-z0-9-]{0,63}$')
 
-# 归属分级（D5）：本插件不在主程序 catalog 里，tier 为 community。
-# community 可用：dock / command / context / settings；不可用：nav / status。
+# 归属分级（D5）：由主程序仓库的 `static/plugins/catalog.json` 决定，manifest 无权声明。
+# 本插件已登记为 official（`catalog.json` 里 `tier: "official"`）。
+# official 可用全部 6 类 kind；若将来降级为 community，则 nav / status 不可用。
+OFFICIAL_ENTRY_KINDS = frozenset({'dock', 'nav', 'settings', 'context', 'command', 'status'})
 COMMUNITY_ENTRY_KINDS = frozenset({'dock', 'command', 'context', 'settings'})
+# 本插件实际使用的 kind（保守集合：即使被降级为 community 也仍然合法）
+USED_ENTRY_KINDS = COMMUNITY_ENTRY_KINDS
 
 PLUGIN_ID_PATTERN = re.compile(r'^[a-z][a-z0-9-]{1,63}$')
 SEMVER_PATTERN = re.compile(r'^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')
@@ -164,13 +168,19 @@ def test_entry_ids_match_pattern_and_are_unique(entries):
     assert len(ids) == len(set(ids)), '入口 id 不得重复'
 
 
-def test_entry_kinds_are_valid_and_allowed_for_community_tier(entries):
-    """D5：本插件 tier 为 community，`nav` / `status` 会被宿主静默忽略 + 记警告。"""
+def test_entry_kinds_are_valid_and_within_community_subset(entries):
+    """D5：kind 必须合法，且只用 community 也允许的那 4 类。
+
+    本插件已登记为 official（可用全部 6 类），但实际只用了
+    `dock` / `context` / `command` / `settings`——这是**刻意**的保守选择：
+    即使将来从 catalog 摘掉（降级为 community），入口也不会被静默忽略。
+    """
     for entry in entries:
         kind = entry.get('kind')
         assert kind in ENTRY_KINDS, kind
-        assert kind in COMMUNITY_ENTRY_KINDS, (
-            f'入口 {entry.get("id")} 使用了 community 不可用的 kind: {kind}'
+        assert kind in USED_ENTRY_KINDS, (
+            f'入口 {entry.get("id")} 使用了 {kind}；'
+            f'本插件只应使用 {sorted(USED_ENTRY_KINDS)}（community 子集）'
         )
 
 
@@ -564,8 +574,13 @@ def test_manifest_passes_main_app_validator():
 
 
 @pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
-def test_entries_pass_tier_filter_for_community():
-    """D5：community tier 过滤后 4 个入口必须全部保留（否则声明了会被静默忽略）。"""
+def test_entries_pass_tier_filter_for_both_tiers():
+    """D5：两种 tier 下 4 个入口都必须全部保留。
+
+    - `official`：本插件在 catalog 里的实际分级（坞默认进槽位）。
+    - `community`：降级后的兜底。本插件刻意只用 community 子集的 kind，
+      所以即使被从 catalog 摘掉，入口也不会被静默忽略。
+    """
     sys.path.insert(0, MAIN_APP_DIR)
     try:
         from core.plugins.manifest import PluginManifest  # noqa: PLC0415
@@ -576,12 +591,34 @@ def test_entries_pass_tier_filter_for_community():
         sys.path.remove(MAIN_APP_DIR)
 
     parsed = PluginManifest.load(ROOT, check_dir_name=False)
-    kept, warnings = apply_tier(parsed.plugin_id, parsed.frontend_entries, tier='community')
-    assert warnings == [], warnings
-    assert len(kept) == len(parsed.frontend_entries)
-    assert {item['id'] for item in kept} == {
-        'workbench', 'analyze-selected', 'open-review', 'assistant-settings',
-    }
+    expected = {'workbench', 'analyze-selected', 'open-review', 'assistant-settings'}
+
+    for tier in ('official', 'community'):
+        kept, warnings = apply_tier(parsed.plugin_id, parsed.frontend_entries, tier=tier)
+        assert warnings == [], f'{tier}: {warnings}'
+        assert len(kept) == len(parsed.frontend_entries), tier
+        assert {item['id'] for item in kept} == expected, tier
+        assert all(item['tier'] == tier for item in kept), tier
+
+
+@pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
+def test_plugin_is_registered_as_official_in_main_app_catalog():
+    """本插件必须在主程序包内 catalog 里登记为 official。
+
+    `tier` 只能由**宿主仓库**的清单决定（manifest 无权声明），所以这条断言
+    是「官方插件」这一事实在插件仓库侧的回归保护：若主程序侧被误删/误改，
+    这里会立刻失败。
+    """
+    catalog_path = os.path.join(MAIN_APP_DIR, 'static', 'plugins', 'catalog.json')
+    if not os.path.isfile(catalog_path):
+        pytest.skip('主程序 catalog.json 不存在')
+
+    with open(catalog_path, 'r', encoding='utf-8') as handle:
+        payload = json.load(handle)
+
+    entries = {item.get('id'): item for item in (payload.get('plugins') or [])}
+    assert 'stm-ai-assistant' in entries, '主程序 catalog 必须登记本插件'
+    assert entries['stm-ai-assistant'].get('tier') == 'official'
 
 
 @pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')

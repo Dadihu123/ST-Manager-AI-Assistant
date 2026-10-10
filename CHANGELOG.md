@@ -21,8 +21,10 @@
   | `open-review` | `command` | 跳到「结果与审批」 | `when: {config: {requireKeys:["default_profile_id"]}}` |
   | `assistant-settings` | `settings` | 设置入口 | — |
 
-  本插件 tier 为 `community`（不在主程序 `catalog.json`），因此**不声明 `nav` / `status`**
-  ——那两类 kind 会被宿主静默忽略并记 warning。
+  本插件已登记为 **`official`**（主程序 `static/plugins/catalog.json`，`tier` 只能由
+  宿主仓库清单决定），因此 dock 入口默认进坞槽位。尽管 official 允许全部 6 类 kind，
+  本插件**刻意只用 community 也允许的 4 类**（`dock` / `context` / `command` /
+  `settings`），不声明 `nav` / `status`——降级后入口也不会被静默忽略。
 
 - **入口不再自绘**：删除可拖拽浮动按钮、`POSITION_KEY` 位置记忆、`clampPos` /
   `restorePos` / `savePos` / `DRAG_THRESHOLD`。坞、命令面板、右键菜单与设置页由宿主渲染。
@@ -98,7 +100,8 @@
   `surface.type` 集合 / 16 项上限 / 无旧三字段）；`when` 表达式校验；
   `when.config.requireKeys` 必须指向已声明的 schema 键；`requires_selection` 必须有
   `disabledHint`；**`entries[].icon` 与 `api.ui.icon()` 引用的宿主图标名全部存在**
-  （问主程序 `core.plugins.icons`）；community tier 过滤后 4 项全保留；
+  （问主程序 `core.plugins.icons`）；official / community 两种 tier 下 4 项全保留
+  （降级兜底）；本插件在主程序 catalog 里确实登记为 `official`；
   manifest 的 `surface.id` 与 `plugin.js` 的 `surfaces.register` 静态对齐；
   前端不得再出现 `api.setFullscreenScrim` / `registerModal` / `createRoot` /
   裸动词别名 / `localStorage` / `position: fixed` / 全局 keydown。
@@ -111,7 +114,7 @@
 - `tests/test_css_scope.py` 删除了 4 条已作废的用例（它们断言
   `body:has(...) .main-container { backdrop-filter: none }` 必须存在——那是旧宿主的
   绕行方案，现已随根因修复一起移除）。
-- 全量：`python -m pytest tests/ -q` → **338 passed**。
+- 全量：`python -m pytest tests/ -q` → **339 passed**。
 - 主程序侧：`tests/test_plugin_manifest.py` + `test_plugin_installer.py` +
   `test_plugin_css_scope.py` → **122 passed**。
 

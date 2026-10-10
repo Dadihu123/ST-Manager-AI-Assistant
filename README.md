@@ -41,8 +41,12 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 | AI 助手：结果与审批 | `command` | 命令面板 | 已配置默认提示词档案 |
 | AI 助手设置 | `settings` | 设置页插件区 | 始终 |
 
-> 本插件的归属分级是 `community`，因此**不声明** `nav` / `status` 入口（那两类 kind 对社区
-> 插件不可用）。community 插件的 dock 入口默认进坞的**溢出菜单**，可在入口总览页固定到坞槽位。
+> 本插件的归属分级是 `official`（登记在主程序 `static/plugins/catalog.json`，`tier` 只能
+> 由宿主仓库清单决定，插件 manifest 无权声明），因此 dock 入口**默认进坞槽位**。
+>
+> 尽管 official 允许全部 6 类 kind，本插件**刻意只使用 community 也允许的 4 类**
+> （`dock` / `context` / `command` / `settings`），不声明 `nav` / `status`——这样即使
+> 将来从 catalog 摘掉而降级，入口也不会被静默忽略。
 >
 > 不可用的入口**可见但置灰**，点击会跳到对应的配置位置，不会无反应。
 
@@ -171,7 +175,7 @@ python app.py plugin stm-ai-assistant analyze Alice.png --apply   # 写回磁盘
 | 现象 | 处理 |
 |---|---|
 | 插件列表显示「加载失败」 | 查看管理界面的 `load_error`；常见原因是 `api_version` 与主程序不匹配（需更新主程序） |
-| 坞里没有「AI 助手」入口 | ① 确认插件已启用且重启过；② community 插件的 dock 入口默认进**溢出菜单**，在入口总览页把它固定到坞槽位；③ 打开控制台看 `[pluginHost]` 日志（样式未通过作用域检查时会被拒绝加载） |
+| 坞里没有「AI 助手」入口 | ① 确认插件已启用且重启过；② 坞槽位上限 8 个、单插件最多 2 个，超额时入口进**溢出菜单**，可在入口总览页固定；③ 打开控制台看 `[pluginHost]` 日志（样式未通过作用域检查时会被拒绝加载） |
 | 点击坞入口没反应 | manifest 的 `surface.id` 与 `plugin.js` 的 `api.surfaces.register()` id 不一致时**不报错且无反应**（本插件统一用 `workbench`）；检查控制台有无 `[surfaceHost] 未注册的 surface` |
 | 命令面板里「结果与审批」是灰的 | 尚未选择默认提示词档案；点它可跳到插件配置区 |
 | 「分析选中的角色卡」是灰的 | 需要切到角色卡视图并至少选中一张卡片 |

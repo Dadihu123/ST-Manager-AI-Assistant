@@ -70,7 +70,7 @@
 | C9 | 数值护栏：单作业 20000 项、单条目结果 256KB（截断并标 `_truncated`）、ui_data 命名空间 256KB（超限整次回滚） | `jobs.py:39`、`job_store` 裁剪、`api.py:46-47`、`api.py:899-906` | 大对象一律落 `api.data_dir()` 下文件；ui_data 只存索引与热缓存，写入前做体积预算 |
 | C10 | CSS 作用域检查为**字符串包含**判定；`@media/@supports/@layer/@container/@keyframes/@font-face` 块内不检查。另有声明层检查（F13/F15）：`position: fixed`、未知令牌无回退、硬编码宿主 sprite、非作用域选择器上的 `!important` 均记 warning | `core/plugins/installer.py:595-640`（作用域）、`installer.py:863-938`（声明层） | 全部选择器以 `.plugin-stm-ai-assistant` 或 `[data-plugin="stm-ai-assistant"]` 开头；**零 `position: fixed`**（层级归宿主容器）；`var(--x)` 无回退时必须在宿主令牌清单内 |
 | C13 | 单插件入口上限 16 项；`entries[].id` 必须匹配 `^[a-z][a-z0-9-]{0,63}$`；`entries[]` 子键是**严格白名单**（多一个键 → 整个插件拒绝加载，不是忽略） | `core/plugins/entries.py:23-36`、`manifest.py:613-628` | 只声明 4 个入口（§8.1）；子键仅用 `KNOWN_ENTRY_KEYS` 内的字段；`tests/test_manifest_contract.py` 复刻白名单做静态自检 |
-| C14 | 归属分级（D5）：`tier_for_plugin('stm-ai-assistant') == 'community'`（不在主程序 `catalog.json` 里）。community 可用 `dock/command/context/settings`；**`nav`/`status` 声明了会被静默忽略 + 记 warning** | `core/plugins/entries.py:55-62,97-102`、`core/plugins/catalog.py` | 不声明 `nav` / `status`。若将来需要侧栏导航项，须先把本插件加进主程序 catalog 并标 `tier: "official"`（`tier` 只能由宿主仓库清单决定，插件 manifest 无权声明） |
+| C14 | 归属分级（D5）：本插件已登记为 **`official`**（主程序 `static/plugins/catalog.json` 里 `tier: "official"`），`tier_for_plugin('stm-ai-assistant') == 'official'`。official 允许全部 6 类 kind；若降级为 `community`，则 `nav`/`status` 会被静默忽略 + 记 warning | `core/plugins/entries.py:55-62,97-102`、`core/plugins/catalog.py:275-304`、`static/plugins/catalog.json` | 尽管 official 允许 6 类，**仍只用 community 也允许的 4 类**（`dock`/`context`/`command`/`settings`）——降级后入口不会被静默忽略。`tier` 只能由宿主仓库清单决定，插件 manifest 无权声明；回归见 `tests/test_manifest_contract.py::test_plugin_is_registered_as_official_in_main_app_catalog` |
 | C15 | 坞按 `<pluginId>:<surface.id ?? entry.id>` 查表；两侧不一致时**点击无反应且不报错** | `static/js/components/entryDock.js:178-187`、`commandPalette.js:202-205`、`pluginSurfaceHost.js:88` | manifest 的 `surface.id` 与 `api.surfaces.register()` 的 id 必须字面一致（本插件统一用 `workbench` / `prompt-preview`）；`tests/test_manifest_contract.py::test_surface_ids_match_frontend_registrations` 做静态对齐 |
 | C16 | 宿主 surface 容器已完成定位、尺寸、滚动、`data-marquee-ignore`、`role="dialog"`/`aria-modal`、焦点陷阱、ESC 关闭；插件**只能**在容器内建 DOM，**不得**设置容器或其祖先的 `position`/`z-index`/`inset`。`mount()` 返回函数时宿主在关闭时调用 | `static/js/pluginSurfaceHost.js:117-200`、`static/css/modules/plugin-surfaces.css` | `mount(container, ctx)` 只往容器里 append；返回值用于摘 DOM；不碰容器样式 |
 | C17 | 宿主 surface 容器**刻意不提供** `backdrop-filter`（Chromium backdrop root 会画出黑块/平坦灰），插件 overlay 上的 `backdrop-filter: blur(5px)` 与 `body:has(...) .main-container { backdrop-filter: none }` 兜底规则都必须删除；`api.setFullscreenScrim()` 也不再需要 | `static/js/pluginSurfaceHost.js:15-17`、`static/css/modules/plugin-surfaces.css:9-15` | 两条规则已删除；插件 CSS 里 `backdrop-filter` 出现次数为 0（`tests/test_css_scope.py` 锁定） |
@@ -674,13 +674,15 @@ def chat(messages, *, provider: dict, api_key: str, extra_headers: dict | None =
 
 | id | kind | label | icon | surface | 条件 | 落地位置 |
 |---|---|---|---|---|---|---|
-| `workbench` | `dock` | AI 助手 | `wand` | `workbench`（panel） | — | 入口坞（community 默认进溢出菜单，用户可固定到坞槽位） |
+| `workbench` | `dock` | AI 助手 | `wand` | `workbench`（panel） | — | 入口坞（official，默认进坞槽位） |
 | `analyze-selected` | `context` | 分析选中的角色卡 | `tags` | `workbench`（panel） | `requires_selection: true`，`when: {mode:["cards"], selection:"any"}`，`disabledHint: 请先在角色卡视图里选中至少一张卡片` | 右键菜单 / 命令面板；未选卡时**可见但置灰** |
 | `open-review` | `command` | AI 助手：结果与审批 | `clipboard` | `workbench`（panel） | `when: {config: {requireKeys:["default_profile_id"]}}`，`disabledHint: 请先在「AI 助手 → 设置」里选择默认提示词档案` | 命令面板；未配档案时置灰，点击跳转到插件配置区 |
 | `assistant-settings` | `settings` | AI 助手设置 | `settings-gear` | `workbench`（panel） | — | 设置页插件区 |
 
-**tier = `community`**（C14）：因此**不声明 `nav` / `status`**——那两类 kind 会被宿主静默
-忽略并记 warning。本插件共 4 项，远低于 16 项上限。
+**tier = `official`**（C14）：登记在主程序 `static/plugins/catalog.json`。
+official 允许全部 6 类 kind，但本插件**刻意只用 community 也允许的 4 类**，
+不声明 `nav` / `status`——这样即使将来从 catalog 摘掉而降级，入口也不会被静默忽略。
+本插件共 4 项，远低于 16 项上限。
 
 四个入口复用同一个 surface（`workbench`），由 `mount(container, ctx)` 按
 `ctx.targetId` 决定落到哪个页签（见 §8.2 的 `tabForTarget`）。
@@ -1034,7 +1036,8 @@ scan_css_scope(frontend/plugin.css, 'stm-ai-assistant')        → []
 scan_css_declarations(frontend/plugin.css, 'stm-ai-assistant') → {}
 PluginManifest.load(插件目录).warnings                          → []
 PluginManifest.load(插件目录).frontend_entries                 → 4 项
-apply_tier(entries, tier='community')                          → 4 项全保留，warnings = []
+apply_tier(entries, tier='official')                            → 4 项全保留，warnings = []
+apply_tier(entries, tier='community')                           → 4 项全保留，warnings = []（降级兜底）
 python -m pytest tests/ -q                                     → 334 passed
 主程序 tests/test_plugin_manifest.py + test_plugin_installer.py
   + test_plugin_css_scope.py                                   → 122 passed
@@ -1055,10 +1058,9 @@ python -m pytest tests/ -q                                     → 334 passed
 
 1. **`api.store.viewState.selectedIds` 仍是 Provisional 耦合**（§8.3 已登记）。
    宿主提供 `api.host.getSelection()` 之类稳定接口后，只改 `frontend/selection.js`。
-2. **社区 tier 的坞行为**：`tier = community` 时坞默认把入口放进**溢出菜单**而非坞槽位
-   （`entryRegistry.js:691-701`）。用户可在入口总览页固定。若希望开箱即进坞，需把本插件
-   加进主程序 `catalog.json` 并标 `tier: "official"`——**那是主程序仓库的改动**，
-   不在本次范围内。
+2. **坞槽位是共享资源**：坞上限 8 个槽位、单插件最多 2 个
+   （`entryRegistry.js:25-26,670-683`）。本插件是 official，默认进坞；槽位被占满时
+   入口退到**溢出菜单**，用户可在入口总览页调整固定顺序。
 3. **`api.ui.badge` 的视觉与原自绘徽章不同**：宿主的 `ui-primitive-badge` 是实心色块，
    旧自绘是描边胶囊。这是「统一到宿主外观」的预期代价（重写文档第 3 节明确要求）。
 4. **端到端手工验收**（重写文档 §5 第 4 条，8 项）尚未执行——需要启动主程序、
@@ -1072,26 +1074,35 @@ python -m pytest tests/ -q                                     → 334 passed
 | 路径 | 支持插件自带图标？ | 实测证据 |
 |---|---|---|
 | **插件资源 URL**（CSS `mask` / `<img>` / 背景图） | ✅ **支持** | `core/plugins/assets.py` 的 `/api/plugins/<id>/assets/<path>` 路由；`ALLOWED_EXTENSIONS` 含 `.svg`。实测：`GET assets/frontend/assets/icon.svg` → `200 image/svg+xml`；`assets/backend/routes.py` → `404`（扩展名白名单 + `is_under_base` 边界检查生效） |
-| **`entries[].icon`**（坞 / 命令面板的图标槽） | ❌ **不支持** | 只吃宿主图标名。实测 `static/js/utils/icons.js:resolveIconUrl('assets/icon.svg')` → **空串**，`uiPrimitives.icon()` 会打上 `is-missing` 并降级为占位图标（不报错，静默降级） |
+| **`entries[].icon`**（坞 / 命令面板的图标槽） | ✅ **支持**（宿主侧已补齐） | 设计文档 2.2 原本就承诺「宿主图标名**或**插件内资源路径（含 `/`）」，但前端 `resolveIconUrl` 早期只实现了前者（对含 `.` 的值返回空串 → 静默降级占位）。现已补齐：`utils/icons.js:resolveIcon()` 三态返回（host / asset / missing），`uiPrimitives.js:icon()` 对资源路径渲染 `<span>` + CSS `mask`，坞 / 命令面板 / 入口总览都传 `pluginId` |
 | **`manifest.icon`**（插件级图标） | ⚠️ 后端下发了，**全仓无渲染者** | `core/plugins/registry.py:84` 把 `manifest.icon` 放进 header，但 `static/`、`templates/` 里没有任何消费者读取它 |
 
 **本插件的选择**：品牌图标（`frontend/assets/icon.svg`，VTracer 生成的图形，
-`fill: currentColor`）走**第一条**——挂在面板状态条左侧的 `.plugin-stm-ai-assistant-glyph`，
+`fill: currentColor`）挂在面板状态条左侧的 `.plugin-stm-ai-assistant-glyph`，
 用 CSS `mask` 抠形、颜色取 `var(--accent-text)`，深浅主题自适应。
-入口图标（坞 / 命令面板）走宿主图标名（`wand` / `tags` / `clipboard` / `settings-gear`）。
-两者互不干扰。
+入口图标（坞 / 命令面板）用宿主图标名（`wand` / `tags` / `clipboard` / `settings-gear`）
+——宿主图标名随主题与禁用态自动变色，且不需要额外资源请求。
+两种写法现在都受支持，选择哪个是视觉/维护权衡，不是能力限制。
 
 **两个易踩的坑**：
 
-1. **`entries[].icon` 写资源路径不会生效**。`core/plugins/manifest.py:_check_entry_icons`
-   的注释说「含 `/` 或 `.` 的取值视为插件自带资源路径，由宿主按 `assets/` 解析」——
-   但**前端没有实现这条分支**（`resolveIconUrl` 直接返回空串）。这是宿主侧
-   文档与实现的不一致，已在本节记录；插件侧不要依赖它。
+1. **`entries[].icon` 写资源路径需要 `pluginId` 才能解析**。资源路径本身不含插件 id，
+   所以宿主渲染侧（坞 / 命令面板 / 入口总览）必须把 `entry.pluginId` 传下去；
+   拿不到 id 时按 `missing` 处理（占位图标），**不会**猜一个 URL。
+   这是宿主侧实现细节，插件作者无需关心——插件只写相对插件根目录的路径即可。
 2. **glyph 不能与徽章同层**。`refreshStatus()` 是「清空后重填」的，若把品牌图标
    放进同一个容器，每次状态刷新都会让图标消失。因此状态条拆成
    `.plugin-stm-ai-assistant-glyph` + `.plugin-stm-ai-assistant-status-badges` 两层，
    `refreshStatus()` 只清后者。回归用例：
    `tests/test_css_scope.py::test_brand_glyph_survives_status_refresh`。
+
+**为什么品牌图标用 `<span>` + mask，而不是 `<use>` 或 `<img>`**：
+
+- 宿主 sprite 是**描边式**（`fill: none; stroke: currentColor`），插件 SVG 是**填充式**
+  （`fill: currentColor`）——混进 `<use>` 会渲染成空图形。
+- `<img>` 里的 SVG 解析不到页面 CSS 变量，`currentColor` 永远是黑色剪影，深浅主题都会瞎。
+
+mask 只取 alpha 形状、颜色由 `background-color: currentColor` 决定，两个问题都没有。
 
 **CSS 合规性**：插件资源 URL 不属于宿主 sprite，因此不会被 F15 的
 `hardcoded_sprite` 误判（`_SPRITE_REFERENCE_PATTERN` 只匹配 `/static/icons/` 与
