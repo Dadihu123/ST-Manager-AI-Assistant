@@ -153,6 +153,38 @@ def test_profiles_export_and_import(env):
     assert len(imported['imported']) == 5
 
 
+def test_profiles_export_single_profile(env):
+    """回归：`/profiles/export?profile_id=` 必须只导出指定的那一个档案。"""
+    client, _api, _store = env
+    exported = client.get('/profiles/export?profile_id=builtin-gpt').get_json()
+
+    assert exported['success'] is True
+    assert len(exported['profiles']) == 1
+    assert exported['profiles'][0]['id'] == 'builtin-gpt'
+
+
+def test_profiles_export_unknown_profile_404(env):
+    client, _api, _store = env
+    response = client.get('/profiles/export?profile_id=does-not-exist')
+    assert response.status_code == 404
+
+
+def test_profiles_active_roundtrip(env):
+    """回归：切换「当前档案」后 `/profiles` 的 active 字段要跟着变。"""
+    client, _api, _store = env
+    assert client.get('/profiles').get_json()['active'] == ''
+
+    saved = client.post('/profiles/active', json={'profile_id': 'builtin-gpt'}).get_json()
+    assert saved['active'] == 'builtin-gpt'
+    assert client.get('/profiles').get_json()['active'] == 'builtin-gpt'
+
+
+def test_profiles_active_rejects_unknown_profile(env):
+    client, _api, _store = env
+    response = client.post('/profiles/active', json={'profile_id': 'nope'})
+    assert response.status_code == 404
+
+
 def test_profiles_reset(env):
     client, _api, _store = env
     profile = client.get('/profiles/builtin-default').get_json()['profile']

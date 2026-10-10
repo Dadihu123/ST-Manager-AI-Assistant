@@ -10,6 +10,7 @@ import {
   button,
   checkbox,
   clear,
+  destroySelects,
   el,
   field,
   formatCost,
@@ -400,13 +401,8 @@ export function createWorkbench(api, client, context) {
         || (state.providers.find((item) => item.is_default) || {}).id
         || '';
       context.providerId = current;
-      clear(providerSelect);
-      options.forEach((option) => {
-        const node = el('option', '', option.label);
-        node.value = option.value;
-        node.selected = option.value === current;
-        providerSelect.append(node);
-      });
+      providerSelect.setOptions(options);
+      providerSelect.value = current;
       syncProvider();
     } catch (error) {
       api.toast(`读取 provider 失败：${error.message}`, 3200, 'close');
@@ -423,13 +419,8 @@ export function createWorkbench(api, client, context) {
       });
       const current = context.profileId || data.active || '';
       context.profileId = current;
-      clear(profileSelect);
-      options.forEach((option) => {
-        const node = el('option', '', option.label);
-        node.value = option.value;
-        node.selected = option.value === current;
-        profileSelect.append(node);
-      });
+      profileSelect.setOptions(options);
+      profileSelect.value = current;
     } catch (error) {
       api.toast(`读取档案失败：${error.message}`, 3200, 'close');
     }
@@ -441,6 +432,7 @@ export function createWorkbench(api, client, context) {
 
   function destroy() {
     if (state.stopSubscribe) state.stopSubscribe();
+    destroySelects(optionsGrid);
   }
 
   return { element: root, refresh, destroy };

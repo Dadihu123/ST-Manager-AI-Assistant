@@ -14,6 +14,7 @@ import {
   field,
   formatTime,
   input,
+  numberInput,
   section,
   select,
   textarea,
@@ -26,13 +27,27 @@ const MISSING_POLICIES = [
 
 export function createProfiles(api, client, context) {
   const root = el('div', 'plugin-stm-ai-assistant-view');
-  const state = { list: [], current: null, isNew: false, variables: [] };
+  const state = {
+    list: [],
+    current: null,
+    isNew: false,
+    variables: [],
+    activeId: '',
+  };
 
-  const listSection = section('提示词档案', '按模型匹配（通配或前缀），优先级越高越优先。');
+  const listSection = section('提示词档案', '按模型匹配（通配或前缀），优先级越高越优先。点击条目即可切换编辑对象。');
   const listBox = el('div', 'plugin-stm-ai-assistant-profile-list');
   const listActions = el('div', 'plugin-stm-ai-assistant-row');
   const editorBox = el('div', 'plugin-stm-ai-assistant-profile-editor');
   const variableHint = el('p', 'plugin-stm-ai-assistant-hint');
+  let editorControls = [];
+
+  function destroyEditorControls() {
+    editorControls.forEach((control) => {
+      if (control && typeof control.destroy === 'function') control.destroy();
+    });
+    editorControls = [];
+  }
 
   listActions.append(
     button('新建档案', 'is-secondary', () => newProfile()),
@@ -56,23 +71,56 @@ export function createProfiles(api, client, context) {
     state.list.forEach((entry) => {
       const item = entry.index || entry;
       const row = el('div', 'plugin-stm-ai-assistant-profile-item');
-      const active = state.current && state.current.id === item.id;
-      if (active) row.classList.add('is-active');
+      const editing = state.current && state.current.id === item.id;
+      const isActive = state.activeId === item.id;
+      if (editing) row.classList.add('is-active');
+      if (isActive) row.classList.add('is-current');
+      row.tabIndex = 0;
+      row.setAttribute('role', 'button');
+      row.setAttribute('aria-pressed', editing ? 'true' : 'false');
+      row.title = '点击切换编辑对象';
 
-      row.append(
-        badge(item.id, item.builtin ? 'is-muted' : 'is-ok'),
+      const tags = el('span', 'plugin-stm-ai-assistant-profile-tags');
+      tags.append(badge(item.id, item.builtin ? 'is-muted' : 'is-ok'));
+      if (isActive) tags.append(badge('当前使用', 'is-ok'));
+
+      const main = el('div', 'plugin-stm-ai-assistant-profile-main');
+      main.append(
         el('span', 'plugin-stm-ai-assistant-profile-name', item.name),
         el('span', 'plugin-stm-ai-assistant-hint',
           `${item.model_match} · 优先级 ${item.priority} · v${item.version}`),
       );
+      main.append(tags);
 
-      const actions = el('div', 'plugin-stm-ai-assistant-row');
+      const actions = el('div', 'plugin-stm-ai-assistant-row plugin-stm-ai-assistant-profile-actions');
+      if (!isActive) {
+        actions.append(button('设为当前', 'is-secondary', () => setActiveProfile(item.id)));
+      }
       actions.append(
         button('编辑', 'is-secondary', () => openProfile(item.id)),
+        button('导出', 'is-secondary', () => exportProfiles(item.id)),
         button('复制', 'is-secondary', () => duplicateProfile(item.id)),
         button('删除', 'is-danger', () => deleteProfile(item)),
       );
-      row.append(actions);
+
+      row.append(main, actions);
+
+      // 整行可点：点空白处即切换编辑对象（按钮自身的事件优先，不冒泡处理）
+      const selectRow = (event) => {
+        if (event && event.target && event.target.closest
+          && event.target.closest('button, input, select, textarea, a')) {
+          return;
+        }
+        openProfile(item.id);
+      };
+      row.addEventListener('click', selectRow);
+      row.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          openProfile(item.id);
+        }
+      });
+
       listBox.append(row);
     });
   }
@@ -113,6 +161,7 @@ export function createProfiles(api, client, context) {
       max_tokens: 2048,
       extra_body: {},
     };
+    renderList();
     renderEditor();
   }
 
@@ -121,13 +170,29 @@ export function createProfiles(api, client, context) {
       const data = await client.profile(profileId);
       state.current = data.profile;
       state.isNew = false;
+      // 关键：立刻重绘列表，否则高亮要等下一次切页签才更新
+      renderList();
       renderEditor();
     } catch (error) {
       api.toast(`读取档案失败：${error.message}`, 3600, 'close');
     }
   }
 
+  /** 把某个档案设为「当前使用」（写入 ui_data.active_profile_id）。 */
+  async function setActiveProfile(profileId) {
+    try {
+      await client.setActiveProfile(profileId);
+      state.activeId = profileId;
+      context.profileId = profileId;
+      api.toast(`当前档案已切换为 ${profileId}`, 2600, 'check');
+      renderList();
+    } catch (error) {
+      api.toast(`切换失败：${error.message}`, 3600, 'close');
+    }
+  }
+
   function renderEditor() {
+    destroyEditorControls();
     clear(editorBox);
     if (!state.current) {
       editorBox.append(el('p', 'plugin-stm-ai-assistant-hint', '选择左侧档案开始编辑，或新建一个。'));
@@ -141,8 +206,9 @@ export function createProfiles(api, client, context) {
     fields.id = input(profile.id, 'text', '小写字母、数字与连字符');
     fields.name = input(profile.name);
     fields.model_match = input(profile.model_match, 'text', '如 gpt-* / deepseek-* / *');
-    fields.priority = input(profile.priority, 'number');
+    fields.priority = numberInput(profile.priority, { step: 1 });
     fields.missing_policy = select(MISSING_POLICIES, profile.missing_policy);
+    editorControls = [fields.missing_policy];
 
     basicGrid.append(
       field('id', fields.id, '内置档案的 id 不可更改（改了等于新建）'),
@@ -179,14 +245,14 @@ export function createProfiles(api, client, context) {
     fields.strip_think = checkbox(formatRules.strip_think !== false, '剥离思考段');
     fields.wrappers = input((formatRules.forbidden_wrappers || []).join(','), 'text', '逗号分隔');
     fields.required_keys = input((formatRules.required_keys || []).join(','), 'text', '逗号分隔');
-    fields.summary_min = input(lengthRules.summary_min_chars, 'number');
-    fields.summary_max = input(lengthRules.summary_max_chars, 'number');
-    fields.tags_min = input(lengthRules.tags_min, 'number');
-    fields.tags_max = input(lengthRules.tags_max, 'number');
-    fields.confidence = input(lengthRules.confidence_min, 'number');
-    fields.temperature = input(profile.temperature, 'number');
-    fields.top_p = input(profile.top_p, 'number');
-    fields.max_tokens = input(profile.max_tokens, 'number');
+    fields.summary_min = numberInput(lengthRules.summary_min_chars, { min: 0, step: 1 });
+    fields.summary_max = numberInput(lengthRules.summary_max_chars, { min: 0, step: 1 });
+    fields.tags_min = numberInput(lengthRules.tags_min, { min: 0, step: 1 });
+    fields.tags_max = numberInput(lengthRules.tags_max, { min: 0, step: 1 });
+    fields.confidence = numberInput(lengthRules.confidence_min, { min: 0, max: 1, step: 0.05 });
+    fields.temperature = numberInput(profile.temperature, { min: 0, max: 2, step: 0.05 });
+    fields.top_p = numberInput(profile.top_p, { min: 0, max: 1, step: 0.05 });
+    fields.max_tokens = numberInput(profile.max_tokens, { min: 1, step: 1 });
     fields.stop = textarea((profile.stop || []).join('\n'), 3);
     fields.extra_body = textarea(JSON.stringify(profile.extra_body || {}, null, 2), 4);
 
@@ -235,7 +301,7 @@ export function createProfiles(api, client, context) {
     profile.id = fields.id.value.trim().toLowerCase();
     profile.name = fields.name.value.trim();
     profile.model_match = fields.model_match.value.trim() || '*';
-    profile.priority = Number(fields.priority.value) || 0;
+    profile.priority = Number(fields.priority.querySelector('input').value) || 0;
     profile.missing_policy = fields.missing_policy.value;
 
     profile.system_prelude = fields.system_prelude.value;
@@ -254,16 +320,16 @@ export function createProfiles(api, client, context) {
     };
 
     profile.length_rules = {
-      summary_min_chars: Number(fields.summary_min.value) || 0,
-      summary_max_chars: Number(fields.summary_max.value) || 300,
-      tags_min: Number(fields.tags_min.value) || 0,
-      tags_max: Number(fields.tags_max.value) || 8,
-      confidence_min: Number(fields.confidence.value) || 0,
+      summary_min_chars: Number(fields.summary_min.querySelector('input').value) || 0,
+      summary_max_chars: Number(fields.summary_max.querySelector('input').value) || 300,
+      tags_min: Number(fields.tags_min.querySelector('input').value) || 0,
+      tags_max: Number(fields.tags_max.querySelector('input').value) || 8,
+      confidence_min: Number(fields.confidence.querySelector('input').value) || 0,
     };
 
-    profile.temperature = Number(fields.temperature.value);
-    profile.top_p = Number(fields.top_p.value);
-    profile.max_tokens = Number(fields.max_tokens.value) || 2048;
+    profile.temperature = Number(fields.temperature.querySelector('input').value);
+    profile.top_p = Number(fields.top_p.querySelector('input').value);
+    profile.max_tokens = Number(fields.max_tokens.querySelector('input').value) || 2048;
     profile.stop = fields.stop.value.split('\n').map((item) => item.trim()).filter(Boolean);
 
     try {
@@ -364,6 +430,7 @@ export function createProfiles(api, client, context) {
       const data = await client.deleteProfile(item.id);
       api.toast(data.message || '已删除', 2400, 'check');
       if (state.current && state.current.id === item.id) state.current = null;
+      if (state.activeId === item.id) state.activeId = '';
       await load();
       renderEditor();
     } catch (error) {
@@ -371,18 +438,27 @@ export function createProfiles(api, client, context) {
     }
   }
 
-  async function exportProfiles() {
+  /**
+   * 导出档案。
+   * @param {string} [profileId] 省略时导出全部；给出时只导出该档案。
+   */
+  async function exportProfiles(profileId) {
+    const target = String(profileId || '').trim();
     try {
-      const data = await client.exportProfiles();
+      const data = await client.exportProfiles(target);
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = 'stm-ai-assistant-profiles.json';
+      link.download = target
+        ? `stm-ai-assistant-profile-${target}.json`
+        : 'stm-ai-assistant-profiles.json';
       document.body.append(link);
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
+      const count = (data.profiles || []).length;
+      api.toast(target ? `已导出档案 ${target}` : `已导出全部 ${count} 个档案`, 2600, 'check');
     } catch (error) {
       api.toast(`导出失败：${error.message}`, 3600, 'close');
     }
@@ -421,6 +497,8 @@ export function createProfiles(api, client, context) {
     try {
       const data = await client.profiles();
       state.list = data.items || [];
+      state.activeId = String(data.active || '');
+      if (!context.profileId) context.profileId = state.activeId;
     } catch (error) {
       api.toast(`读取档案失败：${error.message}`, 3600, 'close');
       state.list = [];
@@ -432,12 +510,20 @@ export function createProfiles(api, client, context) {
     element: root,
     refresh: async () => {
       await load();
+      if (state.current && state.current.id
+        && !state.list.some((entry) => (entry.index || entry).id === state.current.id)) {
+        // 当前编辑的档案已被删除 / 重置
+        state.current = null;
+      }
       if (!state.current && state.list.length) {
         await openProfile((state.list[0].index || state.list[0]).id);
       } else {
+        renderList();
         renderEditor();
       }
     },
-    destroy: () => {},
+    destroy: () => {
+      destroyEditorControls();
+    },
   };
 }

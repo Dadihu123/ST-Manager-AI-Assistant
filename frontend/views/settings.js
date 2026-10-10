@@ -15,6 +15,7 @@ import {
   formatNumber,
   formatTime,
   input,
+  numberInput,
   section,
   select,
   textarea,
@@ -49,6 +50,14 @@ export function createSettings(api, client, context) {
   const providerSection = section('Provider', '每个供应商可配置独立的地址、模型与密钥；密钥存在主程序的 secrets.json（不回显）。');
   const providerList = el('div', 'plugin-stm-ai-assistant-provider-list');
   const providerEditor = el('div', 'plugin-stm-ai-assistant-provider-editor');
+  let editorControls = [];
+
+  function destroyEditorControls() {
+    editorControls.forEach((control) => {
+      if (control && typeof control.destroy === 'function') control.destroy();
+    });
+    editorControls = [];
+  }
 
   const usageSection = section('用量台账');
   const usageBox = el('div', 'plugin-stm-ai-assistant-usage');
@@ -120,6 +129,7 @@ export function createSettings(api, client, context) {
   }
 
   function renderEditor() {
+    destroyEditorControls();
     clear(providerEditor);
     if (!state.editing) return;
 
@@ -132,9 +142,10 @@ export function createSettings(api, client, context) {
     fields.base_url = input(draft.base_url, 'text', '不含 /chat/completions');
     fields.model = input(draft.model, 'text', '如 gpt-4o-mini / deepseek-chat');
     fields.api_style = select(API_STYLES, draft.api_style);
-    fields.connect_timeout = input(draft.connect_timeout, 'number');
-    fields.request_timeout = input(draft.request_timeout, 'number');
-    fields.max_retries = input(draft.max_retries, 'number');
+    editorControls = [fields.api_style];
+    fields.connect_timeout = numberInput(draft.connect_timeout, { min: 1, step: 1 });
+    fields.request_timeout = numberInput(draft.request_timeout, { min: 1, step: 1 });
+    fields.max_retries = numberInput(draft.max_retries, { min: 0, step: 1 });
 
     grid.append(
       field('id', fields.id),
@@ -189,9 +200,9 @@ export function createSettings(api, client, context) {
       base_url: fields.base_url.value.trim(),
       model: fields.model.value.trim(),
       api_style: fields.api_style.value,
-      connect_timeout: Number(fields.connect_timeout.value) || 10,
-      request_timeout: Number(fields.request_timeout.value) || 120,
-      max_retries: Number(fields.max_retries.value) || 0,
+      connect_timeout: Number(fields.connect_timeout.querySelector('input').value) || 10,
+      request_timeout: Number(fields.request_timeout.querySelector('input').value) || 120,
+      max_retries: Number(fields.max_retries.querySelector('input').value) || 0,
       use_stream: fields.use_stream.querySelector('input').checked,
       allow_local: fields.allow_local.querySelector('input').checked,
       enabled: fields.enabled.querySelector('input').checked,
@@ -338,5 +349,9 @@ export function createSettings(api, client, context) {
     }
   }
 
-  return { element: root, refresh: load, destroy: () => {} };
+  return {
+    element: root,
+    refresh: load,
+    destroy: destroyEditorControls,
+  };
 }

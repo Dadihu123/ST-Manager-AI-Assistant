@@ -6,6 +6,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.superdesign/
+design/
 venv/
 
 # 编辑器 / 系统

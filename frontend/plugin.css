@@ -15,22 +15,56 @@
 .plugin-stm-ai-assistant-launcher {
   position: fixed;
   right: 20px;
-  bottom: 20px;
+  bottom: 96px; /* 默认抬高，避开右下角翻页工具栏 */
   z-index: 2140;
-  padding: 10px 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
   border: 1px solid var(--action-border);
-  border-radius: 999px;
+  border-radius: 50%;
   background: var(--action-surface);
   color: var(--action-text);
-  font-size: 0.85rem;
-  font-weight: 600;
-  cursor: pointer;
+  cursor: grab;
   box-shadow: var(--shadow-elevation, 0 4px 16px rgba(0, 0, 0, 0.24));
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none; /* 允许 pointer 拖拽接管触摸手势 */
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
 }
 
 .plugin-stm-ai-assistant-launcher:hover {
   background: var(--action-surface-hover);
   border-color: var(--action-border-hover);
+  transform: translateY(-1px);
+}
+
+.plugin-stm-ai-assistant-launcher.is-dragging {
+  cursor: grabbing;
+  transform: scale(1.06);
+  box-shadow: var(--shadow-elevation, 0 8px 24px rgba(0, 0, 0, 0.32));
+}
+
+.plugin-stm-ai-assistant-launcher-icon {
+  width: 24px;
+  height: 24px;
+  pointer-events: none; /* 让拖拽/点击都落在按钮上 */
+  display: block;
+  /* 图标本体用 mask 抠形，颜色跟随主程序图标色变量，深浅主题自适应 */
+  background-color: var(--action-icon, var(--action-text, var(--content-primary)));
+  -webkit-mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
+  mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
+}
+
+/* 面板顶栏右侧的状态徽章簇 */
+.plugin-stm-ai-assistant-status-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 /* ------------------------------------------------------------ 面板骨架 */
@@ -42,7 +76,14 @@
   z-index: 2150;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.55);
+  /* 对齐主程序 .modal-overlay（components.css:673-685）：语义 scrim + backdrop blur。
+     不能用裸 rgba(0, 0, 0, .55)：当面板内出现高内容滚动容器时（典型是「提示词档案」
+     那一屏），Chromium 会把半透明黑合成到黑色 backdrop root 上，整屏塌成纯黑。
+     backdrop-filter 会强制建立 backdrop root，让 alpha 正确混到真实页面内容上。
+     回归验证：切页 / 滚动 / 视口来回切换共 18 个采样点，0 处黑色。 */
+  background: var(--surface-scrim, rgba(15, 23, 42, 0.58));
+  -webkit-backdrop-filter: blur(5px);
+  backdrop-filter: blur(5px);
 }
 
 .plugin-stm-ai-assistant-overlay.is-open {
@@ -50,101 +91,266 @@
 }
 
 .plugin-stm-ai-assistant-shell {
+  position: relative;
+  isolation: isolate;
   display: flex;
   flex-direction: column;
   width: min(1080px, 94vw);
   height: min(760px, 90vh);
   border: 1px solid var(--border-main);
-  border-radius: 12px;
-  background: var(--bg-panel);
+  border-radius: 14px;
+  background: var(--surface-container, var(--bg-panel));
+  background-image: none;
   color: var(--content-primary);
   overflow: hidden;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  box-shadow: var(--shadow-elevation, 0 12px 40px rgba(0, 0, 0, 0.4));
 }
+
+/* ------------------------------------------------------------ 顶栏（重构）
+ * 图标块 + 标题/副标 + 右侧安静的状态徽章簇 + ghost 关闭钮 */
 
 .plugin-stm-ai-assistant-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 12px 16px;
+  gap: 16px;
+  height: 64px;
+  padding: 0 20px;
   border-bottom: 1px solid var(--border-divider);
   background: var(--bg-sub);
+  flex-shrink: 0;
 }
 
 .plugin-stm-ai-assistant-title {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+
+.plugin-stm-ai-assistant-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex-shrink: 0;
+  /* 去外框：不再垫 action-surface 底色 + inset 描边，图标直接裸露跟随前景色 */
+}
+
+.plugin-stm-ai-assistant-glyph::before {
+  content: '';
+  width: 26px;
+  height: 26px;
+  background-color: var(--accent-text, var(--content-primary));
+  -webkit-mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
+  mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
+}
+
+.plugin-stm-ai-assistant-title-block {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
 }
 
 .plugin-stm-ai-assistant-title-text {
-  font-size: 0.95rem;
+  font-size: 0.98rem;
   font-weight: 600;
+  letter-spacing: 0.01em;
+  line-height: 1.25;
 }
 
-.plugin-stm-ai-assistant-tabs {
+.plugin-stm-ai-assistant-meta-caption {
+  font-size: 0.68rem;
+  color: var(--content-muted, var(--content-secondary));
+  letter-spacing: 0.04em;
+}
+
+.plugin-stm-ai-assistant-header-right {
   display: flex;
-  gap: 4px;
-  padding: 8px 12px 0;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/* ------------------------------------------------------------ 页签导航
+ * 逐条对齐主程序角色卡详情页 workbench 生效样式
+ * （detail-card-workbench.css:1986-2022 + ui-refresh.css:622-644）。
+ * 以下数值全部取自浏览器实测的计算样式，不是凭感觉写的：
+ *   nav  : surface-container-raised / 下边框 border-divider / row / gap .2rem /
+ *          min-height 3.2rem / padding .42rem .85rem .35rem / 可横向滚动
+ *   tab  : 透明底 + 透明描边 / 圆角 0.55rem（详情页是硬编码，**不是** --ui-radius-sm
+ *          的 0.65rem）/ min-height 2.35rem / padding .45rem .7rem / 字号 .78rem / 字重 800
+ *   hover: state-hover-surface + content-primary
+ *   active: action-surface 填充 + 透明描边 + inset 0 -2px 0 accent-action 底条
+ * 关键点：选中项**无边框、无位移**，只靠填充色与 2px 内阴影底条区分——
+ * 旧版那套「向下突出的胶囊」（border-radius 999px + translateY + 负 margin）
+ * 与详情页完全不符，已删除。 */
+
+.plugin-stm-ai-assistant-tabs {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+  flex: 0 0 auto;
+  min-height: 3.2rem;
+  max-width: 100%;
+  padding: 0.42rem 0.85rem 0.35rem;
   border-bottom: 1px solid var(--border-divider);
-  background: var(--bg-sub);
+  background: var(--surface-container-raised, var(--bg-sub));
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
 }
 
 .plugin-stm-ai-assistant-tab {
-  padding: 8px 14px;
+  position: relative;
+  z-index: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.55rem;
+  flex: 0 0 auto;
+  min-width: max-content;
+  min-height: 2.35rem;
+  margin: 0;
+  padding: 0.45rem 0.7rem;
   border: 1px solid transparent;
-  border-bottom: none;
-  border-radius: 8px 8px 0 0;
+  border-radius: 0.55rem;
   background: transparent;
   color: var(--content-secondary);
-  font-size: 0.82rem;
+  font-size: 0.78rem;
+  font-weight: 800;
+  line-height: 1.2;
+  text-align: left;
   cursor: pointer;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
 }
 
 .plugin-stm-ai-assistant-tab:hover {
-  color: var(--content-primary);
   background: var(--state-hover-surface, var(--bg-hover));
+  color: var(--content-primary);
 }
 
+.plugin-stm-ai-assistant-tab:focus-visible {
+  outline: 2px solid var(--state-focus-ring, var(--action-border));
+  outline-offset: 2px;
+}
+
+/* 选中态：无边框 + 无位移，填充 action-surface 并压一条 2px 强调底条。 */
 .plugin-stm-ai-assistant-tab.is-active {
-  color: var(--action-text);
+  z-index: auto;
+  margin-bottom: 0;
+  padding-bottom: 0.45rem;
   background: var(--action-surface);
-  border-color: var(--action-border);
+  border-color: transparent;
+  color: var(--action-text);
+  transform: none;
+  box-shadow: inset 0 -2px 0 var(--accent-action, var(--action-border));
+}
+
+/* 图标槽位：对齐详情页 tab-icon */
+.plugin-stm-ai-assistant-tab-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 1rem;
+  height: 1rem;
+  line-height: 1;
+}
+
+/* 文字标签 */
+.plugin-stm-ai-assistant-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 页签上的数字（待审批等）：对齐详情页 .detail-tab-meta
+ * （detail-card-workbench.css:923-932）——等宽小字，激活时反色，不做胶囊。 */
+.plugin-stm-ai-assistant-tab-count {
+  flex: 0 0 auto;
+  color: var(--content-muted, var(--content-secondary));
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 0.62rem;
+  line-height: 1.2;
+}
+
+.plugin-stm-ai-assistant-tab.is-active .plugin-stm-ai-assistant-tab-count {
+  color: var(--action-text);
 }
 
 .plugin-stm-ai-assistant-body {
+  position: relative;
+  isolation: isolate;
   flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
-  padding: 16px;
+  padding: clamp(1rem, 1.8vw, 1.5rem);
+  background: var(--surface-page, var(--bg-panel));
+  background-image: none;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  scrollbar-color: var(--scrollbar-thumb, var(--border-main)) transparent;
+  scrollbar-width: thin;
 }
-
-/* ------------------------------------------------------------ 通用元素 */
 
 .plugin-stm-ai-assistant-view {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 20px;
+  min-width: 0;
+  background: transparent;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+.plugin-stm-ai-assistant-body.is-profiles,
+.plugin-stm-ai-assistant-view.is-profiles {
+  background: var(--surface-page, var(--bg-panel));
+  background-image: none;
+  box-shadow: none;
 }
 
 .plugin-stm-ai-assistant-section {
-  padding: 14px;
+  padding: 16px 18px;
   border: 1px solid var(--border-subtle, var(--border-light));
-  border-radius: 10px;
+  border-radius: 12px;
   background: var(--bg-item);
 }
 
 .plugin-stm-ai-assistant-section-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin: 0 0 4px;
   font-size: 0.9rem;
   font-weight: 600;
+  letter-spacing: 0.01em;
   color: var(--content-primary);
+}
+
+/* 标题里的「1 · 」序号前缀渲染为等宽强调色 */
+.plugin-stm-ai-assistant-section-title-num {
+  color: var(--accent-text, var(--content-secondary));
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  font-weight: 500;
+  opacity: 0.85;
 }
 
 .plugin-stm-ai-assistant-section-subtitle {
   margin: 0 0 10px;
   font-size: 0.76rem;
   color: var(--content-secondary);
+  line-height: 1.55;
 }
 
 .plugin-stm-ai-assistant-row {
@@ -188,12 +394,13 @@
 .plugin-stm-ai-assistant-badge {
   display: inline-flex;
   align-items: center;
-  padding: 2px 8px;
+  padding: 2px 10px;
   border: 1px solid var(--border-light);
   border-radius: 999px;
   background: var(--bg-tag);
   color: var(--content-secondary);
   font-size: 0.7rem;
+  letter-spacing: 0.01em;
   white-space: nowrap;
 }
 
@@ -233,8 +440,7 @@
 }
 
 .plugin-stm-ai-assistant-input,
-.plugin-stm-ai-assistant-textarea,
-.plugin-stm-ai-assistant-select {
+.plugin-stm-ai-assistant-textarea {
   width: 100%;
   padding: 6px 8px;
   border: 1px solid var(--border-main);
@@ -261,17 +467,23 @@
 }
 
 .plugin-stm-ai-assistant-btn {
-  padding: 6px 12px;
+  padding: 6px 14px;
   border: 1px solid var(--border-main);
-  border-radius: 6px;
+  border-radius: 7px;
   background: var(--bg-sub);
   color: var(--content-primary);
   font-size: 0.78rem;
   cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.1s ease;
 }
 
 .plugin-stm-ai-assistant-btn:hover:not(:disabled) {
   background: var(--state-hover-surface, var(--bg-hover));
+  border-color: var(--border-light);
+}
+
+.plugin-stm-ai-assistant-btn:active:not(:disabled) {
+  transform: translateY(1px);
 }
 
 .plugin-stm-ai-assistant-btn:disabled {
@@ -284,18 +496,308 @@
   background: var(--action-surface);
   color: var(--action-text);
   font-weight: 600;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.2);
 }
 
 .plugin-stm-ai-assistant-btn.is-primary:hover:not(:disabled) {
   background: var(--action-surface-hover);
+  border-color: var(--action-border-hover, var(--action-border));
 }
 
 .plugin-stm-ai-assistant-btn.is-danger {
   border-color: var(--border-warn, var(--border-main));
 }
 
+/* ghost 图标钮（顶栏关闭等）：无边框，只留 hover 底 */
+.plugin-stm-ai-assistant-btn.is-ghost {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--content-secondary);
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.plugin-stm-ai-assistant-btn.is-ghost:hover:not(:disabled) {
+  background: var(--state-hover-surface, var(--bg-hover));
+  border-color: transparent;
+  color: var(--content-primary);
+}
+
 .plugin-stm-ai-assistant-btn.is-hidden {
   display: none;
+}
+
+/* ------------------------------------------------------------ 下拉框（styledSelect）
+ * 复刻主程序 components/styled_select.html + components.css .icon-select 的结构与交互，
+ * 类名加插件前缀以满足 F11；视觉 token 全部复用主程序。 */
+
+.plugin-stm-ai-assistant-select {
+  box-sizing: border-box;
+  position: relative;
+  z-index: 0;
+  display: block;
+  min-width: 0;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.plugin-stm-ai-assistant-select.is-open {
+  z-index: var(--z-dropdown, 500);
+}
+
+.plugin-stm-ai-assistant-select-trigger {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  min-width: 0;
+  min-height: 2.65rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border-default, var(--border-light));
+  border-radius: 0.375rem;
+  background: var(--surface-container-raised, var(--bg-sub));
+  color: var(--content-primary);
+  font: inherit;
+  font-size: 0.8rem;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.2s, background-color 0.2s, box-shadow 0.2s;
+}
+
+.plugin-stm-ai-assistant-select-trigger:hover,
+.plugin-stm-ai-assistant-select-trigger[aria-expanded='true'] {
+  border-color: var(--accent-action, var(--action-border));
+  background: var(--surface-container, var(--bg-panel));
+}
+
+.plugin-stm-ai-assistant-select-trigger:focus-visible {
+  outline: 2px solid var(--accent-action, var(--action-border));
+  outline-offset: 2px;
+}
+
+.plugin-stm-ai-assistant-select-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.plugin-stm-ai-assistant-select-label {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-stm-ai-assistant-select-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--content-muted, var(--content-secondary));
+  transition: transform 0.2s ease;
+}
+
+.plugin-stm-ai-assistant-select-trigger[aria-expanded='true'] .plugin-stm-ai-assistant-select-chevron {
+  transform: rotate(180deg);
+  color: var(--accent-text, var(--action-text));
+}
+
+.plugin-stm-ai-assistant-select-menu {
+  position: absolute;
+  top: calc(100% + 0.35rem);
+  right: 0;
+  left: 0;
+  z-index: var(--z-dropdown, 500);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  max-height: 16rem;
+  overflow-y: auto;
+  padding: 0.25rem;
+  border-radius: 0.5rem;
+  background: var(--surface-container, var(--bg-panel));
+  box-shadow: var(--shadow-elevation, 0 8px 24px rgba(0, 0, 0, 0.32));
+}
+
+/* display:flex 会顶掉 [hidden] 的 display:none，必须显式补回 */
+.plugin-stm-ai-assistant-select-menu[hidden] {
+  display: none;
+}
+
+.plugin-stm-ai-assistant-select-option {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  min-width: 0;
+  min-height: 2.4rem;
+  padding: 0.5rem 0.65rem;
+  border: 0;
+  border-radius: 0.3rem;
+  background: transparent;
+  color: var(--content-primary);
+  font: inherit;
+  font-size: 0.8rem;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.plugin-stm-ai-assistant-select-option:hover,
+.plugin-stm-ai-assistant-select-option[aria-selected='true'] {
+  background: color-mix(in srgb, var(--accent-action, var(--action-surface)), transparent 84%);
+  color: var(--content-primary);
+}
+
+.plugin-stm-ai-assistant-select-option[aria-selected='true'] .plugin-stm-ai-assistant-select-option-icon {
+  color: var(--accent-text, var(--action-text));
+}
+
+.plugin-stm-ai-assistant-select-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.plugin-stm-ai-assistant-select-option-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 1.25rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  color: var(--content-muted, var(--content-secondary));
+}
+
+.plugin-stm-ai-assistant-select-option-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 隐藏的 native select：保留 value/change 作为对外契约 */
+.plugin-stm-ai-assistant-select-source {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+/* ------------------------------------------------------------ 数字调节控件
+ * 复刻 icon-controls.css:111-194 的 ui-number-control + settings-number-stepper：
+ * 右侧内嵌 ↑↓ 按钮列，**默认隐藏**，hover/focus-within 才显示；
+ * 无左分隔线、无按钮间分隔线，宽度 1.55rem，内边距 0.35rem。 */
+
+.plugin-stm-ai-assistant-number-control {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+}
+
+.plugin-stm-ai-assistant-number-input {
+  padding-right: 2.65rem;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* 隐藏浏览器原生上下箭头，只保留自定义 stepper */
+.plugin-stm-ai-assistant-number-input::-webkit-inner-spin-button,
+.plugin-stm-ai-assistant-number-input::-webkit-outer-spin-button {
+  appearance: none;
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.plugin-stm-ai-assistant-number-stepper {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.35rem;
+  bottom: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  width: 1.55rem;
+  overflow: visible;
+  border: 0;
+  border-radius: 0.5rem;
+  background: transparent;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 0.18s ease,
+    visibility 0s linear 0.18s;
+}
+
+.plugin-stm-ai-assistant-number-control:hover > .plugin-stm-ai-assistant-number-stepper,
+.plugin-stm-ai-assistant-number-control:focus-within > .plugin-stm-ai-assistant-number-stepper {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+
+.plugin-stm-ai-assistant-number-stepper-btn {
+  display: inline-flex;
+  flex: 1 1 50%;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0.35rem;
+  color: var(--content-muted, var(--content-secondary));
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color 0.18s ease,
+    background-color 0.18s ease;
+}
+
+.plugin-stm-ai-assistant-number-stepper-btn + .plugin-stm-ai-assistant-number-stepper-btn {
+  border-top: 0;
+}
+
+.plugin-stm-ai-assistant-number-stepper-btn:hover {
+  color: var(--content-primary);
+  background: var(--state-hover-surface, var(--bg-hover));
+}
+
+.plugin-stm-ai-assistant-number-stepper-btn:active {
+  color: var(--accent-text, var(--action-text));
+  background: var(--accent-soft-strong, var(--accent-soft, var(--action-surface)));
+}
+
+.plugin-stm-ai-assistant-number-stepper-btn:focus-visible {
+  z-index: 1;
+  outline: 2px solid var(--accent-text, var(--action-text));
+  outline-offset: -2px;
+}
+
+.plugin-stm-ai-assistant-number-stepper-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.plugin-stm-ai-assistant-number-stepper-btn:disabled:hover {
+  color: var(--content-muted, var(--content-secondary));
+  background: transparent;
 }
 
 /* ------------------------------------------------------------ 选卡 */
@@ -341,26 +843,31 @@
 .plugin-stm-ai-assistant-message {
   margin-top: 8px;
   border: 1px solid var(--border-light);
-  border-radius: 8px;
+  border-radius: 10px;
   overflow: hidden;
 }
 
 .plugin-stm-ai-assistant-message-role {
-  padding: 4px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
   background: var(--bg-sub);
-  color: var(--content-secondary);
-  font-size: 0.7rem;
-  letter-spacing: 0.05em;
+  color: var(--content-muted, var(--content-secondary));
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .plugin-stm-ai-assistant-message-body {
   max-height: 260px;
   margin: 0;
-  padding: 10px;
+  padding: 12px 14px;
   background: var(--bg-code);
   color: var(--content-code, var(--content-primary));
   font-size: 0.74rem;
-  line-height: 1.55;
+  line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
   overflow: auto;
@@ -370,17 +877,23 @@
   margin-top: 6px;
 }
 
+/* 日志区做成控制台质感：深色底 + 圆角 + 内边距 */
 .plugin-stm-ai-assistant-logs {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
   max-height: 160px;
-  margin-top: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-light);
+  border-radius: 10px;
+  background: var(--bg-code);
   overflow-y: auto;
 }
 
 .plugin-stm-ai-assistant-log {
   font-size: 0.72rem;
+  line-height: 1.5;
   color: var(--content-secondary);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
@@ -445,29 +958,76 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
-  max-height: 240px;
+  max-height: 320px;
   overflow-y: auto;
 }
 
+/* 档案行：左「名称/元信息 + 徽章」、右「操作按钮」。整行可点即切换编辑对象。 */
 .plugin-stm-ai-assistant-profile-item {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
-  padding: 8px;
+  justify-content: space-between;
+  gap: 8px 12px;
+  padding: 8px 10px;
   border: 1px solid var(--border-light);
   border-radius: 8px;
   background: var(--bg-item);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
 }
 
+.plugin-stm-ai-assistant-profile-item:hover {
+  background: var(--state-hover-surface, var(--bg-hover));
+  border-color: var(--border-default, var(--border-light));
+}
+
+.plugin-stm-ai-assistant-profile-item:focus-visible {
+  outline: 2px solid var(--state-focus-ring, var(--action-border));
+  outline-offset: 2px;
+}
+
+/* 正在编辑的档案：action-surface 填充 + action-border 描边 */
 .plugin-stm-ai-assistant-profile-item.is-active {
   border-color: var(--action-border);
   background: var(--action-surface);
 }
 
+/* 主程序 ui_data.active_profile_id 指向的档案：左侧 3px 强调条，与编辑态区分 */
+.plugin-stm-ai-assistant-profile-item.is-current {
+  box-shadow: inset 3px 0 0 var(--accent-action, var(--action-border));
+}
+
+.plugin-stm-ai-assistant-profile-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  min-width: 0;
+  flex: 1 1 260px;
+}
+
+.plugin-stm-ai-assistant-profile-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.plugin-stm-ai-assistant-profile-actions {
+  margin-top: 0;
+  flex: 0 0 auto;
+}
+
 .plugin-stm-ai-assistant-profile-name {
   font-size: 0.8rem;
   font-weight: 600;
+}
+
+/* 编辑态里徽章/提示文字要压过 action-surface 底色 */
+.plugin-stm-ai-assistant-profile-item.is-active .plugin-stm-ai-assistant-hint,
+.plugin-stm-ai-assistant-profile-item.is-active .plugin-stm-ai-assistant-profile-name {
+  color: var(--action-text);
 }
 
 .plugin-stm-ai-assistant-profile-editor {
@@ -521,11 +1081,50 @@
   color: var(--content-secondary);
 }
 
+/* ------------------------------------------------------------ 滚动条（面板内） */
+
+.plugin-stm-ai-assistant-body::-webkit-scrollbar,
+.plugin-stm-ai-assistant-logs::-webkit-scrollbar,
+.plugin-stm-ai-assistant-message-body::-webkit-scrollbar,
+.plugin-stm-ai-assistant-card-list::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.plugin-stm-ai-assistant-body::-webkit-scrollbar-thumb,
+.plugin-stm-ai-assistant-logs::-webkit-scrollbar-thumb,
+.plugin-stm-ai-assistant-message-body::-webkit-scrollbar-thumb,
+.plugin-stm-ai-assistant-card-list::-webkit-scrollbar-thumb {
+  background: var(--border-main);
+  border-radius: 8px;
+}
+
+.plugin-stm-ai-assistant-body::-webkit-scrollbar-thumb:hover,
+.plugin-stm-ai-assistant-logs::-webkit-scrollbar-thumb:hover,
+.plugin-stm-ai-assistant-message-body::-webkit-scrollbar-thumb:hover,
+.plugin-stm-ai-assistant-card-list::-webkit-scrollbar-thumb:hover {
+  background: var(--border-light);
+}
+
 /* 分组规则内部的选择器不参与作用域检查，但这里仍保持同样的根前缀以免混淆 */
+
+/* 窄屏：对齐详情页 <=30rem 的 padding-inline 收缩，文字仍显示 */
 @media (max-width: 720px) {
   .plugin-stm-ai-assistant-shell {
     width: 96vw;
     height: 92vh;
+  }
+
+  .plugin-stm-ai-assistant-tabs {
+    padding-inline: 0.55rem;
+  }
+
+  .plugin-stm-ai-assistant-tab {
+    padding-inline: 0.58rem;
+  }
+
+  .plugin-stm-ai-assistant-body {
+    padding: 0.85rem;
   }
 
   .plugin-stm-ai-assistant-grid {

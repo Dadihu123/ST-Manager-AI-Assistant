@@ -106,6 +106,51 @@ def test_css_avoids_tailwind_palette_classes():
     assert palette.findall(source) == []
 
 
+def _strip_comments(source: str) -> str:
+    return re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+
+
+def _rule_body(source: str, selector: str) -> str:
+    """取出某个选择器的声明块（用于样式契约断言，注释已剔除）。"""
+    match = re.search(re.escape(selector) + r'\s*\{([^}]*)\}', _strip_comments(source))
+    assert match, f'未找到规则: {selector}'
+    return match.group(1)
+
+
+def test_overlay_scrim_uses_semantic_token_and_backdrop_filter():
+    """回归：全屏 scrim 不能用裸 rgba(0,0,0,...)。
+
+    裸半透明黑在面板内出现高内容滚动容器时（「提示词档案」页签）会被 Chromium
+    合成到黑色 backdrop root，整屏塌成纯黑。必须用语义 scrim token +
+    backdrop-filter（后者强制建立 backdrop root）。对齐主程序 .modal-overlay。
+    """
+    with open(CSS_PATH, 'r', encoding='utf-8') as handle:
+        source = handle.read()
+
+    body = _rule_body(source, '.plugin-stm-ai-assistant-overlay')
+    assert 'var(--surface-scrim' in body, 'scrim 必须使用 --surface-scrim 语义变量'
+    assert 'rgba(0, 0, 0,' not in body, 'scrim 不得使用裸 rgba(0,0,0,...)'
+    assert 'backdrop-filter: blur(' in body, 'scrim 必须有 backdrop-filter 以建立 backdrop root'
+
+
+def test_active_tab_matches_detail_page_contract():
+    """回归：选中页签必须与角色卡详情页一致——无边框、无位移、2px 内阴影底条。
+
+    旧实现是「向下突出的胶囊」（999px 圆角 + translateY + 负 margin），与详情页不符。
+    """
+    with open(CSS_PATH, 'r', encoding='utf-8') as handle:
+        source = handle.read()
+
+    active = _rule_body(source, '.plugin-stm-ai-assistant-tab.is-active')
+    assert 'transform: none' in active, '选中页签不得有位移'
+    assert 'border-color: transparent' in active, '选中页签必须无可见边框'
+    assert 'inset 0 -2px 0' in active, '选中页签必须有 2px 内阴影底条'
+
+    tab = _rule_body(source, '.plugin-stm-ai-assistant-tab')
+    assert 'border-radius: 0.55rem' in tab, '页签圆角必须是详情页的 0.55rem'
+    assert '999px' not in tab, '页签不得使用胶囊圆角'
+
+
 def test_css_uses_only_defined_variables():
     """变量必须能在主程序里找到定义（否则样式静默失效，参见附录 K）。"""
     if not os.path.isdir(MAIN_APP_DIR):

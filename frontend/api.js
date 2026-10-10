@@ -34,7 +34,10 @@ export function createClient(api) {
       call(`/profiles/${encodeURIComponent(id)}/duplicate`, { method: 'POST', body: { name } }),
     setActiveProfile: (id) => call('/profiles/active', { method: 'POST', body: { profile_id: id } }),
     resetProfiles: () => call('/profiles/reset', { method: 'POST' }),
-    exportProfiles: () => call('/profiles/export'),
+    /** 省略 id 导出全部；给出 id 只导出该档案。 */
+    exportProfiles: (id = '') => call(
+      `/profiles/export${id ? `?profile_id=${encodeURIComponent(id)}` : ''}`,
+    ),
     importProfiles: (payload) => call('/profiles/import', { method: 'POST', body: { payload } }),
 
     providers: () => call('/providers'),
