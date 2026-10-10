@@ -3,177 +3,80 @@
  *
  * 硬约束 F11：所有选择器必须以 `.plugin-stm-ai-assistant` 或
  * `[data-plugin="stm-ai-assistant"]` 开头，否则安装时的作用域检查会拒绝加载
- * （`core/plugins/installer.py:517-591`）。颜色只使用主程序已有的 CSS 变量。
+ * （`core/plugins/installer.py:595-640`）。颜色只使用主程序已有的 CSS 变量。
+ *
+ * ── 层级 / 定位 / 遮罩都归宿主（本次重写的核心）────────────────────────
+ * 插件现在只提供 **surface 内容**：入口由 `manifest.frontend.entries` 声明，
+ * 坞、命令面板、快捷键与设置页由宿主渲染；面板容器（定位、尺寸、滚动、焦点
+ * 陷阱、ESC 关闭、`role="dialog"`、遮罩合成）由 `pluginSurfaceHost.js` 提供。
+ * 因此本文件里**没有** `position: fixed`、没有自绘 overlay、没有 z-index
+ * 硬编码，也没有 `body:has(...)` 兜底规则——那些都是宿主职责。
  */
 
-.plugin-stm-ai-assistant-root {
-  position: relative;
+/* ------------------------------------------------------------ 面板内容
+ * 宿主的 `.plugin-surface--panel` 已经是「右侧抽屉」：标题（`plugin-surface__title`）
+ * 与关闭按钮（`plugin-surface__close`）都由宿主渲染，插件**不重复画**。
+ * 插件只在容器内填三段：状态条 + 横向页签 + 可滚动主体。
+ *
+ * 布局：宿主的 `.plugin-surface__body` 自己有 `overflow: auto` + `padding: 1rem`。
+ * 若直接用那个滚动条，页签会随内容滚走。因此插件根节点撑满容器并自建**内部**
+ * 滚动区（`flex` 列 + 主体 `overflow-y: auto`），使「状态条 + 页签」常驻顶部——
+ * 这与旧版 shell 的观感一致，但定位与层级仍全部归宿主。
+ */
+
+.plugin-stm-ai-assistant-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
 }
 
-/* ------------------------------------------------------------ 浮动入口 */
-
-.plugin-stm-ai-assistant-launcher {
-  position: fixed;
-  right: 20px;
-  bottom: 96px; /* 默认抬高，避开右下角翻页工具栏 */
-  z-index: 2140;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 44px;
-  padding: 0;
-  border: 1px solid var(--action-border);
-  border-radius: 50%;
-  background: var(--action-surface);
-  color: var(--action-text);
-  cursor: grab;
-  box-shadow: var(--shadow-elevation, 0 4px 16px rgba(0, 0, 0, 0.24));
-  user-select: none;
-  -webkit-user-select: none;
-  touch-action: none; /* 允许 pointer 拖拽接管触摸手势 */
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
-}
-
-.plugin-stm-ai-assistant-launcher:hover {
-  background: var(--action-surface-hover);
-  border-color: var(--action-border-hover);
-  transform: translateY(-1px);
-}
-
-.plugin-stm-ai-assistant-launcher.is-dragging {
-  cursor: grabbing;
-  transform: scale(1.06);
-  box-shadow: var(--shadow-elevation, 0 8px 24px rgba(0, 0, 0, 0.32));
-}
-
-.plugin-stm-ai-assistant-launcher-icon {
-  width: 24px;
-  height: 24px;
-  pointer-events: none; /* 让拖拽/点击都落在按钮上 */
-  display: block;
-  /* 图标本体用 mask 抠形，颜色跟随主程序图标色变量，深浅主题自适应 */
-  background-color: var(--action-icon, var(--action-text, var(--content-primary)));
-  -webkit-mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
-  mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
-}
-
-/* 面板顶栏右侧的状态徽章簇 */
 .plugin-stm-ai-assistant-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border-divider);
+}
+
+/* 徽章槽：refreshStatus 只清这一层，品牌图标留在外面不被清掉。 */
+.plugin-stm-ai-assistant-status-badges {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  justify-content: flex-end;
-}
-
-/* ------------------------------------------------------------ 面板骨架 */
-
-.plugin-stm-ai-assistant-overlay {
-  display: none;
-  position: fixed;
-  inset: 0;
-  z-index: 2150;
-  align-items: center;
-  justify-content: center;
-  /* 对齐主程序 .modal-overlay（components.css:673-685）：语义 scrim + backdrop blur。
-     不能用裸 rgba(0, 0, 0, .55)：当面板内出现高内容滚动容器时（典型是「提示词档案」
-     那一屏），Chromium 会把半透明黑合成到黑色 backdrop root 上，整屏塌成纯黑。
-     backdrop-filter 会强制建立 backdrop root，让 alpha 正确混到真实页面内容上。
-     回归验证：切页 / 滚动 / 视口来回切换共 18 个采样点，0 处黑色。 */
-  background: var(--surface-scrim, rgba(15, 23, 42, 0.58));
-  -webkit-backdrop-filter: blur(5px);
-  backdrop-filter: blur(5px);
-}
-
-.plugin-stm-ai-assistant-overlay.is-open {
-  display: flex;
-}
-
-.plugin-stm-ai-assistant-shell {
-  position: relative;
-  isolation: isolate;
-  display: flex;
-  flex-direction: column;
-  width: min(1080px, 94vw);
-  height: min(760px, 90vh);
-  border: 1px solid var(--border-main);
-  border-radius: 14px;
-  background: var(--surface-container, var(--bg-panel));
-  background-image: none;
-  color: var(--content-primary);
-  overflow: hidden;
-  -webkit-backdrop-filter: none !important;
-  backdrop-filter: none !important;
-  box-shadow: var(--shadow-elevation, 0 12px 40px rgba(0, 0, 0, 0.4));
-}
-
-/* ------------------------------------------------------------ 顶栏（重构）
- * 图标块 + 标题/副标 + 右侧安静的状态徽章簇 + ghost 关闭钮 */
-
-.plugin-stm-ai-assistant-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  height: 64px;
-  padding: 0 20px;
-  border-bottom: 1px solid var(--border-divider);
-  background: var(--bg-sub);
-  flex-shrink: 0;
-}
-
-.plugin-stm-ai-assistant-title {
-  display: flex;
-  align-items: center;
-  gap: 12px;
   min-width: 0;
 }
 
+/* 品牌图标：用 CSS mask 抠形，颜色跟随主题前景色，深浅主题自适应。
+ *
+ * 这里引用的是**插件自己的**资源（`/api/plugins/<id>/assets/…`），不是宿主 sprite，
+ * 因此符合 F15「不得硬编码宿主 sprite 路径」；`core/plugins/assets.py` 的
+ * `ALLOWED_EXTENSIONS` 含 `.svg`，该路由可用。
+ *
+ * 为什么不用 `api.ui.icon()`：那个原语只解析**宿主图标名**
+ * （`utils/icons.js:resolveIconUrl` 对含 `.` 的值返回空串 → 降级为占位图标），
+ * 而坞的图标槽也只吃宿主图标名。品牌图标因此挂在插件自己的内容区，
+ * 与宿主图标名体系互不干扰。 */
 .plugin-stm-ai-assistant-glyph {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
-  flex-shrink: 0;
-  /* 去外框：不再垫 action-surface 底色 + inset 描边，图标直接裸露跟随前景色 */
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
 }
 
 .plugin-stm-ai-assistant-glyph::before {
   content: '';
-  width: 26px;
-  height: 26px;
+  width: 20px;
+  height: 20px;
   background-color: var(--accent-text, var(--content-primary));
   -webkit-mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
   mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
-}
-
-.plugin-stm-ai-assistant-title-block {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-
-.plugin-stm-ai-assistant-title-text {
-  font-size: 0.98rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  line-height: 1.25;
-}
-
-.plugin-stm-ai-assistant-meta-caption {
-  font-size: 0.68rem;
-  color: var(--content-muted, var(--content-secondary));
-  letter-spacing: 0.04em;
-}
-
-.plugin-stm-ai-assistant-header-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-shrink: 0;
 }
 
 /* ------------------------------------------------------------ 页签导航
@@ -198,9 +101,9 @@
   flex: 0 0 auto;
   min-height: 3.2rem;
   max-width: 100%;
-  padding: 0.42rem 0.85rem 0.35rem;
+  padding: 0.42rem 0 0.35rem;
   border-bottom: 1px solid var(--border-divider);
-  background: var(--surface-container-raised, var(--bg-sub));
+  background: transparent;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: thin;
@@ -271,33 +174,18 @@
   white-space: nowrap;
 }
 
-/* 页签上的数字（待审批等）：对齐详情页 .detail-tab-meta
- * （detail-card-workbench.css:923-932）——等宽小字，激活时反色，不做胶囊。 */
-.plugin-stm-ai-assistant-tab-count {
-  flex: 0 0 auto;
-  color: var(--content-muted, var(--content-secondary));
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
-  font-size: 0.62rem;
-  line-height: 1.2;
-}
+/* 页签不再自绘数字角标：待审批数走 `api.entries.setBadge('open-review', n)`，
+ * 由宿主渲染在坞入口与命令面板上（`entries[].badge`）。 */
 
-.plugin-stm-ai-assistant-tab.is-active .plugin-stm-ai-assistant-tab-count {
-  color: var(--action-text);
-}
-
+/* 主体：插件自建的内部滚动区（宿主的 `.plugin-surface__body` 是外层滚动，
+ * 这里再套一层是为了让状态条与页签常驻顶部）。 */
 .plugin-stm-ai-assistant-body {
-  position: relative;
-  isolation: isolate;
-  flex: 1;
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
+  padding-top: 0.9rem;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: clamp(1rem, 1.8vw, 1.5rem);
-  background: var(--surface-page, var(--bg-panel));
-  background-image: none;
-  -webkit-backdrop-filter: none !important;
-  backdrop-filter: none !important;
   scrollbar-color: var(--scrollbar-thumb, var(--border-main)) transparent;
   scrollbar-width: thin;
 }
@@ -308,49 +196,31 @@
   gap: 20px;
   min-width: 0;
   background: transparent;
-  -webkit-backdrop-filter: none !important;
-  backdrop-filter: none !important;
 }
 
-.plugin-stm-ai-assistant-body.is-profiles,
-.plugin-stm-ai-assistant-view.is-profiles {
-  background: var(--surface-page, var(--bg-panel));
-  background-image: none;
-  box-shadow: none;
-}
+/* ------------------------------------------------------------ 宿主原语的插件侧微调
+ *
+ * 按钮 / 徽标 / 区块现在由 `api.ui.*` 渲染（`static/css/modules/ui-primitives.css`），
+ * 插件不再自带一套外观——旧版的 `.plugin-stm-ai-assistant-btn` /
+ * `.plugin-stm-ai-assistant-badge` / `.plugin-stm-ai-assistant-section*` 规则已删除。
+ * 下面只保留两处插件特有的补充。
+ */
 
-.plugin-stm-ai-assistant-section {
-  padding: 16px 18px;
-  border: 1px solid var(--border-subtle, var(--border-light));
-  border-radius: 12px;
-  background: var(--bg-item);
-}
-
-.plugin-stm-ai-assistant-section-title {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 0 0 4px;
-  font-size: 0.9rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  color: var(--content-primary);
-}
-
-/* 标题里的「1 · 」序号前缀渲染为等宽强调色 */
+/* 区块标题里的「1 · 」序号前缀渲染为等宽强调色（插件自己的信息架构）。 */
 .plugin-stm-ai-assistant-section-title-num {
+  margin-right: 0.35rem;
   color: var(--accent-text, var(--content-secondary));
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.8rem;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 0.85em;
   font-weight: 500;
   opacity: 0.85;
 }
 
-.plugin-stm-ai-assistant-section-subtitle {
-  margin: 0 0 10px;
-  font-size: 0.76rem;
-  color: var(--content-secondary);
-  line-height: 1.55;
+/* `is-hidden` 是插件自己的显隐约定（作业取消按钮等），宿主原语没有对应语义。
+ * 必须带作用域前缀（F11），因此按实际用法列出两个组合选择器。 */
+.plugin-stm-ai-assistant-row .is-hidden,
+.plugin-stm-ai-assistant-view .is-hidden {
+  display: none;
 }
 
 .plugin-stm-ai-assistant-row {
@@ -389,37 +259,6 @@
   border-left: 3px solid var(--border-warn, var(--accent-outline));
   padding-left: 8px;
   line-height: 1.5;
-}
-
-.plugin-stm-ai-assistant-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 2px 10px;
-  border: 1px solid var(--border-light);
-  border-radius: 999px;
-  background: var(--bg-tag);
-  color: var(--content-secondary);
-  font-size: 0.7rem;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-}
-
-.plugin-stm-ai-assistant-badge.is-ok {
-  border-color: var(--accent-outline);
-  color: var(--accent-text, var(--content-primary));
-}
-
-.plugin-stm-ai-assistant-badge.is-warn {
-  border-color: var(--border-warn, var(--accent-outline));
-}
-
-.plugin-stm-ai-assistant-badge.is-error {
-  border-color: var(--border-warn, var(--accent-outline));
-  color: var(--content-primary);
-}
-
-.plugin-stm-ai-assistant-badge.is-muted {
-  opacity: 0.75;
 }
 
 .plugin-stm-ai-assistant-field {
@@ -464,73 +303,6 @@
   font-size: 0.78rem;
   color: var(--content-secondary);
   cursor: pointer;
-}
-
-.plugin-stm-ai-assistant-btn {
-  padding: 6px 14px;
-  border: 1px solid var(--border-main);
-  border-radius: 7px;
-  background: var(--bg-sub);
-  color: var(--content-primary);
-  font-size: 0.78rem;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, transform 0.1s ease;
-}
-
-.plugin-stm-ai-assistant-btn:hover:not(:disabled) {
-  background: var(--state-hover-surface, var(--bg-hover));
-  border-color: var(--border-light);
-}
-
-.plugin-stm-ai-assistant-btn:active:not(:disabled) {
-  transform: translateY(1px);
-}
-
-.plugin-stm-ai-assistant-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.plugin-stm-ai-assistant-btn.is-primary {
-  border-color: var(--action-border);
-  background: var(--action-surface);
-  color: var(--action-text);
-  font-weight: 600;
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.2);
-}
-
-.plugin-stm-ai-assistant-btn.is-primary:hover:not(:disabled) {
-  background: var(--action-surface-hover);
-  border-color: var(--action-border-hover, var(--action-border));
-}
-
-.plugin-stm-ai-assistant-btn.is-danger {
-  border-color: var(--border-warn, var(--border-main));
-}
-
-/* ghost 图标钮（顶栏关闭等）：无边框，只留 hover 底 */
-.plugin-stm-ai-assistant-btn.is-ghost {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
-  color: var(--content-secondary);
-  font-size: 0.9rem;
-  line-height: 1;
-}
-
-.plugin-stm-ai-assistant-btn.is-ghost:hover:not(:disabled) {
-  background: var(--state-hover-surface, var(--bg-hover));
-  border-color: transparent;
-  color: var(--content-primary);
-}
-
-.plugin-stm-ai-assistant-btn.is-hidden {
-  display: none;
 }
 
 /* ------------------------------------------------------------ 下拉框（styledSelect）
@@ -1106,15 +878,9 @@
   background: var(--border-light);
 }
 
-/* 分组规则内部的选择器不参与作用域检查，但这里仍保持同样的根前缀以免混淆 */
-
-/* 窄屏：对齐详情页 <=30rem 的 padding-inline 收缩，文字仍显示 */
+/* 窄屏：面板宽度/高度由宿主的 `.plugin-surface--panel` 负责（≤900px 退化全屏），
+ * 插件只收自己的内边距与栅格列数。 */
 @media (max-width: 720px) {
-  .plugin-stm-ai-assistant-shell {
-    width: 96vw;
-    height: 92vh;
-  }
-
   .plugin-stm-ai-assistant-tabs {
     padding-inline: 0.55rem;
   }

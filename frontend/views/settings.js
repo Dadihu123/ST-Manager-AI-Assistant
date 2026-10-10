@@ -6,18 +6,14 @@
  */
 
 import {
-  badge,
-  button,
   checkbox,
   clear,
+  createUi,
   el,
   field,
   formatNumber,
   formatTime,
   input,
-  numberInput,
-  section,
-  select,
   textarea,
 } from '../dom.js';
 
@@ -41,6 +37,7 @@ const BLANK_PROVIDER = {
 };
 
 export function createSettings(api, client, context) {
+  const { badge, button, numberInput, section, select } = createUi(api);
   const root = el('div', 'plugin-stm-ai-assistant-view');
   const state = { providers: [], usage: null, status: null, suggestions: [], editing: null };
 
@@ -220,12 +217,12 @@ export function createSettings(api, client, context) {
         await client.saveProviderSecrets(provider.id, payload);
       }
 
-      api.toast('已保存', 2400, 'check');
+      api.host.toast('已保存', 2400, 'check');
       state.editing = null;
       await load();
     } catch (error) {
       const detail = (error.detail && error.detail.errors) || [];
-      api.toast(`保存失败：${error.message}${detail.length ? `（${detail.join('；')}）` : ''}`, 6000, 'close');
+      api.host.toast(`保存失败：${error.message}${detail.length ? `（${detail.join('；')}）` : ''}`, 6000, 'close');
     }
   }
 
@@ -233,33 +230,38 @@ export function createSettings(api, client, context) {
     try {
       const data = await client.testProvider(item.id);
       if (data.ok) {
-        api.toast(`连接正常：${data.latency_ms}ms · 模型 ${data.model}`, 3200, 'check');
+        api.host.toast(`连接正常：${data.latency_ms}ms · 模型 ${data.model}`, 3200, 'check');
       } else {
-        api.toast(`连接失败：${data.error} ${data.message || ''}`, 5000, 'close');
+        api.host.toast(`连接失败：${data.error} ${data.message || ''}`, 5000, 'close');
       }
     } catch (error) {
-      api.toast(`测试失败：${error.message}`, 4000, 'close');
+      api.host.toast(`测试失败：${error.message}`, 4000, 'close');
     }
   }
 
   async function setDefault(item) {
     try {
       await client.setDefaultProvider(item.id);
-      api.toast(`默认 provider 已切换为 ${item.id}`, 2600, 'check');
+      api.host.toast(`默认 provider 已切换为 ${item.id}`, 2600, 'check');
       await load();
     } catch (error) {
-      api.toast(`设置失败：${error.message}`, 3600, 'close');
+      api.host.toast(`设置失败：${error.message}`, 3600, 'close');
     }
   }
 
   async function removeProvider(item) {
-    if (!window.confirm(`删除 provider「${item.id}」？其密钥也会被清除。`)) return;
+    const confirmed = await api.ui.confirm({
+      title: `删除 provider「${item.id}」？`,
+      message: '其密钥也会被一并清除，此操作不可撤销。',
+      danger: true,
+    });
+    if (!confirmed) return;
     try {
       await client.deleteProvider(item.id);
-      api.toast('已删除', 2400, 'check');
+      api.host.toast('已删除', 2400, 'check');
       await load();
     } catch (error) {
-      api.toast(`删除失败：${error.message}`, 3600, 'close');
+      api.host.toast(`删除失败：${error.message}`, 3600, 'close');
     }
   }
 
@@ -303,13 +305,18 @@ export function createSettings(api, client, context) {
 
     const actions = el('div', 'plugin-stm-ai-assistant-row');
     actions.append(button('清空建议队列', 'is-danger', async () => {
-      if (!window.confirm('清空全部新标签建议？')) return;
+      const confirmed = await api.ui.confirm({
+        title: '清空全部新标签建议？',
+        message: '建议队列会被完全清空，AI 曾提出的标签需要重新分析才能再次出现。',
+        danger: true,
+      });
+      if (!confirmed) return;
       try {
         await client.clearSuggestions(null);
-        api.toast('已清空', 2400, 'check');
+        api.host.toast('已清空', 2400, 'check');
         await load();
       } catch (error) {
-        api.toast(error.message, 3600, 'close');
+        api.host.toast(error.message, 3600, 'close');
       }
     }));
 
@@ -326,7 +333,7 @@ export function createSettings(api, client, context) {
       state.usage = usage;
       state.suggestions = suggestions.items || [];
     } catch (error) {
-      api.toast(`读取设置失败：${error.message}`, 3600, 'close');
+      api.host.toast(`读取设置失败：${error.message}`, 3600, 'close');
     }
 
     renderOverview();
@@ -336,14 +343,15 @@ export function createSettings(api, client, context) {
     renderSuggestions();
 
     if (state.status && state.status.outbound_acknowledged === false) {
-      const confirmed = window.confirm(
-        '提示：AI 分析会把卡片内容发送到你配置的 provider 地址。确认已知晓？',
-      );
+      const confirmed = await api.ui.confirm({
+        title: '出站内容提示',
+        message: 'AI 分析会把卡片内容发送到你配置的 provider 地址。确认已知晓？',
+      });
       if (confirmed) {
         try {
           await client.ackOutbound();
         } catch (error) {
-          api.toast(error.message, 3200, 'close');
+          api.host.toast(error.message, 3200, 'close');
         }
       }
     }

@@ -6,8 +6,6 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
-.superdesign/
-design/
 venv/
 
 # 编辑器 / 系统
@@ -15,3 +13,11 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# 设计工具产物
+.superdesign/
+design/
+
+# 临时产物（截图 / JSON 报告）
+tmp_crops/
+tmp_*.png

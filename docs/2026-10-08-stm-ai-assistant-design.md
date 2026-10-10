@@ -1,9 +1,15 @@
-# stm-ai-assistant 插件设计（v0.1 · 待确认）
+# stm-ai-assistant 插件设计（v0.2 · 入口/表面重写后）
 
 > **本文件是本仓库的唯一事实来源。** 实现与本文档冲突时，先改文档再改代码。
-> 主程序契约基线：`api_version = 1`、`APP_VERSION = 1.0.0`、`SUPPORTED_PLUGIN_API_VERSIONS = (1,)`。
+> 主程序契约基线：`api_version = 2`、`manifest_version = 2`、`APP_VERSION = 1.0.0`、
+> `PLUGIN_API_VERSION = 2`。
 > 所有契约结论均标注了核对来源（`文件:行`），凡未标注者视为**未验证假设**，不得实现。
-> 核对时间：2026-10-08，主程序仓库 `D:\Workspace\MyOwn\ST-Manager`。
+> 核对时间：2026-10-08（初版）/ 2026-10-11（入口与表面重写），主程序仓库
+> `D:\Workspace\MyOwn\ST-Manager`。
+>
+> **v0.2 变更摘要**：插件从「自绘 `position: fixed` 浮层 + 自建模态框骨架」改为
+> 「**插件声明入口与 surface，宿主提供容器**」。入口表与 surface 表见 §8.1 / §8.2；
+> 后端业务逻辑（LLM、提示词、作业、幂等、成本记账）**一行未动**。
 
 ---
 
@@ -43,7 +49,8 @@
 | 其它 | `suppress_fs_events()` / `notify(level, msg)` / `log(level, msg, **extra)` | `api.py:925-974` |
 | 作业 ctx | `items[{key,payload,seq}]`、`should_cancel()`、`report(key, status=, result=, error=)`、`set_total/set_message/set_summary`、`save_state/load_state`、`resolve_secret(key)` | `core/plugins/jobs.py:91-219` |
 | 主程序 HTTP | 作业列表/详情/SSE/取消/暂停/恢复/重试/逐条审批全部已注册 | `core/plugins/routes.py:382-478` |
-| 前端 | `api.api()`、`state`、`store`、`on/off/emit`、`toast`、`progress.*`、`openDetail/refresh/switchMode`、`registerAlpineComponent`、`subscribeJob`、`estimateTokens`、`utils.*`、`jobs.*`、`createRoot` | `static/js/pluginHost.js:180-547` |
+| 前端 | `api.api()`、`state`、`store`、`on/off/emit`、`onConfigChange`、`entries.*`、`surfaces.*`、`ui.*`（18 个原语）、`storage.*`、`host.*`、`progress.*`、`subscribeJob`、`estimateTokens`、`utils.*`、`jobs.*` | `static/js/pluginHost.js`、`static/js/uiPrimitives.js`、`docs/plugin-api.md` |
+| 前端（旧名，保留为别名） | `toast`、`refresh`、`switchMode`、`openDetail`、`openSettingsSection`、`createRoot`、`registerModal`（Deprecated）、`registerSettingsSection`（Deprecated） | `pluginHost.js:400-635` |
 
 **作业状态机**（`job_store.py`）：`queued → running → completed / failed / cancelled / aborted`，`running ↔ paused`。
 **条目状态机**：`pending / running / done / failed / skipped / awaiting_review`。
@@ -55,26 +62,35 @@
 | C1 | `estimateTokens()` **只在**前端 API 上（`ceil(cjk + (len-cjk)/3.5)`）；后端 `PluginAPI` 无 token 估算 | `pluginHost.js:464-469`；同公式 `core/utils/text.py:41-44` | 后端自带 `tokens.estimate(text)`（同公式，纯函数，可测）；前端预览用 `api.estimateTokens()`；两者用固定样本对齐 |
 | C2 | 卡片概览无插件写入口：`ui_data_update` 只能写插件命名空间；`write_card_fields` 白名单不含 `summary` | `api.py:62-66`、`api.py:872-921`；概览落点见 `core/api/v1/cards.py:1745-1748` | 见 §4.1 方案 A/B/C，**待确认**（推荐 A：内部 bridge + 失败降级） |
 | C3 | `ui_data_update(mutator)` 若 mutator 返回 dict，会 `entry.clear()` 后整体替换 → 连带清掉 `config` / `enabled` / `load_error` | `api.py:892-897` | 强制约定：mutator **只原地修改子键并返回 `None`**；代码评审红线 |
-| C4 | `manifest.frontend.panels / settings_tab / detail_tab` 仅被解析下发，前端**无消费者**；`registerModal` / `registerSettingsSection` 只写入内存 Map，**无渲染者** | `manifest.py:486-495`、`pluginHost.js:317-327`（全仓 grep 无其他引用） | 插件 UI 自建：`createRoot()` + 自绘 overlay；不依赖上述字段与 API |
+| C4 | **（已反转）** 旧版 `manifest.frontend.panels / settings_tab / detail_tab` 无前端消费者，插件只能自建 UI。主程序已完成「插件系统地基修缮」（commit `78465b5`）：旧三字段**彻底删除且不保留别名**（出现即拒绝加载），取而代之的是 `frontend.entries[]` + 坞 / 命令面板 / 右键菜单 / 设置页消费者，以及 `pluginSurfaceHost.js` 提供的宿主容器 | `core/plugins/manifest.py:43-45,459-473`（`LEGACY_FRONTEND_KEYS`）、`static/js/entryRegistry.js`、`static/js/components/entryDock.js`、`static/js/components/commandPalette.js`、`static/js/pluginSurfaceHost.js` | **插件声明 entries，宿主渲染坞与容器**：入口见 §8.1，surface 见 §8.2。插件不再 `createRoot()`、不再自绘 overlay、不再自己处理层级/焦点/ESC/遮罩 |
 | C5 | 同 `plugin_id + job_type` 只能有一个活跃作业；单插件最多 2 个作业槽位 | `jobs.py:32`、`jobs.py:242-252` | 一次批量 = 一个 run，靠 `items` 承载；不同 `job_type` 可并行但 ≤2 |
 | C6 | `apply_tags()` 内置治理：黑名单必拦；`lock_tag_library=true` 时未知标签被跳过 | `api.py:558-566`、`core/services/tag_management_service.py:43-68` | AI 标签先与标签库求交：已知 → `apply_tags`；未知 → 进「新标签建议」队列；把 `skipped_*` 计入结果并在 UI 提示 |
 | C7 | `write_worldbook` 的 `global` 来源要求 `file_path` 落在 `world_info_dir` 下，`resource` 要求路径含 `/lorebooks/` | `api.py:679-710` | 前端只允许从插件返回的候选列表里选来源；来源解析失败 → `source_invalid` |
 | C8 | 密钥不得进作业 payload（明文落库） | `api.py:299-307`、`jobs.py:777` | payload 只放 `{"secret_ref": "api_key"}`，运行时 `ctx.resolve_secret('api_key')` |
 | C9 | 数值护栏：单作业 20000 项、单条目结果 256KB（截断并标 `_truncated`）、ui_data 命名空间 256KB（超限整次回滚） | `jobs.py:39`、`job_store` 裁剪、`api.py:46-47`、`api.py:899-906` | 大对象一律落 `api.data_dir()` 下文件；ui_data 只存索引与热缓存，写入前做体积预算 |
-| C10 | CSS 作用域检查为**字符串包含**判定；`@media/@supports/@layer/@container/@keyframes/@font-face` 块内不检查 | `core/plugins/installer.py:517-591` | 全部选择器以 `.plugin-stm-ai-assistant` 或 `[data-plugin="stm-ai-assistant"]` 开头 |
+| C10 | CSS 作用域检查为**字符串包含**判定；`@media/@supports/@layer/@container/@keyframes/@font-face` 块内不检查。另有声明层检查（F13/F15）：`position: fixed`、未知令牌无回退、硬编码宿主 sprite、非作用域选择器上的 `!important` 均记 warning | `core/plugins/installer.py:595-640`（作用域）、`installer.py:863-938`（声明层） | 全部选择器以 `.plugin-stm-ai-assistant` 或 `[data-plugin="stm-ai-assistant"]` 开头；**零 `position: fixed`**（层级归宿主容器）；`var(--x)` 无回退时必须在宿主令牌清单内 |
+| C13 | 单插件入口上限 16 项；`entries[].id` 必须匹配 `^[a-z][a-z0-9-]{0,63}$`；`entries[]` 子键是**严格白名单**（多一个键 → 整个插件拒绝加载，不是忽略） | `core/plugins/entries.py:23-36`、`manifest.py:613-628` | 只声明 4 个入口（§8.1）；子键仅用 `KNOWN_ENTRY_KEYS` 内的字段；`tests/test_manifest_contract.py` 复刻白名单做静态自检 |
+| C14 | 归属分级（D5）：`tier_for_plugin('stm-ai-assistant') == 'community'`（不在主程序 `catalog.json` 里）。community 可用 `dock/command/context/settings`；**`nav`/`status` 声明了会被静默忽略 + 记 warning** | `core/plugins/entries.py:55-62,97-102`、`core/plugins/catalog.py` | 不声明 `nav` / `status`。若将来需要侧栏导航项，须先把本插件加进主程序 catalog 并标 `tier: "official"`（`tier` 只能由宿主仓库清单决定，插件 manifest 无权声明） |
+| C15 | 坞按 `<pluginId>:<surface.id ?? entry.id>` 查表；两侧不一致时**点击无反应且不报错** | `static/js/components/entryDock.js:178-187`、`commandPalette.js:202-205`、`pluginSurfaceHost.js:88` | manifest 的 `surface.id` 与 `api.surfaces.register()` 的 id 必须字面一致（本插件统一用 `workbench` / `prompt-preview`）；`tests/test_manifest_contract.py::test_surface_ids_match_frontend_registrations` 做静态对齐 |
+| C16 | 宿主 surface 容器已完成定位、尺寸、滚动、`data-marquee-ignore`、`role="dialog"`/`aria-modal`、焦点陷阱、ESC 关闭；插件**只能**在容器内建 DOM，**不得**设置容器或其祖先的 `position`/`z-index`/`inset`。`mount()` 返回函数时宿主在关闭时调用 | `static/js/pluginSurfaceHost.js:117-200`、`static/css/modules/plugin-surfaces.css` | `mount(container, ctx)` 只往容器里 append；返回值用于摘 DOM；不碰容器样式 |
+| C17 | 宿主 surface 容器**刻意不提供** `backdrop-filter`（Chromium backdrop root 会画出黑块/平坦灰），插件 overlay 上的 `backdrop-filter: blur(5px)` 与 `body:has(...) .main-container { backdrop-filter: none }` 兜底规则都必须删除；`api.setFullscreenScrim()` 也不再需要 | `static/js/pluginSurfaceHost.js:15-17`、`static/css/modules/plugin-surfaces.css:9-15` | 两条规则已删除；插件 CSS 里 `backdrop-filter` 出现次数为 0（`tests/test_css_scope.py` 锁定） |
 | C11 | 插件后端以 `st_plugin_stm_ai_assistant` 模块名加载，**不注入 sys.path** | `core/plugins/registry.py:262-286` | 插件内一律相对导入（`from .core.prompt import ...`）；禁止 `import backend` |
 | C12 | 作业归属强校验；越权一律按「作业不存在」处理 | `jobs.py:299-318`、附录 L | 前端只用本插件的 run_id；插件路由内对 `api.get_job(run_id)` 做 `None` 判空 |
 
 ### 1.3 硬约束清单（违反即静默失效或拒绝加载）
 
-1. `manifest.json` 在仓库根；`id = stm-ai-assistant`（等于目录名）；`api_version = 1`；`min_app_version = 1.0.0`。
+1. `manifest.json` 在仓库根；`id = stm-ai-assistant`（等于目录名）；`api_version = 2`；`manifest_version = 2`；`min_app_version = 1.0.0`。
 2. `backend.jobs` 必须预先声明全部 `job_type`，否则 `register_job` 抛 `ValueError`（`api.py:289-297`）。
-3. `backend.hooks` 只能取白名单 11 个事件（`manifest.py:37-49`）。
-4. `permissions` 只能取白名单 9 项（`manifest.py:52-57`）；如实声明（声明即审计）。
+3. `backend.hooks` 只能取白名单 11 个事件（`manifest.py:61-73`）。
+4. `permissions` 只能取白名单 9 项（`manifest.py:76-81`）；如实声明（声明即审计）。
 5. 私有表名必须带 `plugin_stm_ai_assistant_` 前缀，且 `migrate` 只接受 `CREATE TABLE / CREATE INDEX`（`api.py:364-394`）。
 6. 密钥环境变量名：`STM_PLUGIN_STM_AI_ASSISTANT_<KEY>`（`secrets.py:67-71`）。
-7. 前端 `toast(msg, duration, icon)` 的 `duration` 必须是数字；图标名须在主程序白名单内（设计文档 F6/F7）。
-8. 框选区域内的插件控件需加 `data-marquee-ignore`（设计文档 F5）。
+7. 前端 `api.host.toast(msg, duration, icon)` 的 `duration` 必须是数字（传字符串会被强制成 3000）；图标名须在宿主图标表内（`GET /api/plugins/ui-icons`）。
+8. 框选区域内的插件控件需加 `data-marquee-ignore`（宿主 surface 容器已自带）。
+9. **`frontend` 段只允许 `entry` / `styles` / `entries`**；旧三字段出现即拒绝加载。
+10. **`entries[].icon` 用宿主图标名**（不含 `/` 与 `.`）；不存在时不拒绝加载，但记 warning 并降级为占位。
+11. **插件 CSS 不得出现 `position: fixed`**（声明层检查会记 warning，且会相对视口定位把宿主布局打散）。
+12. **不得硬编码宿主 sprite 路径**（`url('/static/icons/…')` 或 `icons/ui.svg`）；插件自带资源走 `/api/plugins/<id>/assets/…`。
 
 ---
 
@@ -651,53 +667,105 @@ def chat(messages, *, provider: dict, api_key: str, extra_headers: dict | None =
 
 ## 8. 前端设计
 
-### 8.1 挂载与入口
+### 8.1 入口表（`manifest.frontend.entries`）
 
-`export async function activate(api)`：
+插件**不画入口**：入口是声明，坞 / 命令面板 / 右键菜单 / 设置页由宿主渲染（C4）。
+每项只允许 `KNOWN_ENTRY_KEYS` 内的子键（C13），图标用宿主图标名（C10 硬约束 10）。
 
-1. `const root = api.createRoot('div')`（自动带 `data-plugin="stm-ai-assistant"`，挂到 `#plugin-host-root`）。
-2. 在 `root` 内渲染一个**浮动入口按钮**（`position: fixed`，右下角，带 `data-marquee-ignore`）与一个**隐藏的 overlay 容器**。
-3. 点击按钮 → 打开 overlay（自绘遮罩 + 面板），不依赖主程序的 `ui-modal-*` 骨架（C4）。
-4. 返回清理函数：移除节点、关闭 EventSource、注销事件监听。
+| id | kind | label | icon | surface | 条件 | 落地位置 |
+|---|---|---|---|---|---|---|
+| `workbench` | `dock` | AI 助手 | `wand` | `workbench`（panel） | — | 入口坞（community 默认进溢出菜单，用户可固定到坞槽位） |
+| `analyze-selected` | `context` | 分析选中的角色卡 | `tags` | `workbench`（panel） | `requires_selection: true`，`when: {mode:["cards"], selection:"any"}`，`disabledHint: 请先在角色卡视图里选中至少一张卡片` | 右键菜单 / 命令面板；未选卡时**可见但置灰** |
+| `open-review` | `command` | AI 助手：结果与审批 | `clipboard` | `workbench`（panel） | `when: {config: {requireKeys:["default_profile_id"]}}`，`disabledHint: 请先在「AI 助手 → 设置」里选择默认提示词档案` | 命令面板；未配档案时置灰，点击跳转到插件配置区 |
+| `assistant-settings` | `settings` | AI 助手设置 | `settings-gear` | `workbench`（panel） | — | 设置页插件区 |
 
-**样式**：全部选择器以 `.plugin-stm-ai-assistant` 开头（C10）；颜色只用 CSS 变量（`var(--content-secondary)` 等），不使用 Tailwind 调色板类（附录 K 的资产审计口径）。
+**tier = `community`**（C14）：因此**不声明 `nav` / `status`**——那两类 kind 会被宿主静默
+忽略并记 warning。本插件共 4 项，远低于 16 项上限。
 
-### 8.2 面板结构
+四个入口复用同一个 surface（`workbench`），由 `mount(container, ctx)` 按
+`ctx.targetId` 决定落到哪个页签（见 §8.2 的 `tabForTarget`）。
+
+### 8.2 surface 表与面板结构
+
+`api.surfaces.register(surfaceId, spec)`；容器由宿主提供（C16），`surface.id` 与
+manifest 字面一致（C15）。
+
+| surface.id | type | 用途 | `mount` 行为 |
+|---|---|---|---|
+| `workbench` | `panel` | 主面板（四个页签） | 把「状态条 + 页签栏 + 主体」append 进宿主容器；返回摘 DOM 的函数 |
+| `prompt-preview` | `modal` | Prompt 全文预览（原本塞在页签里造成长滚动） | 由 `panel.js:createPromptPreview` 渲染消息块 |
+
+**宿主负责、插件不重复实现**（C16 / C17）：定位、尺寸、滚动、`data-marquee-ignore`、
+`role="dialog"` / `aria-modal`、焦点陷阱、ESC 关闭、遮罩合成、`z-index`。
+插件**不创建** overlay / shell / 顶栏 / 关闭按钮（标题与关闭钮是宿主 DOM，
+`.plugin-surface__title` / `.plugin-surface__close`，插件 CSS 选不中也**不该**去选，硬约束坑 5）。
 
 ```
-┌─ AI 助手 ─────────────────────────────────────────────┐
-│ [工作台] [结果与审批] [提示词档案] [设置]                │
+宿主容器 .plugin-surface--panel（右侧抽屉，宽度 min(420px, 92vw)）
+┌─ AI 助手                              [×]  ← 宿主渲染的标题栏
+├───────────────────────────────────────────────────────┤
+│ 档案 5  Provider 2  写回 逐条审批  待审批 3            │ ← 插件：状态条（常驻）
+├───────────────────────────────────────────────────────┤
+│ [工作台] [结果与审批] [提示词档案] [设置]               │ ← 插件：页签
 ├───────────────────────────────────────────────────────┤
 │ 工作台                                                 │
-│  目标：○ 概览+标签 ○ 仅概览 ○ 仅标签                    │
-│  档案：gpt-4o → 命中「GPT 家族」(builtin-gpt)  [查看]   │
-│  Provider：[OpenAI ▾] 模型：[gpt-4o-mini]  批次：[10]   │
-│  ☑ 跳过未变化的卡片  ☐ 仅预览不写入  ☐ 严格校验         │
-│  预计：约 12,400 prompt tokens / 1,800 completion tokens│
-│  [预览 Prompt]  [开始分析]                              │
-│                                                         │
-│ 结果与审批                                              │
-│  42 完成 · 3 失败 · 61,203 tokens                       │
-│  ☑ 卡片A  概览：……  标签：+战斗 +奇幻  新标签：赛博朋克  │
-│  ☐ 卡片B  ⚠ 解析失败：……                                │
-│  [全选] [全不选] [应用已接受] [只重跑失败项]             │
+│  1 · 选择卡片                                          │
+│   已选 12 张 · 卡片A、卡片B、卡片C …                    │
+│   [读取主程序选择] [清空] [手动选择]                    │
+│  2 · 运行参数                                          │
+│   Provider [OpenAI ▾] 模型 [gpt-4o-mini]               │
+│   提示词档案 [gpt-4o → GPT 家族 ▾]                     │
+│   分析目标 [概览+标签 ▾] 写回方式 [逐条审批 ▾]          │
+│   ☑ 仅预览不写入  ☐ 忽略幂等                            │
+│  3 · 预览与执行                                        │
+│   [预览 Prompt] [开始分析] [取消作业]                   │
+│  4 · 进度                                              │
+│   状态 running · 完成 12/42 · 失败 0 · 跳过 3           │
 └───────────────────────────────────────────────────────┘
 ```
 
-### 8.3 与主程序 UI 的耦合点（Provisional，全部带兜底）
+**文件分工**：
 
-| 用途 | 方式 | 兜底 |
-|---|---|---|
-| 读取用户选中的卡片 | `api.store.viewState.selectedIds`（`static/js/state.js:765`） | 取不到 → 面板内提供卡片多选列表（走插件自己的 `/cards` 路由） |
-| 概览写后刷新列表 | `api.refresh('cards')` | 事件无人监听 → 提示用户手动刷新 |
-| 轻提示 | `api.toast(msg, 3000, 'check')` | — |
-| 打开作业面板 | `api.jobs.open(runId, {title})` | 失败 → 插件自建进度区（`subscribeJob` 直连） |
+| 文件 | 职责 |
+|---|---|
+| `frontend/plugin.js` | `activate(api)`：注册 2 个 surface、启动自检、回报入口状态、返回清理函数（D9.1） |
+| `frontend/panel.js` | surface **内容**渲染器（`createPanelBody`）+ Prompt 预览（`createPromptPreview`）。不含 overlay / ESC / 点击遮罩关闭 |
+| `frontend/dom.js` | `el`/`clear`/格式化等纯辅助；`createUi(api)` 构造委托到 `api.ui.*` 的 `icon`/`button`/`badge`/`section`，以及插件自有的 `styledSelect`/`numberInput` |
+| `frontend/selection.js` | **唯一的 Provisional 耦合点**：读取选中卡片 id |
+| `frontend/views/*.js` | 四个页签的视图（逻辑基本未动，只替换 API 形态） |
+
+**样式**：全部选择器以 `.plugin-stm-ai-assistant` 开头（C10）；颜色只用 CSS 变量，
+零十六进制字面量；**零 `position: fixed`**（层级归宿主容器，硬约束 11）。
+
+### 8.3 与主程序 UI 的耦合点
+
+| 用途 | 方式 | 稳定性 | 兜底 |
+|---|---|---|---|
+| 入口可用/置灰 | `entries[].when`（宿主求值，D7） | Stable | 插件不自行判断 |
+| 待审批角标 | `api.entries.setBadge('open-review', n)` | Stable | — |
+| 自检结论 / 作业进度 | `api.entries.setStatus` / `setProgress` / `setBusy` | Stable | — |
+| **读取用户选中的卡片** | `api.store.viewState.selectedIds`，**集中封装在 `frontend/selection.js`** | **Provisional** | 取不到 → 返回 `[]`，面板内提供卡片多选列表（走插件自己的 `/cards` 路由） |
+| 概览写后刷新列表 | `api.host.refresh('cards')` | Stable | 事件无人监听 → 提示用户手动刷新 |
+| 轻提示 | `api.host.toast(msg, 3000, 'check')` | Stable | — |
+| 配置变更 | `api.onConfigChange(handler)`（D10，替代轮询） | Stable | 旧宿主无此成员时跳过订阅 |
+| 打开作业面板 | `api.jobs.open(runId, {title})` | Provisional | 失败 → 插件自建进度区（`subscribeJob` 直连） |
+
+> **Provisional 登记**：`api.store.viewState.selectedIds` 是宿主 Alpine store 的内部形状，
+> 随宿主重构而变。新契约把这部分责任交给宿主（`entries[].when.selection` 由宿主求值，
+> 插件只声明「需要至少选中一张」），但「提交作业」终究需要**具体 id 列表**，而
+> `ctx.targetId` 只给入口 id、`api.entries.list()` 只给 `enabled` 布尔值。
+> 因此保留最小读取，并把耦合**全部收进 `frontend/selection.js`**；宿主一旦提供稳定 API
+> （例如 `api.host.getSelection()`），只改这一个文件即可完成迁移。
+> 相关回归：`tests/test_manifest_contract.py::test_frontend_avoids_removed_host_apis`。
 
 ### 8.4 进度与审批
 
 - 进度：`api.subscribeJob(runId, {snapshot, item, log, done, error})`；`item` 事件逐条更新结果表；`done` 刷新汇总并写 `pending_reviews`。
+- 进度同时回报到坞入口：`api.entries.setProgress('workbench', {done, total})` + `setBusy`。
 - 审批：每行两个按钮 → `api.api('/jobs/<run_id>/items/<key>/review', {method:'POST', body:{status}})`（主程序端点）；全部处理完后 → `api.api('/jobs/<run_id>/apply', {method:'POST', body:{...}})`（插件端点）。
-- 断线重连：`subscribeJob` 自带 SSE + 4s 轮询降级（`pluginHost.js:377-461`）。
+- 断线重连：`subscribeJob` 自带 SSE + 4s 轮询降级（`pluginHost.js:638-725`）。
+- **宿主不会替插件清 backend 作业**（卸载/禁用只强制卸载 surface），因此 `activate` 的
+  返回值里保留 `subscribeJob` 的取消订阅与 `setBusy(false)` / `setProgress(null)` 复位。
 
 ---
 
@@ -862,10 +930,16 @@ def chat(messages, *, provider: dict, api_key: str, extra_headers: dict | None =
 | 作业 ctx 与状态机 | `core/plugins/jobs.py:91-219,242-259` |
 | 同类型作业串行化 | `jobs.py:242-252` |
 | 逐条审批端点 | `core/plugins/routes.py:464-478` |
-| manifest 校验规则（id/正则/白名单） | `core/plugins/manifest.py:24-63,332-525` |
-| CSS 作用域检查算法 | `core/plugins/installer.py:517-591` |
-| 前端 API 面（含 `estimateTokens`） | `static/js/pluginHost.js:180-547` |
-| 挂载锚点与容器样式 | `pluginHost.js:52-62`、`static/css/modules/modal-plugin-manager.css:429-436` |
+| manifest 校验规则（id/正则/白名单） | `core/plugins/manifest.py:24-88,320-661` |
+| 入口（entries）规范化与 tier 准入 | `core/plugins/entries.py`（`KNOWN_ENTRY_KEYS` / `ENTRY_KINDS` / `apply_tier`） |
+| 宿主图标名索引 | `core/plugins/icons.py`（`GET /api/plugins/ui-icons`） |
+| CSS 作用域检查算法 | `core/plugins/installer.py:595-640` |
+| CSS 声明层检查（F13/F15） | `core/plugins/installer.py:700-957` |
+| 前端 API 面（含 `estimateTokens`） | `static/js/pluginHost.js:303-826` |
+| 宿主 UI 原语（`api.ui.*`） | `static/js/uiPrimitives.js`、`static/css/modules/ui-primitives.css` |
+| 入口注册表 / 坞 / 命令面板 | `static/js/entryRegistry.js`、`static/js/components/entryDock.js`、`static/js/components/commandPalette.js` |
+| 宿主表面容器与 `mount` 契约 | `static/js/pluginSurfaceHost.js`、`static/css/modules/plugin-surfaces.css` |
+| 挂载锚点与容器样式 | `pluginHost.js:74-84`、`static/css/modules/modal-plugin-manager.css:429-436` |
 | token 估算公式（后端） | `core/utils/text.py:41-44` |
 | 概览渲染链路 | `core/api/v1/cards.py:1745-1748`、`core/data/cache.py:776-788` |
 | 卡片选择集合 | `static/js/state.js:765`、`static/js/components/cardGrid.js:116-120` |
@@ -931,4 +1005,96 @@ GET /profiles/builtin-gpt → 200（id=builtin-gpt, model_match=gpt-*）
 ```
 
 **前端**：8 个 ES module 全部通过 `node --check`（按 ESM 解析）。
+
+---
+
+## 附录 E · P1 入口与表面重写记录（2026-10-11）
+
+### E.1 交付范围
+
+| 项 | 状态 |
+|---|---|
+| `manifest.json`：`api_version` 1 → 2、新增 `manifest_version: 2`、`version` 0.1.0 → 0.2.0 | ✅ |
+| `frontend.entries`：声明 4 项（`workbench` dock / `analyze-selected` context / `open-review` command / `assistant-settings` settings） | ✅ |
+| `frontend/plugin.js`：入口重写（删 launcher / 拖拽 / `POSITION_KEY` / `clampPos` / `restorePos` / `savePos` / `DRAG_THRESHOLD`），改为 `entries` + `surfaces` 接线 | ✅ |
+| `frontend/panel.js`：`createPanel` → `createPanelBody`（surface 内容渲染器）+ `createPromptPreview`（modal） | ✅ |
+| `frontend/dom.js`：`icon` / `button` / `badge` / `section` 改为委托 `api.ui.*`；保留 `styledSelect` / `numberInput` / `checkbox` | ✅ |
+| `frontend/selection.js`：新增，集中唯一的 Provisional 耦合点 | ✅ |
+| `frontend/views/*.js`：`api.toast` → `api.host.toast`、`badge/button/section` 委托宿主、`window.confirm`/`window.prompt` → `api.ui.confirm`/`api.ui.prompt`、`api.refresh` → `api.host.refresh` | ✅ |
+| `frontend/plugin.css`：删 launcher / overlay / `position: fixed` / `backdrop-filter` / `body:has(...)` 兜底 / 自绘 `.btn` `.badge` `.section*` | ✅ |
+| `frontend/assets/icon.svg`：**保留**（品牌图标，挂在面板状态条左侧的 glyph） | ✅ |
+| `tests/test_manifest_contract.py`：entries 结构校验 + 图标存在性 + tier 准入 + surface id 对齐 + 前端契约 | ✅ |
+| `tests/test_css_scope.py`：新增声明层自检（无 fixed / 无 sprite / 令牌有回退）+ 主程序实现交叉验证 | ✅ |
+| `backend/**` | **零改动**（重写目标是前端职责边界） |
+
+### E.2 验收结果
+
+```
+scan_css_scope(frontend/plugin.css, 'stm-ai-assistant')        → []
+scan_css_declarations(frontend/plugin.css, 'stm-ai-assistant') → {}
+PluginManifest.load(插件目录).warnings                          → []
+PluginManifest.load(插件目录).frontend_entries                 → 4 项
+apply_tier(entries, tier='community')                          → 4 项全保留，warnings = []
+python -m pytest tests/ -q                                     → 334 passed
+主程序 tests/test_plugin_manifest.py + test_plugin_installer.py
+  + test_plugin_css_scope.py                                   → 122 passed
+```
+
+### E.3 与重写文档的偏差
+
+| # | 文档要求 | 实际做法 | 原因 |
+|---|---|---|---|
+| 1 | 步骤 3 建议「另外注册一个 `type: 'modal'` 的 surface 用于 Prompt 预览」 | 已实现（`prompt-preview`），并把档案页的「用当前档案预览」也接进该 surface | 同一份次级内容，两条入口都该走弹层而不是页签内长滚动 |
+| 2 | 步骤 2 提到 `syncSelection()` 可「保留原写法但加注释标注 Provisional 耦合」 | 升级为独立模块 `frontend/selection.js`，并在设计文档 §8.3 登记 | 耦合点集中一处，宿主提供稳定 API 后只改一个文件；测试可静态锁定 |
+| 3 | 步骤 4 表格建议 `section(title, subtitle)` → `api.ui.section({title, description})` | `createUi` 里的 `section()` 返回 `ui.section` 的**内容容器** | 四个视图原本就是「拿到空壳再 append」的用法；直接返回容器可避免大面积改写，且序号前缀（`1 · `）仍由插件渲染 |
+| 4 | 步骤 4 建议 `button(label,'is-ghost',fn)` → `api.ui.button({variant:'ghost'})` | `createUi` 保留旧签名并做 `is-*` → `variant` 映射 | 调用点有 30+ 处；映射层让迁移可读且不改变调用形态 |
+| 5 | 步骤 5 提到「确认 `frontend/assets/icon.svg` 是否还有消费者；没有就一并删掉」 | **保留**，并接到面板状态条左侧的品牌 glyph | 宿主对新契约下的插件品牌图标**没有展示位**（坞的图标槽只吃宿主图标名，surface 标题栏由宿主渲染）——见 E.5。删掉会让插件彻底失去品牌标识，因此挂回插件自己的内容区 |
+| 6 | 步骤 3 要求「`refreshStatus()` 里的 `badge()` 改用 `api.ui.badge`」 | 同前，但状态条拆成「glyph + 徽章槽」两层 | `refreshStatus()` 是清空后重填的；若 glyph 与徽章同层，每次刷新都会把图标一起清掉 |
+
+### E.4 已知遗留
+
+1. **`api.store.viewState.selectedIds` 仍是 Provisional 耦合**（§8.3 已登记）。
+   宿主提供 `api.host.getSelection()` 之类稳定接口后，只改 `frontend/selection.js`。
+2. **社区 tier 的坞行为**：`tier = community` 时坞默认把入口放进**溢出菜单**而非坞槽位
+   （`entryRegistry.js:691-701`）。用户可在入口总览页固定。若希望开箱即进坞，需把本插件
+   加进主程序 `catalog.json` 并标 `tier: "official"`——**那是主程序仓库的改动**，
+   不在本次范围内。
+3. **`api.ui.badge` 的视觉与原自绘徽章不同**：宿主的 `ui-primitive-badge` 是实心色块，
+   旧自绘是描边胶囊。这是「统一到宿主外观」的预期代价（重写文档第 3 节明确要求）。
+4. **端到端手工验收**（重写文档 §5 第 4 条，8 项）尚未执行——需要启动主程序、
+   在真实坞/命令面板里点击验证。自动化测试覆盖了 manifest / CSS / 静态契约，
+   但「点击坞入口打开抽屉」「框选不命中面板」这类行为只能手工确认。
+
+### E.5 图标能力实测（三条路径，能力不同）
+
+新契约下「插件图标」有三条互不相同的路径，**不要混用**：
+
+| 路径 | 支持插件自带图标？ | 实测证据 |
+|---|---|---|
+| **插件资源 URL**（CSS `mask` / `<img>` / 背景图） | ✅ **支持** | `core/plugins/assets.py` 的 `/api/plugins/<id>/assets/<path>` 路由；`ALLOWED_EXTENSIONS` 含 `.svg`。实测：`GET assets/frontend/assets/icon.svg` → `200 image/svg+xml`；`assets/backend/routes.py` → `404`（扩展名白名单 + `is_under_base` 边界检查生效） |
+| **`entries[].icon`**（坞 / 命令面板的图标槽） | ❌ **不支持** | 只吃宿主图标名。实测 `static/js/utils/icons.js:resolveIconUrl('assets/icon.svg')` → **空串**，`uiPrimitives.icon()` 会打上 `is-missing` 并降级为占位图标（不报错，静默降级） |
+| **`manifest.icon`**（插件级图标） | ⚠️ 后端下发了，**全仓无渲染者** | `core/plugins/registry.py:84` 把 `manifest.icon` 放进 header，但 `static/`、`templates/` 里没有任何消费者读取它 |
+
+**本插件的选择**：品牌图标（`frontend/assets/icon.svg`，VTracer 生成的图形，
+`fill: currentColor`）走**第一条**——挂在面板状态条左侧的 `.plugin-stm-ai-assistant-glyph`，
+用 CSS `mask` 抠形、颜色取 `var(--accent-text)`，深浅主题自适应。
+入口图标（坞 / 命令面板）走宿主图标名（`wand` / `tags` / `clipboard` / `settings-gear`）。
+两者互不干扰。
+
+**两个易踩的坑**：
+
+1. **`entries[].icon` 写资源路径不会生效**。`core/plugins/manifest.py:_check_entry_icons`
+   的注释说「含 `/` 或 `.` 的取值视为插件自带资源路径，由宿主按 `assets/` 解析」——
+   但**前端没有实现这条分支**（`resolveIconUrl` 直接返回空串）。这是宿主侧
+   文档与实现的不一致，已在本节记录；插件侧不要依赖它。
+2. **glyph 不能与徽章同层**。`refreshStatus()` 是「清空后重填」的，若把品牌图标
+   放进同一个容器，每次状态刷新都会让图标消失。因此状态条拆成
+   `.plugin-stm-ai-assistant-glyph` + `.plugin-stm-ai-assistant-status-badges` 两层，
+   `refreshStatus()` 只清后者。回归用例：
+   `tests/test_css_scope.py::test_brand_glyph_survives_status_refresh`。
+
+**CSS 合规性**：插件资源 URL 不属于宿主 sprite，因此不会被 F15 的
+`hardcoded_sprite` 误判（`_SPRITE_REFERENCE_PATTERN` 只匹配 `/static/icons/` 与
+`icons/{ui,detail,sidebar,preset}.svg`）。实测 `scan_css_declarations` 仍为 `{}`。
+回归用例：`tests/test_css_scope.py::test_plugin_brand_icon_is_a_plugin_owned_asset`。
 

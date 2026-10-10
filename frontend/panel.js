@@ -1,53 +1,54 @@
 /**
- * 面板骨架：浮动入口按钮 + 自绘 overlay + 四个页签。
+ * surface 内容渲染器：状态条 + 四个页签 + 主体。
  *
- * 说明（设计文档 C4）：主程序 manifest 的 `frontend.panels` / `settings_tab` /
- * `detail_tab` 目前**没有前端消费者**，`registerModal()` / `registerSettingsSection()`
- * 也只写入内存 Map 而无人渲染。因此插件 UI 自建：
- * - 入口：`api.createRoot()` 挂载点内的浮动按钮（`position: fixed`）；
- * - 面板：自带遮罩与尺寸的 overlay（不依赖主程序的 `ui-modal-*` 骨架）。
+ * 契约变化（本次重写的核心）：
+ * 旧版 `createPanel` 返回 `{ element: overlay, open, close, ... }`，插件自绘
+ * `position: fixed` 遮罩、自己绑 ESC、自己处理点击遮罩关闭、自己管焦点。
+ * 现在容器由宿主提供（`pluginSurfaceHost.js`）：定位、尺寸、滚动、`role="dialog"`、
+ * `aria-modal`、焦点陷阱、ESC 关闭、遮罩合成全归宿主，插件**只在容器内画内容**。
+ *
+ * 因此这里：
+ * - 不再创建 overlay / shell / 顶栏 / 关闭按钮（标题与关闭钮是宿主 DOM）；
+ * - 不再 `document.addEventListener('keydown', ...)`，不再监听遮罩点击；
+ * - 不再调用 `api.setFullscreenScrim`（宿主自己管遮罩合成）。
+ *
+ * 页签切换（`showTab` / `cleanupView` / `refreshStatus`）是插件自己的信息架构，
+ * 原样保留。待审批角标改走 `api.entries.setBadge()`，交给宿主渲染。
  */
 
-import { badge, button, clear, closeSelectMenus, destroySelects, el, icon } from './dom.js';
+import { clear, closeSelectMenus, destroySelects, el } from './dom.js';
 import { createProfiles } from './views/profiles.js';
 import { createReview } from './views/review.js';
 import { createSettings } from './views/settings.js';
 import { createWorkbench } from './views/workbench.js';
 
-const TABS = [
+export const TABS = [
   { id: 'workbench', label: '工作台', icon: 'sliders-settings' },
   { id: 'review', label: '结果与审批', icon: 'tags' },
   { id: 'profiles', label: '提示词档案', icon: 'note' },
   { id: 'settings', label: '设置', icon: 'settings-gear' },
 ];
 
-export function createPanel(api, client, context) {
-  const overlay = el('div', 'plugin-stm-ai-assistant-overlay');
-  const shell = el('div', 'plugin-stm-ai-assistant-shell');
+/** `is-*` 旧色调 → 宿主 `api.ui.badge` 的 tone（设计文档第 3 节映射表）。 */
+const TONE_BY_LEGACY = {
+  'is-ok': 'success',
+  'is-warn': 'warning',
+  'is-error': 'danger',
+  'is-muted': 'neutral',
+};
 
-  // 顶栏：图标块 + 标题/副标 + 右侧状态徽章簇 + ghost 关闭钮（重构版）
-  const header = el('header', 'plugin-stm-ai-assistant-header');
-  const title = el('div', 'plugin-stm-ai-assistant-title');
+function toneOf(legacy) {
+  return TONE_BY_LEGACY[String(legacy || '')] || 'neutral';
+}
+
+export function createPanelBody(api, client, context) {
+  // 状态条：常驻容器。品牌图标与徽章槽分开——refreshStatus 只清徽章槽，
+  // 否则每次刷新都会把图标一起清掉。
+  const statusRow = el('div', 'plugin-stm-ai-assistant-status-row');
   const glyph = el('span', 'plugin-stm-ai-assistant-glyph');
   glyph.setAttribute('aria-hidden', 'true');
-  const titleText = el('div', 'plugin-stm-ai-assistant-title-block');
-  titleText.append(
-    el('span', 'plugin-stm-ai-assistant-title-text', 'AI 助手'),
-    el('span', 'plugin-stm-ai-assistant-meta-caption', '角色卡批量分析'),
-  );
-  title.append(glyph, titleText);
-
-  // 常驻容器：refreshStatus 每次只刷新它，不再删除 badge 节点本身
-  const statusRow = el('span', 'plugin-stm-ai-assistant-status-row');
-  statusRow.append(badge('未连接', 'is-muted'));
-
-  const closeBtn = button('✕', 'is-ghost', () => close());
-  closeBtn.title = '关闭';
-  closeBtn.setAttribute('aria-label', '关闭');
-
-  const headerRight = el('div', 'plugin-stm-ai-assistant-header-right');
-  headerRight.append(statusRow, closeBtn);
-  header.append(title, headerRight);
+  const badgeSlot = el('span', 'plugin-stm-ai-assistant-status-badges');
+  statusRow.append(glyph, badgeSlot);
 
   const tabBar = el('nav', 'plugin-stm-ai-assistant-tabs');
   tabBar.setAttribute('role', 'tablist');
@@ -68,35 +69,23 @@ export function createPanel(api, client, context) {
   let activeTab = 'workbench';
   const tabButtons = {};
 
+  const badge = (value, legacyTone) => api.ui.badge({ value, tone: toneOf(legacyTone) });
+
   TABS.forEach((tab) => {
     const node = el('button', 'plugin-stm-ai-assistant-tab');
     node.type = 'button';
     node.dataset.marqueeIgnore = 'true';
     node.setAttribute('role', 'tab');
-    node.append(icon(tab.icon, 'ui-icon--xs plugin-stm-ai-assistant-tab-icon'));
-    const label = el('span', 'plugin-stm-ai-assistant-tab-label', tab.label);
-    node.append(label);
-    // 数字角标容器（结果与审批等待审批数等），默认隐藏
-    const count = el('span', 'plugin-stm-ai-assistant-tab-count');
-    count.hidden = true;
-    node.append(count);
+    node.append(api.ui.icon(tab.icon, { className: 'ui-icon--xs plugin-stm-ai-assistant-tab-icon' }));
+    node.append(el('span', 'plugin-stm-ai-assistant-tab-label', tab.label));
     node.addEventListener('click', () => showTab(tab.id));
-    tabButtons[tab.id] = { node, count };
+    tabButtons[tab.id] = node;
     tabBar.append(node);
   });
 
-  // 详情页骨架：header → 横向 tabBar → body（对齐 modal-detail.css 的 .detail-tabs 横排）
-  shell.append(header, tabBar, body);
-  overlay.append(shell);
-
-  overlay.addEventListener('click', (event) => {
-    if (event.target === overlay) close();
-  });
-  document.addEventListener('keydown', onKeydown);
-
-  function onKeydown(event) {
-    if (event.key === 'Escape' && overlay.classList.contains('is-open')) close();
-  }
+  // 内容顺序：状态条 → 横向页签 → 主体（宿主的标题栏在上方）
+  const root = el('div', 'plugin-stm-ai-assistant-panel');
+  root.append(statusRow, tabBar, body);
 
   function cleanupView(view, { destroy = false } = {}) {
     if (!view) return;
@@ -108,22 +97,19 @@ export function createPanel(api, client, context) {
   }
 
   function showTab(tabId) {
+    if (!views[tabId]) tabId = 'workbench';
     const previousView = views[activeTab];
     if (previousView && previousView !== views[tabId]) cleanupView(previousView);
     activeTab = tabId;
     clear(body);
-    Object.entries(tabButtons).forEach(([id, entry]) => {
+    Object.entries(tabButtons).forEach(([id, node]) => {
       const on = id === tabId;
-      entry.node.classList.toggle('is-active', on);
-      entry.node.setAttribute('aria-selected', on ? 'true' : 'false');
+      node.classList.toggle('is-active', on);
+      node.setAttribute('aria-selected', on ? 'true' : 'false');
     });
     const view = views[tabId];
-    body.classList.toggle('is-profiles', tabId === 'profiles');
-    Object.values(views).forEach((candidate) => {
-      if (candidate && candidate.element) candidate.element.classList.toggle('is-profiles', candidate === view);
-    });
-    if (view) body.append(view.element);
-    if (view && typeof view.refresh === 'function') view.refresh();
+    body.append(view.element);
+    if (typeof view.refresh === 'function') view.refresh();
     refreshStatus();
   }
 
@@ -132,40 +118,110 @@ export function createPanel(api, client, context) {
       const data = await client.status();
       const providers = data.providers || {};
       const config = data.config || {};
-      clear(statusRow);
       const pending = data.suggestions || 0;
-      statusRow.append(
+      clear(badgeSlot);
+      badgeSlot.append(
         badge(`档案 ${(data.profiles && data.profiles.count) || 0}`),
         badge(`Provider ${providers.count || 0}`),
         badge(`写回 ${config.apply_mode === 'auto' ? '直接写入' : '逐条审批'}`),
         badge(`待审批 ${pending}`, pending ? 'is-warn' : 'is-muted'),
       );
-      // 同步「结果与审批」页签上的待审批角标
-      const reviewEntry = tabButtons.review;
-      if (reviewEntry) {
-        reviewEntry.count.textContent = pending > 99 ? '99+' : String(pending);
-        reviewEntry.count.hidden = !pending;
-      }
+      // 待审批数走宿主入口角标（坞 / 命令面板），不再自绘页签数字
+      syncPendingBadge(pending);
     } catch (error) {
-      clear(statusRow);
-      statusRow.append(badge(`状态读取失败：${error.message}`, 'is-error'));
+      clear(badgeSlot);
+      badgeSlot.append(badge(`状态读取失败：${error.message}`, 'is-error'));
     }
   }
 
-  function open() {
-    overlay.classList.add('is-open');
-    showTab(activeTab);
+  /** 把待审批数同步到 `open-review` 入口角标；为 0 时清除。
+   *
+   * 交给 `context.setPendingBadge`（由 `plugin.js` 注入）而不是直接调
+   * `api.entries.setBadge`：注册表可能还没建表（见 `plugin.js` 的
+   * `createEntryStatusReporter` 注释），那个写入器会负责重放。
+   * 独立存在时（例如被单测直接构造）退化为直接调用。
+   */
+  function syncPendingBadge(pending) {
+    const value = Number(pending) || 0;
+    if (typeof context.setPendingBadge === 'function') {
+      context.setPendingBadge(value);
+      return;
+    }
+    api.entries.setBadge('open-review', value > 0 ? (value > 99 ? '99+' : value) : null);
   }
 
-  function close() {
-    cleanupView(views[activeTab]);
-    overlay.classList.remove('is-open');
+  /** 入口打开时按 `ctx.targetId` 落到对应页签（一个 surface 服务 4 个入口）。 */
+  function tabForTarget(targetId) {
+    const target = String(targetId || '');
+    if (target === 'open-review') return 'review';
+    if (target === 'assistant-settings') return 'settings';
+    return 'workbench';
   }
 
-  function destroy() {
-    document.removeEventListener('keydown', onKeydown);
-    Object.values(views).forEach((view) => cleanupView(view, { destroy: true }));
+  return {
+    element: root,
+    showTab,
+    refreshStatus,
+    tabForTarget,
+    /** 宿主关闭 surface 时调用：只摘 DOM，视图实例留待下次 mount 复用。 */
+    detach() {
+      cleanupView(views[activeTab]);
+      root.remove();
+    },
+    get activeTab() {
+      return activeTab;
+    },
+    destroy() {
+      Object.values(views).forEach((view) => cleanupView(view, { destroy: true }));
+    },
+  };
+}
+
+/**
+ * 「Prompt 预览」次级 surface（`type: 'modal'`）。
+ *
+ * 存在意义有二：把结构上属于「次级内容」的东西从页签里搬出来，以及让插件真实
+ * 使用四种容器类型中的第二种——宿主的 modal 容器自带遮罩、居中、焦点陷阱。
+ */
+export function createPromptPreview(api) {
+  let root = null;
+  let blocks = [];
+
+  function render() {
+    if (!root) return;
+    clear(root);
+    if (!blocks.length) {
+      root.append(api.ui.empty({
+        icon: 'file',
+        title: '还没有可预览的 Prompt',
+        description: '请先在工作台点击「预览 Prompt」。',
+      }));
+      return;
+    }
+
+    blocks.forEach((message) => {
+      const block = el('div', 'plugin-stm-ai-assistant-message');
+      block.append(el('div', 'plugin-stm-ai-assistant-message-role', message.role));
+      block.append(el('pre', 'plugin-stm-ai-assistant-message-body', message.content));
+      root.append(block);
+    });
   }
 
-  return { element: overlay, open, close, destroy, showTab };
+  return {
+    mount(container) {
+      root = el('div', 'plugin-stm-ai-assistant-view');
+      container.append(root);
+      render();
+      // 宿主关闭时调用：摘掉自己的节点，并清空引用（下次 mount 重新创建）
+      return () => {
+        root.remove();
+        root = null;
+      };
+    },
+    /** 由工作台 / 档案页在拿到预览结果后调用（调用方随后打开该 surface）。 */
+    setMessages(messages) {
+      blocks = Array.isArray(messages) ? messages : [];
+      render();
+    },
+  };
 }

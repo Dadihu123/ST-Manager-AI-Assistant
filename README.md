@@ -21,10 +21,44 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 
 1. 重启 ST-Manager（后端插件在 `create_app()` 阶段加载）。
 2. 打开「设置 → 维护与高级 → 插件管理」，确认状态为「已启用 / 加载成功」。
-3. 右下角会出现「AI 助手」浮动按钮，点击打开面板。
+3. 入口坞（屏幕右侧的图标条）会出现「AI 助手」入口；点击打开宿主提供的右侧抽屉。
+   也可以在命令面板里搜「AI 助手」。
 
+> **需要主程序 `PLUGIN_API_VERSION >= 2`**（本插件 `api_version = 2`）；旧主程序会以
+> `PluginApiVersionError` 拒绝加载。
+>
 > 主程序以 `st_plugin_stm_ai_assistant` 模块名加载 `backend/`，**不注入 `sys.path`**，因此插件内部一律使用相对导入。
 > 插件私有数据（档案、缓存、用量）写在 `data/plugins/stm-ai-assistant/data/`，卸载时由主程序按需清理。
+
+### 插件声明的入口
+
+插件**不画入口**——入口在 `manifest.json` 的 `frontend.entries` 里声明，由宿主渲染：
+
+| 入口 | 类型 | 位置 | 何时可用 |
+|---|---|---|---|
+| AI 助手 | `dock` | 入口坞 | 始终 |
+| 分析选中的角色卡 | `context` | 右键菜单 / 命令面板 | 角色卡视图下且至少选中一张卡 |
+| AI 助手：结果与审批 | `command` | 命令面板 | 已配置默认提示词档案 |
+| AI 助手设置 | `settings` | 设置页插件区 | 始终 |
+
+> 本插件的归属分级是 `community`，因此**不声明** `nav` / `status` 入口（那两类 kind 对社区
+> 插件不可用）。community 插件的 dock 入口默认进坞的**溢出菜单**，可在入口总览页固定到坞槽位。
+>
+> 不可用的入口**可见但置灰**，点击会跳到对应的配置位置，不会无反应。
+
+### 界面约定
+
+- 面板容器（定位、尺寸、滚动、焦点陷阱、ESC 关闭、遮罩合成）全部由主程序提供；
+  插件只在容器内渲染内容。因此插件 CSS 里没有 `position: fixed`，也不接管键盘。
+- 面板内容由「状态条 + 四个页签 + 主体」组成：状态条常驻显示品牌图标、档案数 /
+  Provider 数 / 写回方式 / 待审批数。待审批数同时显示为坞入口上的角标。
+- Prompt 全文预览走独立的 `modal` 弹层（不塞在页签里造成长滚动）。
+
+> **关于图标**：入口图标（坞 / 命令面板）用**宿主图标名**（`manifest.json` 的
+> `entries[].icon`，如 `wand`），因为宿主图标槽不解析插件资源路径；
+> 插件自己的品牌图标是 `frontend/assets/icon.svg`，走
+> `/api/plugins/stm-ai-assistant/assets/…` 资源路由，挂在面板状态条左侧。
+> 两条路径能力不同，详见设计文档附录 E.5。
 
 ---
 
@@ -137,7 +171,10 @@ python app.py plugin stm-ai-assistant analyze Alice.png --apply   # 写回磁盘
 | 现象 | 处理 |
 |---|---|
 | 插件列表显示「加载失败」 | 查看管理界面的 `load_error`；常见原因是 `api_version` 与主程序不匹配（需更新主程序） |
-| 右下角没有浮动按钮 | 确认插件已启用且重启过；打开控制台看 `[pluginHost]` 日志（样式未通过作用域检查时会被拒绝加载） |
+| 坞里没有「AI 助手」入口 | ① 确认插件已启用且重启过；② community 插件的 dock 入口默认进**溢出菜单**，在入口总览页把它固定到坞槽位；③ 打开控制台看 `[pluginHost]` 日志（样式未通过作用域检查时会被拒绝加载） |
+| 点击坞入口没反应 | manifest 的 `surface.id` 与 `plugin.js` 的 `api.surfaces.register()` id 不一致时**不报错且无反应**（本插件统一用 `workbench`）；检查控制台有无 `[surfaceHost] 未注册的 surface` |
+| 命令面板里「结果与审批」是灰的 | 尚未选择默认提示词档案；点它可跳到插件配置区 |
+| 「分析选中的角色卡」是灰的 | 需要切到角色卡视图并至少选中一张卡片 |
 | 提示「尚未配置 Provider」 | AI 助手 → 设置 → 新增 Provider 并填写 API Key |
 | 提示「概览写入通道不可用」 | 主程序版本过旧或内部接口变化；概览会降级保存在插件内，标签写入不受影响 |
 | 作业大量 `llm_auth_failed` | API Key 无效或权限不足（401/403 不重试） |
@@ -162,7 +199,13 @@ python -m pytest tests -q
 
 - `backend/core/`：纯函数层（token 估算、内容哈希、模板渲染、档案匹配、输出解析、世界书取样）。**不导入 flask，也不导入主程序模块**，因此可以独立单测。
 - `backend/`：装配层（`store` / `llm` / `jobs` / `routes` / `cli` / `summary_bridge`）。
-- `frontend/`：ES module 前端（入口 `plugin.js`，视图在 `views/`），CSS 全部以 `.plugin-stm-ai-assistant` 作用域限定。
-- `tests/`：`FakeApi` / `FakeCtx` 替身 + `FakeTransport` 打桩，覆盖纯函数、LLM 重试与取消、作业写回语义、HTTP 路由与审批应用。
+- `frontend/`：ES module 前端。`plugin.js` 只做接线（注册 surface、回报入口状态、返回清理函数）；
+  `panel.js` 是 surface **内容**渲染器（不含 overlay / ESC / 遮罩）；`dom.js` 里
+  `icon`/`button`/`badge`/`section` 委托 `api.ui.*`，`styledSelect`/`numberInput` 为插件自有控件；
+  `selection.js` 集中唯一的 Provisional 耦合点（读取选中卡片）；
+  `assets/icon.svg` 是插件品牌图标（走插件资源路由，不占宿主图标名）。
+  CSS 全部以 `.plugin-stm-ai-assistant` 作用域限定，且**不含 `position: fixed`**（层级归宿主容器）。
+- `tests/`：`FakeApi` / `FakeCtx` 替身 + `FakeTransport` 打桩，覆盖纯函数、LLM 重试与取消、作业写回语义、HTTP 路由与审批应用；
+  `test_manifest_contract.py` / `test_css_scope.py` 复刻主程序校验规则做静态自检，并用真实实现交叉验证。
 
 设计文档：[`docs/2026-10-08-stm-ai-assistant-design.md`](docs/2026-10-08-stm-ai-assistant-design.md)（本仓库的唯一事实来源；实现与文档冲突时先改文档）。

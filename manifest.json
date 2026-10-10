@@ -1,8 +1,9 @@
 {
   "id": "stm-ai-assistant",
   "name": "AI 角色卡分析助手",
-  "version": "0.1.0",
-  "api_version": 1,
+  "version": "0.2.0",
+  "api_version": 2,
+  "manifest_version": 2,
   "author": "ST-Manager",
   "description": "为角色卡生成概览与标签建议：服务端 LLM 调用、按模型分档的提示词工程、批量作业与逐条审批、幂等跳过与成本记账。",
   "license": "MIT",
@@ -19,6 +20,72 @@
     "entry": "frontend/plugin.js",
     "styles": [
       "frontend/plugin.css"
+    ],
+    "entries": [
+      {
+        "id": "workbench",
+        "kind": "dock",
+        "label": "AI 助手",
+        "description": "角色卡批量分析工作台：概览与标签建议、结果审批、提示词档案与设置。",
+        "icon": "wand",
+        "surface": {
+          "id": "workbench",
+          "type": "panel"
+        },
+        "priority": 40
+      },
+      {
+        "id": "analyze-selected",
+        "kind": "context",
+        "label": "分析选中的角色卡",
+        "description": "对当前选中的卡片提交一次 AI 分析作业。",
+        "icon": "tags",
+        "surface": {
+          "id": "workbench",
+          "type": "panel"
+        },
+        "requires_selection": true,
+        "when": {
+          "mode": [
+            "cards"
+          ],
+          "selection": "any"
+        },
+        "disabledHint": "请先在角色卡视图里选中至少一张卡片",
+        "priority": 60
+      },
+      {
+        "id": "open-review",
+        "kind": "command",
+        "label": "AI 助手：结果与审批",
+        "description": "直接打开待审批的分析结果。",
+        "icon": "clipboard",
+        "surface": {
+          "id": "workbench",
+          "type": "panel"
+        },
+        "when": {
+          "config": {
+            "requireKeys": [
+              "default_profile_id"
+            ]
+          }
+        },
+        "disabledHint": "请先在「AI 助手 → 设置」里选择默认提示词档案",
+        "priority": 70
+      },
+      {
+        "id": "assistant-settings",
+        "kind": "settings",
+        "label": "AI 助手设置",
+        "description": "Provider、密钥、用量与新标签建议。",
+        "icon": "settings-gear",
+        "surface": {
+          "id": "workbench",
+          "type": "panel"
+        },
+        "priority": 80
+      }
     ]
   },
   "permissions": [

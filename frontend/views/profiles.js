@@ -6,17 +6,13 @@
  */
 
 import {
-  badge,
-  button,
   checkbox,
   clear,
+  createUi,
   el,
   field,
   formatTime,
   input,
-  numberInput,
-  section,
-  select,
   textarea,
 } from '../dom.js';
 
@@ -26,6 +22,7 @@ const MISSING_POLICIES = [
 ];
 
 export function createProfiles(api, client, context) {
+  const { badge, button, numberInput, section, select } = createUi(api);
   const root = el('div', 'plugin-stm-ai-assistant-view');
   const state = {
     list: [],
@@ -174,7 +171,7 @@ export function createProfiles(api, client, context) {
       renderList();
       renderEditor();
     } catch (error) {
-      api.toast(`读取档案失败：${error.message}`, 3600, 'close');
+      api.host.toast(`读取档案失败：${error.message}`, 3600, 'close');
     }
   }
 
@@ -184,10 +181,10 @@ export function createProfiles(api, client, context) {
       await client.setActiveProfile(profileId);
       state.activeId = profileId;
       context.profileId = profileId;
-      api.toast(`当前档案已切换为 ${profileId}`, 2600, 'check');
+      api.host.toast(`当前档案已切换为 ${profileId}`, 2600, 'check');
       renderList();
     } catch (error) {
-      api.toast(`切换失败：${error.message}`, 3600, 'close');
+      api.host.toast(`切换失败：${error.message}`, 3600, 'close');
     }
   }
 
@@ -266,6 +263,11 @@ export function createProfiles(api, client, context) {
       field('top_p', fields.top_p),
       field('max_tokens', fields.max_tokens),
     );
+    editorControls = editorControls.concat([
+      fields.priority, fields.summary_min, fields.summary_max, fields.tags_min,
+      fields.tags_max, fields.confidence, fields.temperature, fields.top_p,
+      fields.max_tokens,
+    ]);
 
     const toggles = el('div', 'plugin-stm-ai-assistant-row');
     toggles.append(fields.json_only, fields.strip_think);
@@ -352,12 +354,12 @@ export function createProfiles(api, client, context) {
       renderVariableHint();
 
       if ((data.unknown || []).length) {
-        api.toast(`存在未知变量：${data.unknown.join('、')}`, 4200, 'close');
+        api.host.toast(`存在未知变量：${data.unknown.join('、')}`, 4200, 'close');
       } else {
-        api.toast('模板变量校验通过', 2400, 'check');
+        api.host.toast('模板变量校验通过', 2400, 'check');
       }
     } catch (error) {
-      api.toast(error.message, 3600, 'close');
+      api.host.toast(error.message, 3600, 'close');
     }
   }
 
@@ -372,7 +374,7 @@ export function createProfiles(api, client, context) {
 
   async function previewWith(fields) {
     if (!context.selectedCardIds || !context.selectedCardIds.length) {
-      api.toast('请先在工作台选择一张卡片', 3000, 'close');
+      api.host.toast('请先在工作台选择一张卡片', 3000, 'close');
       return;
     }
     try {
@@ -381,9 +383,13 @@ export function createProfiles(api, client, context) {
         card_id: context.selectedCardIds[0],
         profile_id: profile.id,
       });
-      api.toast(`预览：${data.tokens.total} token（${data.profile.id}）`, 3600, 'settings-help-entry');
+      api.host.toast(`预览：${data.tokens.total} token（${data.profile.id}）`, 3600, 'settings-help-entry');
+      // 全文交给宿主的 modal surface（见 panel.js 的 createPromptPreview）
+      if (typeof context.openPromptPreview === 'function') {
+        context.openPromptPreview(data.messages || []);
+      }
     } catch (error) {
-      api.toast(`预览失败：${error.message}`, 3600, 'close');
+      api.host.toast(`预览失败：${error.message}`, 3600, 'close');
     }
   }
 
@@ -392,7 +398,7 @@ export function createProfiles(api, client, context) {
     try {
       profile = collect(fields);
     } catch (error) {
-      api.toast(error.message, 4000, 'close');
+      api.host.toast(error.message, 4000, 'close');
       return;
     }
 
@@ -400,41 +406,45 @@ export function createProfiles(api, client, context) {
       const data = await client.saveProfile(profile);
       state.current = data.profile;
       state.isNew = false;
-      api.toast('已保存', 2400, 'check');
+      api.host.toast('已保存', 2400, 'check');
       await load();
       renderEditor();
     } catch (error) {
       const detail = (error.detail && error.detail.errors) || [];
-      api.toast(`保存失败：${error.message}${detail.length ? `（${detail.join('；')}）` : ''}`, 6000, 'close');
+      api.host.toast(`保存失败：${error.message}${detail.length ? `（${detail.join('；')}）` : ''}`, 6000, 'close');
     }
   }
 
   async function duplicateProfile(profileId) {
     try {
       const data = await client.duplicateProfile(profileId);
-      api.toast(`已复制为 ${data.profile.id}`, 3000, 'check');
+      api.host.toast(`已复制为 ${data.profile.id}`, 3000, 'check');
       await load();
       await openProfile(data.profile.id);
     } catch (error) {
-      api.toast(`复制失败：${error.message}`, 3600, 'close');
+      api.host.toast(`复制失败：${error.message}`, 3600, 'close');
     }
   }
 
   async function deleteProfile(item) {
-    const message = item.builtin
-      ? `「${item.name}」是内置档案，删除将恢复出厂默认，继续？`
-      : `删除档案「${item.name}」？`;
-    if (!window.confirm(message)) return;
+    const confirmed = await api.ui.confirm({
+      title: item.builtin ? `「${item.name}」是内置档案` : `删除档案「${item.name}」？`,
+      message: item.builtin
+        ? '删除将恢复出厂默认，被修改的内容会先自动备份。'
+        : '此操作不可撤销，导出备份后可以再导入。',
+      danger: true,
+    });
+    if (!confirmed) return;
 
     try {
       const data = await client.deleteProfile(item.id);
-      api.toast(data.message || '已删除', 2400, 'check');
+      api.host.toast(data.message || '已删除', 2400, 'check');
       if (state.current && state.current.id === item.id) state.current = null;
       if (state.activeId === item.id) state.activeId = '';
       await load();
       renderEditor();
     } catch (error) {
-      api.toast(`删除失败：${error.message}`, 3600, 'close');
+      api.host.toast(`删除失败：${error.message}`, 3600, 'close');
     }
   }
 
@@ -458,38 +468,50 @@ export function createProfiles(api, client, context) {
       link.remove();
       URL.revokeObjectURL(url);
       const count = (data.profiles || []).length;
-      api.toast(target ? `已导出档案 ${target}` : `已导出全部 ${count} 个档案`, 2600, 'check');
+      api.host.toast(target ? `已导出档案 ${target}` : `已导出全部 ${count} 个档案`, 2600, 'check');
     } catch (error) {
-      api.toast(`导出失败：${error.message}`, 3600, 'close');
+      api.host.toast(`导出失败：${error.message}`, 3600, 'close');
     }
   }
 
   async function importProfile() {
-    const raw = window.prompt('粘贴档案 JSON（单个对象或数组，或 {"profiles": [...]}）');
+    const result = await api.ui.prompt({
+      title: '导入档案',
+      fields: [{
+        key: 'payload',
+        label: '档案 JSON（单个对象或数组，或 {"profiles": [...]}）',
+        type: 'string',
+      }],
+    });
+    const raw = result && result.payload ? String(result.payload).trim() : '';
     if (!raw) return;
+
     try {
       const payload = JSON.parse(raw);
       const data = await client.importProfiles(payload);
-      api.toast(`导入 ${data.imported.length} 个档案`
+      api.host.toast(`导入 ${data.imported.length} 个档案`
         + (data.failed.length ? `，失败 ${data.failed.length} 个` : ''), 4000, 'check');
       await load();
     } catch (error) {
-      api.toast(`导入失败：${error.message}`, 4000, 'close');
+      api.host.toast(`导入失败：${error.message}`, 4000, 'close');
     }
   }
 
   async function resetProfiles() {
-    if (!window.confirm('将删除全部自定义档案，并把被修改的内置档案恢复为出厂默认（会自动备份）。继续？')) {
-      return;
-    }
+    const confirmed = await api.ui.confirm({
+      title: '恢复出厂档案？',
+      message: '将删除全部自定义档案，并把被修改的内置档案恢复为出厂默认（会自动备份）。',
+      danger: true,
+    });
+    if (!confirmed) return;
     try {
       const data = await client.resetProfiles();
-      api.toast(`已重置（移除 ${data.removed.length} 个档案）`, 3200, 'check');
+      api.host.toast(`已重置（移除 ${data.removed.length} 个档案）`, 3200, 'check');
       state.current = null;
       await load();
       renderEditor();
     } catch (error) {
-      api.toast(`重置失败：${error.message}`, 3600, 'close');
+      api.host.toast(`重置失败：${error.message}`, 3600, 'close');
     }
   }
 
@@ -500,7 +522,7 @@ export function createProfiles(api, client, context) {
       state.activeId = String(data.active || '');
       if (!context.profileId) context.profileId = state.activeId;
     } catch (error) {
-      api.toast(`读取档案失败：${error.message}`, 3600, 'close');
+      api.host.toast(`读取档案失败：${error.message}`, 3600, 'close');
       state.list = [];
     }
     renderList();

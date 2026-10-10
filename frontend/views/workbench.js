@@ -1,24 +1,21 @@
 /**
  * 工作台：选卡 → 预览 → 提交作业 → 实时进度。
  *
- * 卡片选择优先读取主程序的 `store.viewState.selectedIds`（Provisional 耦合，
- * 见设计文档 §8.3）；取不到时回退到插件自己的卡片列表。
+ * 选中集合的读取集中在 `selection.js`（唯一的 Provisional 耦合点）；入口的可用/
+ * 置灰由宿主按 `entries[].when.selection` 求值，不再由本视图判断。
  */
 
 import {
-  badge,
-  button,
   checkbox,
   clear,
-  destroySelects,
+  createUi,
   el,
   field,
   formatCost,
   formatNumber,
   input,
-  section,
-  select,
 } from '../dom.js';
+import { readSelectedCardIds } from '../selection.js';
 
 const MODE_OPTIONS = [
   { value: 'both', label: '概览 + 标签' },
@@ -32,6 +29,7 @@ const APPLY_OPTIONS = [
 ];
 
 export function createWorkbench(api, client, context) {
+  const { badge, button, section, select } = createUi(api);
   const root = el('div', 'plugin-stm-ai-assistant-view');
 
   const state = {
@@ -70,10 +68,7 @@ export function createWorkbench(api, client, context) {
   cardsSection.append(selectionInfo, cardActions, picker);
 
   function readMainSelection() {
-    const store = api.store;
-    const viewState = store && store.viewState;
-    const ids = viewState && Array.isArray(viewState.selectedIds) ? viewState.selectedIds : [];
-    context.selectedCardIds = ids.map((item) => String(item || '')).filter(Boolean);
+    context.selectedCardIds = readSelectedCardIds(api);
   }
 
   async function loadCards() {
@@ -82,7 +77,7 @@ export function createWorkbench(api, client, context) {
       state.cards = data.items || [];
     } catch (error) {
       state.cards = [];
-      api.toast(`读取卡片列表失败：${error.message}`, 3600, 'close');
+      api.host.toast(`读取卡片列表失败：${error.message}`, 3600, 'close');
     }
     renderCards();
   }
@@ -191,9 +186,9 @@ export function createWorkbench(api, client, context) {
     if (!context.runId) return;
     try {
       await client.cancelJob(context.runId);
-      api.toast('已请求取消', 2400, 'forbidden');
+      api.host.toast('已请求取消', 2400, 'forbidden');
     } catch (error) {
-      api.toast(error.message, 3200, 'close');
+      api.host.toast(error.message, 3200, 'close');
     }
   });
 
@@ -244,17 +239,25 @@ export function createWorkbench(api, client, context) {
         `缺失必需变量：${missing.required.join('、')}`));
     }
 
-    (state.preview.messages || []).forEach((message) => {
+    const messages = state.preview.messages || [];
+    messages.slice(0, 2).forEach((message) => {
       const block = el('div', 'plugin-stm-ai-assistant-message');
       block.append(el('div', 'plugin-stm-ai-assistant-message-role', message.role));
       block.append(el('pre', 'plugin-stm-ai-assistant-message-body', message.content));
       previewOutput.append(block);
     });
+
+    // 全文交给宿主的 modal surface（次级内容不再塞在页签里造成长滚动）
+    if (messages.length && typeof context.openPromptPreview === 'function') {
+      previewOutput.append(button('在弹层中查看全文', 'is-secondary', () => {
+        context.openPromptPreview(messages);
+      }));
+    }
   }
 
   async function runPreview() {
     if (!context.selectedCardIds.length) {
-      api.toast('请先选择卡片', 2400, 'close');
+      api.host.toast('请先选择卡片', 2400, 'close');
       return;
     }
     previewBtn.disabled = true;
@@ -267,7 +270,7 @@ export function createWorkbench(api, client, context) {
       });
       renderPreview();
     } catch (error) {
-      api.toast(`预览失败：${error.message}`, 3600, 'close');
+      api.host.toast(`预览失败：${error.message}`, 3600, 'close');
     } finally {
       previewBtn.disabled = false;
     }
@@ -311,11 +314,26 @@ export function createWorkbench(api, client, context) {
     progressBody.append(logList);
   }
 
+  /** 作业进度同时反映到坞入口（`setProgress` / `setBusy` / `setBadge`）。 */
+  function syncEntryProgress(progress) {
+    const total = Number(progress && progress.total) || 0;
+    if (!total) {
+      api.entries.setProgress('workbench', null);
+      return;
+    }
+    api.entries.setProgress('workbench', {
+      done: Number(progress.completed) || 0,
+      total,
+    });
+  }
+
   function subscribe(runId) {
     if (state.stopSubscribe) state.stopSubscribe();
+    api.entries.setBusy('workbench', true);
     state.stopSubscribe = api.subscribeJob(runId, {
       snapshot: (payload) => {
         state.progress = payload;
+        syncEntryProgress(payload);
         renderProgress();
       },
       item: (payload) => {
@@ -327,18 +345,23 @@ export function createWorkbench(api, client, context) {
       log: (payload) => appendLog(payload),
       done: (payload) => {
         state.progress = payload;
+        api.entries.setBusy('workbench', false);
+        api.entries.setProgress('workbench', null);
         renderProgress();
         cancelBtn.classList.add('is-hidden');
-        api.toast('作业已结束，可在「结果与审批」里查看', 3200, 'check');
+        api.host.toast('作业已结束，可在「结果与审批」里查看', 3200, 'check');
         context.notifyReview && context.notifyReview();
       },
-      error: (payload) => appendLog({ level: 'error', message: (payload && payload.msg) || 'SSE 异常' }),
+      error: (payload) => {
+        api.entries.setBusy('workbench', false);
+        appendLog({ level: 'error', message: (payload && payload.msg) || 'SSE 异常' });
+      },
     });
   }
 
   async function submit() {
     if (!context.selectedCardIds.length) {
-      api.toast('请先选择卡片', 2400, 'close');
+      api.host.toast('请先选择卡片', 2400, 'close');
       return;
     }
 
@@ -357,12 +380,13 @@ export function createWorkbench(api, client, context) {
       });
 
       if (!data.run_id) {
-        api.toast(data.message || '没有需要处理的卡片', 3600, 'settings-help-entry');
+        api.host.toast(data.message || '没有需要处理的卡片', 3600, 'settings-help-entry');
         return;
       }
 
       context.runId = data.run_id;
       state.progress = { status: 'queued', total: data.total, completed: 0, failed: 0, skipped: 0 };
+      syncEntryProgress(state.progress);
       cancelBtn.classList.remove('is-hidden');
       renderProgress();
 
@@ -377,11 +401,11 @@ export function createWorkbench(api, client, context) {
         });
       }
 
-      api.toast(`作业已创建：${data.run_id.slice(0, 8)}`, 3000, 'check');
+      api.host.toast(`作业已创建：${data.run_id.slice(0, 8)}`, 3000, 'check');
       subscribe(data.run_id);
       context.notifyReview && context.notifyReview();
     } catch (error) {
-      api.toast(`提交失败：${error.message}`, 4000, 'close');
+      api.host.toast(`提交失败：${error.message}`, 4000, 'close');
     } finally {
       submitBtn.disabled = false;
     }
@@ -405,7 +429,7 @@ export function createWorkbench(api, client, context) {
       providerSelect.value = current;
       syncProvider();
     } catch (error) {
-      api.toast(`读取 provider 失败：${error.message}`, 3200, 'close');
+      api.host.toast(`读取 provider 失败：${error.message}`, 3200, 'close');
     }
 
     try {
@@ -422,17 +446,22 @@ export function createWorkbench(api, client, context) {
       profileSelect.setOptions(options);
       profileSelect.value = current;
     } catch (error) {
-      api.toast(`读取档案失败：${error.message}`, 3200, 'close');
+      api.host.toast(`读取档案失败：${error.message}`, 3200, 'close');
     }
 
-    readMainSelection();
+    // 宿主尚未把选中集合交给插件，这里按需再读一次（见 selection.js 的说明）
+    if (!context.selectedCardIds.length) readMainSelection();
     renderCards();
     renderProgress();
   }
 
   function destroy() {
     if (state.stopSubscribe) state.stopSubscribe();
-    destroySelects(optionsGrid);
+    api.entries.setBusy('workbench', false);
+    api.entries.setProgress('workbench', null);
+    Object.values({ providerSelect, profileSelect, modeSelect, applySelect }).forEach((control) => {
+      if (control && typeof control.destroy === 'function') control.destroy();
+    });
   }
 
   return { element: root, refresh, destroy };

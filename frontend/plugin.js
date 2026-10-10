@@ -1,17 +1,62 @@
 /**
  * stm-ai-assistant 前端入口。
  *
- * 契约：导出 `activate(api)`，可选导出 `deactivate(api)`（见 `static/js/pluginHost.js:165-178`）。
- * 容器由 `api.createRoot()` 生成，自动带 `data-plugin="stm-ai-assistant"`（F12），
- * 与 `frontend/plugin.css` 的作用域前缀配套（F11）。
+ * 契约：导出 `activate(api)`，可选导出 `deactivate(api)`。
+ * 本次重写后，入口**不再自绘浮动按钮**：入口在 `manifest.frontend.entries` 里声明，
+ * 由宿主渲染到坞、命令面板 / 右键菜单与设置页；面板容器由宿主提供
+ * （`static/js/pluginSurfaceHost.js`，其头部注释把本插件旧版的固定定位浮层列为反面教材）。
+ *
+ * 插件剩下三件事：
+ * 1. 注册 surface 与它们的 `mount(container, ctx)` 内容渲染器；
+ * 2. 把运行期状态（自检结论、待审批角标、作业进度）回报给宿主入口；
+ * 3. 在 `activate` 的返回值里交出清理逻辑（D9.1）。
  */
 
 import { createClient } from './api.js';
-import { el } from './dom.js';
-import { createPanel } from './panel.js';
+import { createPanelBody, createPromptPreview } from './panel.js';
+import { readSelectedCardIds } from './selection.js';
 
-const POSITION_KEY = 'stm-ai-assistant.launcher-pos';
-const DRAG_THRESHOLD = 6; // 超过该位移才算拖拽（避免点击被误判）
+/**
+ * 入口运行期状态回报器。
+ *
+ * **为什么需要它**：`PluginHost.loadAll()` 先 `loadPlugin()`（= 调用 `activate`），
+ * **之后**才 `EntryRegistry.setPlugins(items)` 建表（`pluginHost.js:183-194`）。
+ * 也就是说 `activate()` 执行期间注册表还是空的，此时 `api.entries.setStatus()` 会
+ * 静默返回 `false`（`entryRegistry.js:566-573` 查不到条目就 return），自检结论会丢失。
+ *
+ * 因此这里把「期望状态」记下来，先尝试写一次，再订阅 `entries:changed`
+ * （`setPlugins` 末尾会广播）重放——这样无论宿主将来调整加载顺序都能正确落地。
+ */
+function createEntryStatusReporter(api) {
+  let status = '';
+  let badge;
+  let hasBadge = false;
+
+  const apply = () => {
+    if (status) api.entries.setStatus('workbench', status);
+    if (hasBadge) api.entries.setBadge('open-review', badge);
+  };
+
+  apply();
+  const off = api.on('entries:changed', apply);
+
+  return {
+    setStatus(next) {
+      status = String(next || '');
+      if (status) api.entries.setStatus('workbench', status);
+    },
+    /** 待审批角标；`null` 表示清除。 */
+    setPendingBadge(value) {
+      const count = Number(value) || 0;
+      badge = count > 0 ? (count > 99 ? '99+' : count) : null;
+      hasBadge = true;
+      api.entries.setBadge('open-review', badge);
+    },
+    dispose() {
+      if (typeof off === 'function') off();
+    },
+  };
+}
 
 export async function activate(api) {
   const client = createClient(api);
@@ -28,180 +73,109 @@ export async function activate(api) {
     dryRun: false,
     force: false,
     notifyReview: null,
+    /** 由本函数注入：把 Prompt 预览交给 modal surface（见下）。 */
+    openPromptPreview: null,
+    /** 由本函数注入：待审批角标写入器（带注册表就绪重放）。 */
+    setPendingBadge: null,
   };
 
-  const root = api.createRoot('div');
-  root.classList.add('plugin-stm-ai-assistant-root');
+  const reporter = createEntryStatusReporter(api);
+  context.setPendingBadge = (value) => reporter.setPendingBadge(value);
+  const panel = createPanelBody(api, client, context);
+  const preview = createPromptPreview(api);
 
-  // ---------------------------------------------------------- 悬浮入口（图标 + 可拖拽）
+  // ---------------------------------------------------------- surface 注册
 
-  const launcher = el('button', 'plugin-stm-ai-assistant-launcher');
-  launcher.type = 'button';
-  launcher.dataset.marqueeIgnore = 'true';
-  launcher.title = 'AI 助手';
-  launcher.setAttribute('aria-label', 'AI 助手');
-
-  // 用 <span> + CSS mask 渲染图标：mask 只取 SVG 的 alpha 形状，
-  // 颜色由 background: var(--action-icon) 决定 → 深浅主题都跟随主程序图标色。
-  // （不能用 <img>：外部 SVG 的 currentColor 解析不到页面 CSS 变量，永远是黑色剪影。）
-  const icon = el('span', 'plugin-stm-ai-assistant-launcher-icon');
-  icon.setAttribute('role', 'img');
-  icon.setAttribute('aria-hidden', 'true');
-  launcher.append(icon);
-
-  const panel = createPanel(api, client, context);
-  root.append(launcher, panel.element);
-
-  // ---- 位置：localStorage 记忆，默认右下（往上抬避开翻页栏）----
-
-  const applyPos = (x, y) => {
-    launcher.style.left = `${x}px`;
-    launcher.style.top = `${y}px`;
-    launcher.style.right = 'auto';
-    launcher.style.bottom = 'auto';
-  };
-
-  const defaultPos = () => ({
-    x: window.innerWidth - launcher.offsetWidth - 20,
-    // 抬高到翻页工具栏上方（底部工具栏约 64px，留 20px 间距）
-    y: window.innerHeight - launcher.offsetHeight - 96,
+  // 面板：`surface.id` 必须与 manifest 保持一致（坞按 `<pluginId>:<surface.id ?? entry.id>` 查表）。
+  api.surfaces.register('workbench', {
+    title: 'AI 助手',
+    type: 'panel',
+    mount(container, ctx) {
+      // 同一个 surface 服务 4 个入口：按 `ctx.targetId` 决定落到哪个页签
+      panel.showTab(panel.tabForTarget(ctx && ctx.targetId));
+      container.append(panel.element);
+      // 宿主关闭时调用（D8 契约）：只摘 DOM，视图实例留待下次 mount 复用
+      return () => panel.detach();
+    },
   });
 
-  const clampPos = (x, y) => ({
-    x: Math.min(Math.max(0, x), Math.max(0, window.innerWidth - launcher.offsetWidth)),
-    y: Math.min(Math.max(0, y), Math.max(0, window.innerHeight - launcher.offsetHeight)),
+  // 次级内容用 modal：Prompt 全文原本塞在页签里（长滚动内容），现在归宿主居中弹层。
+  api.surfaces.register('prompt-preview', {
+    title: 'Prompt 预览',
+    type: 'modal',
+    mount(container) {
+      return preview.mount(container);
+    },
   });
 
-  const restorePos = () => {
-    try {
-      const saved = JSON.parse(localStorage.getItem(POSITION_KEY) || 'null');
-      if (saved && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
-        const { x, y } = clampPos(saved.x, saved.y);
-        applyPos(x, y);
-        return;
-      }
-    } catch (_) { /* 忽略坏数据 */ }
-    const pos = defaultPos();
-    applyPos(pos.x, pos.y);
+  context.openPromptPreview = (messages) => {
+    preview.setMessages(messages);
+    api.surfaces.open('prompt-preview', { source: 'workbench' });
   };
-
-  const savePos = () => {
-    try {
-      localStorage.setItem(POSITION_KEY, JSON.stringify({
-        x: launcher.offsetLeft,
-        y: launcher.offsetTop,
-      }));
-    } catch (_) { /* localStorage 不可用时静默 */ }
-  };
-
-  // ---- 拖拽：pointer 事件统一鼠标/触摸，位移超阈值才进入拖拽 ----
-
-  let dragging = false;
-  let moved = false;
-  let startX = 0;
-  let startY = 0;
-  let baseX = 0;
-  let baseY = 0;
-
-  launcher.addEventListener('pointerdown', (event) => {
-    if (event.button !== 0) return;
-    dragging = true;
-    moved = false;
-    startX = event.clientX;
-    startY = event.clientY;
-    baseX = launcher.offsetLeft;
-    baseY = launcher.offsetTop;
-    launcher.setPointerCapture(event.pointerId);
-  });
-
-  launcher.addEventListener('pointermove', (event) => {
-    if (!dragging) return;
-    const dx = event.clientX - startX;
-    const dy = event.clientY - startY;
-    if (!moved && Math.hypot(dx, dy) > DRAG_THRESHOLD) {
-      moved = true;
-      launcher.classList.add('is-dragging');
-    }
-    if (moved) {
-      const { x, y } = clampPos(baseX + dx, baseY + dy);
-      applyPos(x, y);
-    }
-  });
-
-  const endDrag = (event) => {
-    if (!dragging) return;
-    dragging = false;
-    launcher.classList.remove('is-dragging');
-    try { launcher.releasePointerCapture(event.pointerId); } catch (_) {}
-    if (moved) {
-      savePos();
-      // 拖拽后的这次 pointerup 不应触发 click
-      event.preventDefault();
-      event.stopPropagation();
-    }
-  };
-
-  launcher.addEventListener('pointerup', endDrag);
-  launcher.addEventListener('pointercancel', endDrag);
-
-  // 只有「没有拖动」的点击才打开面板
-  launcher.addEventListener('click', (event) => {
-    if (moved) {
-      event.preventDefault();
-      event.stopPropagation();
-      moved = false;
-      return;
-    }
-    panel.open();
-  });
-
-  // 尺寸就绪后恢复位置；窗口尺寸变化时把按钮收进可视区
-  requestAnimationFrame(restorePos);
-  const onResize = () => {
-    const { x, y } = clampPos(launcher.offsetLeft, launcher.offsetTop);
-    applyPos(x, y);
-  };
-  window.addEventListener('resize', onResize);
 
   // ---------------------------------------------------------- 与主程序联动
 
-  // 主程序勾选变化时同步一次（`viewState.selectedIds` 是 Provisional 耦合点）
+  // 选中集合：宿主尚未提供稳定的读取接口，这里是**唯一的** Provisional 耦合点
+  // （集中放在 selection.js，便于宿主提供 API 后整体替换；设计文档已登记）。
   const syncSelection = () => {
-    const store = api.store;
-    const viewState = store && store.viewState;
-    const ids = viewState && Array.isArray(viewState.selectedIds) ? viewState.selectedIds : null;
-    if (ids) context.selectedCardIds = ids.map((item) => String(item || '')).filter(Boolean);
+    context.selectedCardIds = readSelectedCardIds(api);
   };
   syncSelection();
 
-  // 卡片被更新后刷新状态（避免显示过期信息）
+  // 卡片被更新后刷新工作台（避免显示过期信息）。
+  // 只在面板真的打开时刷新：视图的 refresh() 会打后端接口，面板关着时白跑。
   const offCardUpdated = api.on('card.updated', () => {
-    panel.showTab('workbench');
+    if (api.surfaces.isOpen('workbench')) panel.showTab('workbench');
   });
 
-  try {
-    await client.health().then((data) => {
+  // 插件配置变更（D10）：替代轮询，设置页改完立即反映到 UI
+  const offConfigChange = typeof api.onConfigChange === 'function'
+    ? api.onConfigChange(() => {
+      if (api.surfaces.isOpen('workbench')) panel.refreshStatus();
+    })
+    : null;
+
+  // ---------------------------------------------------------- 启动自检
+
+  const runSelfCheck = async () => {
+    try {
+      const data = await client.health();
       const checks = data.checks || {};
-      if (!(checks.provider && checks.provider.ok)) {
-        api.toast('尚未配置 Provider，请到「AI 助手 → 设置」完成配置', 5000, 'settings-help-entry');
-      } else if (!(checks.api_key && checks.api_key.ok)) {
-        api.toast('Provider 缺少 API Key，请到「AI 助手 → 设置」填写', 5000, 'settings-help-entry');
+      const providerReady = checks.provider && checks.provider.ok;
+      const keyReady = checks.api_key && checks.api_key.ok;
+      const bridgeReady = checks.summary_bridge && checks.summary_bridge.ok;
+
+      if (!providerReady) {
+        api.host.toast('尚未配置 Provider，请到「AI 助手 → 设置」完成配置', 5000, 'settings-help-entry');
+      } else if (!keyReady) {
+        api.host.toast('Provider 缺少 API Key，请到「AI 助手 → 设置」填写', 5000, 'settings-help-entry');
       }
-      if (checks.summary_bridge && !checks.summary_bridge.ok) {
-        api.toast('概览写入通道不可用，结果将只保存在插件内', 5000, 'settings-help-entry');
+      if (!bridgeReady) {
+        api.host.toast('概览写入通道不可用，结果将只保存在插件内', 5000, 'settings-help-entry');
       }
-    });
-  } catch (error) {
-    api.toast(`插件自检失败：${error.message}`, 5000, 'close');
-  }
+
+      // 自检结论反映到坞入口的状态点（`api.entries.setStatus`）
+      reporter.setStatus(!providerReady || !keyReady || !bridgeReady ? 'warn' : 'ok');
+    } catch (error) {
+      reporter.setStatus('error');
+      api.host.toast(`插件自检失败：${error.message}`, 5000, 'close');
+    }
+  };
+
+  await runSelfCheck();
 
   api.log?.('info', 'stm-ai-assistant 前端已激活');
 
+  // ---------------------------------------------------------- 清理（D9.1）
+
+  // 宿主在禁用 / 卸载时调用本函数；`deactivate` 保留为兜底（旧宿主）。
   return () => {
-    window.removeEventListener('resize', onResize);
     if (typeof offCardUpdated === 'function') offCardUpdated();
+    if (typeof offConfigChange === 'function') offConfigChange();
+    reporter.dispose();
+    api.surfaces.close('prompt-preview');
+    api.surfaces.close('workbench');
     panel.destroy();
-    root.remove();
   };
 }
 

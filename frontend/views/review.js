@@ -2,10 +2,10 @@
  * 结果与审批：逐条查看 AI 建议 → 接受 / 拒绝 → 统一写回。
  *
  * 审批走主程序端点 `POST /api/plugins/<id>/jobs/<run_id>/items/<key>/review`
- * （`core/plugins/routes.py:464-478`）；写回走插件自己的 `/jobs/<run_id>/apply`。
+ * （`core/plugins/routes.py`）；写回走插件自己的 `/jobs/<run_id>/apply`。
  */
 
-import { badge, button, clear, el, formatNumber, section } from '../dom.js';
+import { clear, createUi, el, formatNumber } from '../dom.js';
 
 const ITEM_STATUS_LABELS = {
   pending: '待处理',
@@ -17,6 +17,7 @@ const ITEM_STATUS_LABELS = {
 };
 
 export function createReview(api, client, context) {
+  const { badge, button, section } = createUi(api);
   const root = el('div', 'plugin-stm-ai-assistant-view');
   const state = { job: null, items: [], lastApply: null, busy: false };
 
@@ -158,7 +159,7 @@ export function createReview(api, client, context) {
       state.job = data.job || {};
       state.items = data.items || [];
     } catch (error) {
-      api.toast(`读取作业失败：${error.message}`, 3600, 'close');
+      api.host.toast(`读取作业失败：${error.message}`, 3600, 'close');
       state.items = [];
     }
 
@@ -174,7 +175,7 @@ export function createReview(api, client, context) {
       renderSummary();
       renderItems();
     } catch (error) {
-      api.toast(`审批失败：${error.message}`, 3600, 'close');
+      api.host.toast(`审批失败：${error.message}`, 3600, 'close');
     }
   }
 
@@ -182,7 +183,7 @@ export function createReview(api, client, context) {
     if (!context.runId) return;
     const targets = state.items.filter((item) => item.status === 'awaiting_review');
     if (!targets.length) {
-      api.toast('没有待审批条目', 2400, 'settings-help-entry');
+      api.host.toast('没有待审批条目', 2400, 'settings-help-entry');
       return;
     }
 
@@ -192,9 +193,9 @@ export function createReview(api, client, context) {
         await client.reviewItem(context.runId, item.item_key, status);
         item.status = status;
       }
-      api.toast(`已批量标记 ${targets.length} 条`, 2400, 'check');
+      api.host.toast(`已批量标记 ${targets.length} 条`, 2400, 'check');
     } catch (error) {
-      api.toast(`批量审批失败：${error.message}`, 3600, 'close');
+      api.host.toast(`批量审批失败：${error.message}`, 3600, 'close');
     } finally {
       state.busy = false;
       renderSummary();
@@ -204,7 +205,7 @@ export function createReview(api, client, context) {
 
   async function applyAccepted() {
     if (!context.runId) {
-      api.toast('当前没有作业', 2400, 'close');
+      api.host.toast('当前没有作业', 2400, 'close');
       return;
     }
 
@@ -212,12 +213,12 @@ export function createReview(api, client, context) {
     try {
       state.lastApply = await client.applyJob(context.runId, { apply_tags: true });
       const data = state.lastApply;
-      api.toast(`已写入 ${data.applied} 张卡片`, 3200, 'check');
-      if (data.applied) api.refresh('cards');
+      api.host.toast(`已写入 ${data.applied} 张卡片`, 3200, 'check');
+      if (data.applied) api.host.refresh('cards');
       renderDetail();
       await load();
     } catch (error) {
-      api.toast(`应用失败：${error.message}`, 4000, 'close');
+      api.host.toast(`应用失败：${error.message}`, 4000, 'close');
     } finally {
       applyBtn.disabled = false;
     }
@@ -228,10 +229,10 @@ export function createReview(api, client, context) {
     try {
       const data = await client.retryJob(context.runId, true);
       context.runId = data.run_id || context.runId;
-      api.toast('已重新入队，可回到工作台查看进度', 3200, 'check');
+      api.host.toast('已重新入队，可回到工作台查看进度', 3200, 'check');
       await load();
     } catch (error) {
-      api.toast(`重跑失败：${error.message}`, 3600, 'close');
+      api.host.toast(`重跑失败：${error.message}`, 3600, 'close');
     }
   }
 
