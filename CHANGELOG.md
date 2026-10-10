@@ -52,6 +52,11 @@
   `api.store.viewState.selectedIds` 这个 Provisional 耦合收进单一模块
   （设计文档 §8.3 已登记；宿主提供稳定 API 后只改这一个文件）。
 
+- **声明快捷键**：`workbench` 加 `Ctrl+Shift+A`、`open-review` 加 `Ctrl+Shift+R`。
+  宿主侧 `shortcut` 的语义是「建议快捷键，宿主可覆盖」——用户没改时直接生效，
+  改绑后以用户配置为准。此前该字段虽在白名单里但宿主无消费者，本次随宿主补齐
+  （见主程序 CHANGELOG）。
+
 - **`activate()` 返回值**：清理逻辑收进函数并 `return`（D9.1）；`deactivate` 保留为兜底。
 
 ### 删除
@@ -95,11 +100,12 @@
 
 ### 测试
 
-- `tests/test_manifest_contract.py`（+25 用例）：`api_version == 2` 与
+- `tests/test_manifest_contract.py`（+27 用例）：`api_version == 2` 与
   `manifest_version == 2`；`entries` 结构校验（子键白名单 / id 正则 / kind 集合 /
   `surface.type` 集合 / 16 项上限 / 无旧三字段）；`when` 表达式校验；
   `when.config.requireKeys` 必须指向已声明的 schema 键；`requires_selection` 必须有
-  `disabledHint`；**`entries[].icon` 与 `api.ui.icon()` 引用的宿主图标名全部存在**
+  `disabledHint`；**快捷键格式匹配宿主折算规则且不重复、不占用 `Ctrl+K`**；
+  **`entries[].icon` 与 `api.ui.icon()` 引用的宿主图标名全部存在**
   （问主程序 `core.plugins.icons`）；official / community 两种 tier 下 4 项全保留
   （降级兜底）；本插件在主程序 catalog 里确实登记为 `official`；
   manifest 的 `surface.id` 与 `plugin.js` 的 `surfaces.register` 静态对齐；
@@ -114,7 +120,7 @@
 - `tests/test_css_scope.py` 删除了 4 条已作废的用例（它们断言
   `body:has(...) .main-container { backdrop-filter: none }` 必须存在——那是旧宿主的
   绕行方案，现已随根因修复一起移除）。
-- 全量：`python -m pytest tests/ -q` → **339 passed**。
+- 全量：`python -m pytest tests/ -q` → **341 passed**。
 - 主程序侧：`tests/test_plugin_manifest.py` + `test_plugin_installer.py` +
   `test_plugin_css_scope.py` → **122 passed**。
 

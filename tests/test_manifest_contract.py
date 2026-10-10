@@ -246,6 +246,41 @@ def test_when_config_require_keys_exist_in_schemas(manifest):
             assert key in declared, f'入口 {entry.get("id")} 引用了未声明的配置键: {key}'
 
 
+def test_entry_shortcuts_are_wellformed_and_unique(entries):
+    """`shortcut` 是「建议快捷键，宿主可覆盖」（设计文档 2.2）。
+
+    格式必须与宿主 `commandPalette.shortcutCombo()` 的折算规则一致，否则
+    用户按下去永远匹配不上：`Ctrl+Alt+Shift+Meta` 固定顺序 + 主键大写。
+    """
+    combo_pattern = re.compile(
+        r'^(Ctrl\+)?(Alt\+)?(Shift\+)?(Meta\+)?'
+        r'([A-Z0-9]|F\d{1,2}|Arrow(Up|Down|Left|Right)|Enter|Escape|Space|Tab|Backspace|Delete)$'
+    )
+
+    seen = {}
+    for entry in entries:
+        combo = str(entry.get('shortcut') or '').strip()
+        if not combo:
+            continue
+        assert combo_pattern.match(combo), (
+            f'入口 {entry.get("id")} 的快捷键格式不符合宿主折算规则: {combo!r}'
+        )
+        assert combo not in seen, (
+            f'快捷键 {combo} 被多个入口声明: {seen[combo]} 与 {entry.get("id")}'
+        )
+        seen[combo] = entry.get('id')
+
+
+def test_shortcuts_do_not_collide_with_host_reserved_combos(entries):
+    """不要占用宿主已用的组合键（`Ctrl+K` = 命令面板）。"""
+    reserved = {'Ctrl+K', 'Ctrl+Shift+K'}
+    for entry in entries:
+        combo = str(entry.get('shortcut') or '').strip()
+        assert combo not in reserved, (
+            f'入口 {entry.get("id")} 占用了宿主保留快捷键 {combo}'
+        )
+
+
 def test_surface_ids_are_consistent_across_entries(entries):
     """坑 2：坞按 `<pluginId>:<surface.id ?? entry.id>` 查表，两侧必须一致。
 

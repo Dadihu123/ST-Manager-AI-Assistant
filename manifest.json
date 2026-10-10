@@ -32,6 +32,7 @@
           "id": "workbench",
           "type": "panel"
         },
+        "shortcut": "Ctrl+Shift+A",
         "priority": 40
       },
       {
@@ -72,6 +73,7 @@
           }
         },
         "disabledHint": "请先在「AI 助手 → 设置」里选择默认提示词档案",
+        "shortcut": "Ctrl+Shift+R",
         "priority": 70
       },
       {

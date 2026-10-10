@@ -72,6 +72,8 @@
 | C13 | 单插件入口上限 16 项；`entries[].id` 必须匹配 `^[a-z][a-z0-9-]{0,63}$`；`entries[]` 子键是**严格白名单**（多一个键 → 整个插件拒绝加载，不是忽略） | `core/plugins/entries.py:23-36`、`manifest.py:613-628` | 只声明 4 个入口（§8.1）；子键仅用 `KNOWN_ENTRY_KEYS` 内的字段；`tests/test_manifest_contract.py` 复刻白名单做静态自检 |
 | C14 | 归属分级（D5）：本插件已登记为 **`official`**（主程序 `static/plugins/catalog.json` 里 `tier: "official"`），`tier_for_plugin('stm-ai-assistant') == 'official'`。official 允许全部 6 类 kind；若降级为 `community`，则 `nav`/`status` 会被静默忽略 + 记 warning | `core/plugins/entries.py:55-62,97-102`、`core/plugins/catalog.py:275-304`、`static/plugins/catalog.json` | 尽管 official 允许 6 类，**仍只用 community 也允许的 4 类**（`dock`/`context`/`command`/`settings`）——降级后入口不会被静默忽略。`tier` 只能由宿主仓库清单决定，插件 manifest 无权声明；回归见 `tests/test_manifest_contract.py::test_plugin_is_registered_as_official_in_main_app_catalog` |
 | C15 | 坞按 `<pluginId>:<surface.id ?? entry.id>` 查表；两侧不一致时**点击无反应且不报错** | `static/js/components/entryDock.js:178-187`、`commandPalette.js:202-205`、`pluginSurfaceHost.js:88` | manifest 的 `surface.id` 与 `api.surfaces.register()` 的 id 必须字面一致（本插件统一用 `workbench` / `prompt-preview`）；`tests/test_manifest_contract.py::test_surface_ids_match_frontend_registrations` 做静态对齐 |
+| C18 | `entries[].shortcut` 是**建议值**（「宿主可覆盖」），不是装饰：用户没改时直接生效。宿主侧由 `commandPalette` 的 keydown 消费（`findByShortcut`），并在入口总览页提供改绑 UI | `static/js/entryRegistry.js:findByShortcut`、`commandPalette.js:handleEntryShortcut`、`pluginManager.js:assignEntryShortcut` | 声明 `Ctrl+Shift+A` / `Ctrl+Shift+R`；格式必须匹配宿主的折算规则（`Ctrl+Alt+Shift+Meta` 顺序 + 主键大写），且不占用宿主保留的 `Ctrl+K` |
+| C19 | `kind: "context"` 的落点是**右键菜单**（此前无消费者，只在命令面板可见） | `static/js/components/contextMenu.js`（`refreshPluginEntries` / `runPluginEntry`）、`templates/components/context_menu.html` | `analyze-selected` 现在同时出现在右键菜单与命令面板；置灰项可见、附 `disabledHint`、点击不执行 |
 | C16 | 宿主 surface 容器已完成定位、尺寸、滚动、`data-marquee-ignore`、`role="dialog"`/`aria-modal`、焦点陷阱、ESC 关闭；插件**只能**在容器内建 DOM，**不得**设置容器或其祖先的 `position`/`z-index`/`inset`。`mount()` 返回函数时宿主在关闭时调用 | `static/js/pluginSurfaceHost.js:117-200`、`static/css/modules/plugin-surfaces.css` | `mount(container, ctx)` 只往容器里 append；返回值用于摘 DOM；不碰容器样式 |
 | C17 | 宿主 surface 容器**刻意不提供** `backdrop-filter`（Chromium backdrop root 会画出黑块/平坦灰），插件 overlay 上的 `backdrop-filter: blur(5px)` 与 `body:has(...) .main-container { backdrop-filter: none }` 兜底规则都必须删除；`api.setFullscreenScrim()` 也不再需要 | `static/js/pluginSurfaceHost.js:15-17`、`static/css/modules/plugin-surfaces.css:9-15` | 两条规则已删除；插件 CSS 里 `backdrop-filter` 出现次数为 0（`tests/test_css_scope.py` 锁定） |
 | C11 | 插件后端以 `st_plugin_stm_ai_assistant` 模块名加载，**不注入 sys.path** | `core/plugins/registry.py:262-286` | 插件内一律相对导入（`from .core.prompt import ...`）；禁止 `import backend` |
@@ -674,10 +676,19 @@ def chat(messages, *, provider: dict, api_key: str, extra_headers: dict | None =
 
 | id | kind | label | icon | surface | 条件 | 落地位置 |
 |---|---|---|---|---|---|---|
-| `workbench` | `dock` | AI 助手 | `wand` | `workbench`（panel） | — | 入口坞（official，默认进坞槽位） |
-| `analyze-selected` | `context` | 分析选中的角色卡 | `tags` | `workbench`（panel） | `requires_selection: true`，`when: {mode:["cards"], selection:"any"}`，`disabledHint: 请先在角色卡视图里选中至少一张卡片` | 右键菜单 / 命令面板；未选卡时**可见但置灰** |
-| `open-review` | `command` | AI 助手：结果与审批 | `clipboard` | `workbench`（panel） | `when: {config: {requireKeys:["default_profile_id"]}}`，`disabledHint: 请先在「AI 助手 → 设置」里选择默认提示词档案` | 命令面板；未配档案时置灰，点击跳转到插件配置区 |
+| `workbench` | `dock` | AI 助手 | `wand` | `workbench`（panel） | — | 入口坞（official，默认进坞槽位）；快捷键 `Ctrl+Shift+A` |
+| `analyze-selected` | `context` | 分析选中的角色卡 | `tags` | `workbench`（panel） | `requires_selection: true`，`when: {mode:["cards"], selection:"any"}`，`disabledHint: 请先在角色卡视图里选中至少一张卡片` | **右键菜单** / 命令面板；未选卡时**可见但置灰** |
+| `open-review` | `command` | AI 助手：结果与审批 | `clipboard` | `workbench`（panel） | `when: {config: {requireKeys:["default_profile_id"]}}`，`disabledHint: 请先在「AI 助手 → 设置」里选择默认提示词档案` | 命令面板；快捷键 `Ctrl+Shift+R`；未配档案时置灰，点击跳转到插件配置区 |
 | `assistant-settings` | `settings` | AI 助手设置 | `settings-gear` | `workbench`（panel） | — | 设置页插件区 |
+
+**`shortcut` 的语义**（设计文档 2.2：「建议快捷键，宿主可覆盖」）：
+插件声明的是**建议值**，用户没改时**直接生效**（不是仅展示）；用户在入口总览页
+设定后以用户配置为准。因此本插件可以放心声明，不会与用户习惯冲突。
+
+格式必须与宿主 `commandPalette.shortcutCombo()` 的折算规则一致——
+`Ctrl+Alt+Shift+Meta` 固定顺序 + 主键大写（`Ctrl+Shift+A`）。
+不要占用宿主保留的 `Ctrl+K`（命令面板）。回归见
+`tests/test_manifest_contract.py::test_entry_shortcuts_are_wellformed_and_unique`。
 
 **tier = `official`**（C14）：登记在主程序 `static/plugins/catalog.json`。
 official 允许全部 6 类 kind，但本插件**刻意只用 community 也允许的 4 类**，
@@ -744,6 +755,7 @@ manifest 字面一致（C15）。
 | 用途 | 方式 | 稳定性 | 兜底 |
 |---|---|---|---|
 | 入口可用/置灰 | `entries[].when`（宿主求值，D7） | Stable | 插件不自行判断 |
+| 快捷键 | `entries[].shortcut`（建议值）+ 用户配置（`_entry_layout_v1.shortcuts`） | Stable | 用户配置优先；格式见 C18 |
 | 待审批角标 | `api.entries.setBadge('open-review', n)` | Stable | — |
 | 自检结论 / 作业进度 | `api.entries.setStatus` / `setProgress` / `setBusy` | Stable | — |
 | **读取用户选中的卡片** | `api.store.viewState.selectedIds`，**集中封装在 `frontend/selection.js`** | **Provisional** | 取不到 → 返回 `[]`，面板内提供卡片多选列表（走插件自己的 `/cards` 路由） |
@@ -1064,8 +1076,13 @@ python -m pytest tests/ -q                                     → 334 passed
 3. **`api.ui.badge` 的视觉与原自绘徽章不同**：宿主的 `ui-primitive-badge` 是实心色块，
    旧自绘是描边胶囊。这是「统一到宿主外观」的预期代价（重写文档第 3 节明确要求）。
 4. **端到端手工验收**（重写文档 §5 第 4 条，8 项）尚未执行——需要启动主程序、
-   在真实坞/命令面板里点击验证。自动化测试覆盖了 manifest / CSS / 静态契约，
-   但「点击坞入口打开抽屉」「框选不命中面板」这类行为只能手工确认。
+   在真实坞/命令面板/右键菜单里点击验证。自动化测试覆盖了 manifest / CSS / 静态契约，
+   但「点击坞入口打开抽屉」「框选不命中面板」「右键菜单里点插件项」这类行为只能手工确认。
+5. **宿主侧两处缺口已补齐**（本次一并修掉，原为「已知但未修」）：
+   - `kind: "context"` 原先无消费者（`contextMenu.js` 不引用 `EntryRegistry`），
+     现已落到右键菜单（见 C19）；
+   - `entries[].shortcut` 原先只有 `findByShortcut()` 没有调用方，
+     现已由 `commandPalette` 的 keydown 消费 + 入口总览页提供改绑 UI（见 C18）。
 
 ### E.5 图标能力实测（三条路径，能力不同）
 
