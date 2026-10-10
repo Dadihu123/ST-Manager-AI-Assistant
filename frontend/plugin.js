@@ -22,19 +22,31 @@ import { readSelectedCardIds } from './selection.js';
  * **为什么需要它**：`PluginHost.loadAll()` 先 `loadPlugin()`（= 调用 `activate`），
  * **之后**才 `EntryRegistry.setPlugins(items)` 建表（`pluginHost.js:183-194`）。
  * 也就是说 `activate()` 执行期间注册表还是空的，此时 `api.entries.setStatus()` 会
- * 静默返回 `false`（`entryRegistry.js:566-573` 查不到条目就 return），自检结论会丢失。
+ * 静默返回 `false`（`entryRegistry.js` 查不到条目就 return），自检结论会丢失。
  *
  * 因此这里把「期望状态」记下来，先尝试写一次，再订阅 `entries:changed`
  * （`setPlugins` 末尾会广播）重放——这样无论宿主将来调整加载顺序都能正确落地。
+ *
+ * **重放必须幂等**：`entries:changed` 既是通知、也是本函数的重放触发源，所以
+ * 回调里写状态等于「写 → 通知 → 再写」。宿主已做两件事兜底（写入器只在值变化
+ * 时广播；`notifyChange` 有重入合并与轮数上限），但插件侧也不该依赖宿主——
+ * 这里记住**上次已写成功的值**，相同就跳过，避免无谓的写入与广播。
  */
 function createEntryStatusReporter(api) {
   let status = '';
   let badge;
   let hasBadge = false;
+  // 上次真正写成功的值（null 表示尚未写成功，需重放）
+  let writtenStatus = null;
+  let writtenBadge = undefined;
 
   const apply = () => {
-    if (status) api.entries.setStatus('workbench', status);
-    if (hasBadge) api.entries.setBadge('open-review', badge);
+    if (status && writtenStatus !== status) {
+      if (api.entries.setStatus('workbench', status)) writtenStatus = status;
+    }
+    if (hasBadge && writtenBadge !== badge) {
+      if (api.entries.setBadge('open-review', badge)) writtenBadge = badge;
+    }
   };
 
   apply();
@@ -42,15 +54,20 @@ function createEntryStatusReporter(api) {
 
   return {
     setStatus(next) {
-      status = String(next || '');
-      if (status) api.entries.setStatus('workbench', status);
+      const value = String(next || '');
+      if (value === status) return;
+      status = value;
+      if (status && writtenStatus !== status) {
+        if (api.entries.setStatus('workbench', status)) writtenStatus = status;
+      }
     },
     /** 待审批角标；`null` 表示清除。 */
     setPendingBadge(value) {
       const count = Number(value) || 0;
       badge = count > 0 ? (count > 99 ? '99+' : count) : null;
       hasBadge = true;
-      api.entries.setBadge('open-review', badge);
+      if (writtenBadge === badge) return;
+      if (api.entries.setBadge('open-review', badge)) writtenBadge = badge;
     },
     dispose() {
       if (typeof off === 'function') off();
