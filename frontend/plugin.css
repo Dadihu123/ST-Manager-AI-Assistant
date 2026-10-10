@@ -174,7 +174,7 @@
   white-space: nowrap;
 }
 
-/* 页签不再自绘数字角标：待审批数走 `api.entries.setBadge('open-review', n)`，
+/* 页签不再自绘数字角标：待审批数走 `api.entries.setBadge('workbench', n)`，
  * 由宿主渲染在坞入口与命令面板上（`entries[].badge`）。 */
 
 /* 主体：插件自建的内部滚动区（宿主的 `.plugin-surface__body` 是外层滚动，

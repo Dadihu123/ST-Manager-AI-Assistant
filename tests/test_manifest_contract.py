@@ -42,11 +42,14 @@ KNOWN_ENTRY_KEYS = frozenset({
     'when', 'disabledHint',
 })
 KNOWN_WHEN_KEYS = frozenset({
-    'mode', 'selection', 'indexState', 'config', 'hostVersion', 'feature',
+    'mode', 'selection', 'indexState', 'config', 'hostVersion', 'feature', 'target',
 })
-ENTRY_KINDS = frozenset({'dock', 'nav', 'settings', 'context', 'command', 'status'})
+ENTRY_KINDS = frozenset({
+    'dock', 'nav', 'settings', 'context', 'command', 'status', 'batch',
+})
 SURFACE_TYPES = frozenset({'panel', 'modal', 'page', 'sheet'})
 SELECTION_MODES = frozenset({'none', 'any', 'single', 'multi'})
+TARGET_KINDS = frozenset({'folder', 'card', 'any'})
 KNOWN_MODES = frozenset({
     'cards', 'worldinfo', 'chats', 'presets',
     'regex', 'scripts', 'quick_replies', 'beautify',
@@ -56,9 +59,11 @@ ENTRY_ID_PATTERN = re.compile(r'^[a-z][a-z0-9-]{0,63}$')
 
 # 归属分级（D5）：由主程序仓库的 `static/plugins/catalog.json` 决定，manifest 无权声明。
 # 本插件已登记为 official（`catalog.json` 里 `tier: "official"`）。
-# official 可用全部 6 类 kind；若将来降级为 community，则 nav / status 不可用。
-OFFICIAL_ENTRY_KINDS = frozenset({'dock', 'nav', 'settings', 'context', 'command', 'status'})
-COMMUNITY_ENTRY_KINDS = frozenset({'dock', 'command', 'context', 'settings'})
+# official 可用全部 7 类 kind；若将来降级为 community，则 nav / status 不可用。
+OFFICIAL_ENTRY_KINDS = frozenset({
+    'dock', 'nav', 'settings', 'context', 'command', 'status', 'batch',
+})
+COMMUNITY_ENTRY_KINDS = frozenset({'dock', 'command', 'context', 'settings', 'batch'})
 # 本插件实际使用的 kind（保守集合：即使被降级为 community 也仍然合法）
 USED_ENTRY_KINDS = COMMUNITY_ENTRY_KINDS
 
@@ -169,10 +174,10 @@ def test_entry_ids_match_pattern_and_are_unique(entries):
 
 
 def test_entry_kinds_are_valid_and_within_community_subset(entries):
-    """D5：kind 必须合法，且只用 community 也允许的那 4 类。
+    """D5：kind 必须合法，且只用 community 也允许的那 5 类。
 
-    本插件已登记为 official（可用全部 6 类），但实际只用了
-    `dock` / `context` / `command` / `settings`——这是**刻意**的保守选择：
+    本插件已登记为 official（可用全部 7 类），但实际只用了
+    `dock` / `context` / `batch` / `settings`——这是**刻意**的保守选择：
     即使将来从 catalog 摘掉（降级为 community），入口也不会被静默忽略。
     """
     for entry in entries:
@@ -182,6 +187,91 @@ def test_entry_kinds_are_valid_and_within_community_subset(entries):
             f'入口 {entry.get("id")} 使用了 {kind}；'
             f'本插件只应使用 {sorted(USED_ENTRY_KINDS)}（community 子集）'
         )
+
+
+def test_entries_land_on_distinct_host_locations(entries):
+    """入口必须落在**互不相同**的宿主位置。
+
+    旧版 4 个入口全部指向同一个 `surface: workbench`，导致「入口总览里看起来
+    有很多入口，实际点开都是同一个面板」。收敛后每个 kind 各有一个真实消费者：
+    `dock` → 入口坞、`context` → 右键菜单、`batch` → 批量操作菜单、`settings` → 设置页。
+    """
+    kinds = [entry.get('kind') for entry in entries]
+    assert len(kinds) == len(set(kinds)), f'存在落点重复的 kind: {kinds}'
+    assert set(kinds) == {'dock', 'context', 'batch', 'settings'}, kinds
+
+
+def test_folder_context_entry_declares_folder_target(entries):
+    """`analyze-folder` 必须声明 `when.target: "folder"`。
+
+    没有它，这个入口会出现在**卡片**右键菜单里（那才是旧的 `analyze-selected`
+    行为），而右键分类 → 分析整个分类这条路径就丢了。
+    """
+    by_id = {entry.get('id'): entry for entry in entries}
+    folder_entry = by_id.get('analyze-folder')
+    assert folder_entry is not None, '缺少 analyze-folder 入口'
+    assert folder_entry['kind'] == 'context'
+    assert (folder_entry.get('when') or {}).get('target') == 'folder'
+    assert str(folder_entry.get('disabledHint') or '').strip()
+
+    # 右键菜单专属：不得再声明 selection（右键分类的作用域与全局选中集无关）
+    assert 'selection' not in (folder_entry.get('when') or {})
+
+
+def test_selected_batch_entry_requires_selection_with_hint(entries):
+    """`analyze-selected` 是批量菜单项：`kind: "batch"` + `when.selection: "any"`。"""
+    by_id = {entry.get('id'): entry for entry in entries}
+    entry = by_id.get('analyze-selected')
+    assert entry is not None, '缺少 analyze-selected 入口'
+    assert entry['kind'] == 'batch'
+    assert (entry.get('when') or {}).get('selection') == 'any'
+    assert str(entry.get('disabledHint') or '').strip()
+
+
+def test_obsolete_open_review_entry_is_gone(entries):
+    """`open-review` 与 `workbench` 落点重复（都开同一个面板的同一批内容），已删除。
+
+    它的唯一独特价值是「直接跳到审批页签」，而页签切换由 `assistant-settings`
+    之外的入口上下文决定——保留它只会让入口总览里多一条重复快捷键。
+    """
+    ids = [entry.get('id') for entry in entries]
+    assert 'open-review' not in ids, 'open-review 应已删除（与 workbench 重复）'
+
+
+def test_pending_badge_targets_the_workbench_entry():
+    """待审批角标必须挂在仍然存在的入口上。
+
+    旧版挂在 `open-review` 上，删掉该入口后角标会静默丢失（`setBadge` 查不到
+    条目直接返回 false），用户再也看不到「有几条待审批」。
+    """
+    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
+        source = _strip_js_comments(handle.read())
+    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
+        panel_source = _strip_js_comments(handle.read())
+
+    for name, text in (('plugin.js', source), ('panel.js', panel_source)):
+        assert "setBadge('open-review'" not in text, f'{name} 仍在给已删除的入口写角标'
+        assert "setBadge('workbench'" in text, f'{name} 必须把角标写到 workbench'
+
+
+def test_workbench_surface_is_a_modal(entries, manifest):
+    """`workbench` 从 `panel` 改为 `modal`（主工作台需要遮罩 + 焦点陷阱）。
+
+    manifest 与 `frontend/plugin.js` 的注册必须**同时**改，否则宿主按 manifest
+    的类型建容器、插件按自己的类型理解尺寸，长表单会被挤在窄抽屉里。
+    """
+    by_id = {entry.get('id'): entry for entry in entries}
+    assert by_id['workbench']['surface']['type'] == 'modal'
+
+    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
+        source = handle.read()
+    match = re.search(
+        r"api\.surfaces\.register\(\s*'workbench'\s*,\s*\{(.*?)\n  \}\)",
+        source,
+        re.S,
+    )
+    assert match, '未能解析 workbench 的 surfaces.register 调用'
+    assert "type: 'modal'" in match.group(1), 'plugin.js 里 workbench 仍不是 modal'
 
 
 def test_entry_labels_present(entries):
@@ -216,6 +306,9 @@ def test_entry_when_expression_is_valid(entries):
 
         if 'selection' in when:
             assert when['selection'] in SELECTION_MODES, when['selection']
+
+        if 'target' in when:
+            assert when['target'] in TARGET_KINDS, when['target']
 
         if 'config' in when:
             assert isinstance(when['config'], dict)
@@ -626,7 +719,7 @@ def test_entries_pass_tier_filter_for_both_tiers():
         sys.path.remove(MAIN_APP_DIR)
 
     parsed = PluginManifest.load(ROOT, check_dir_name=False)
-    expected = {'workbench', 'analyze-selected', 'open-review', 'assistant-settings'}
+    expected = {'workbench', 'analyze-folder', 'analyze-selected', 'assistant-settings'}
 
     for tier in ('official', 'community'):
         kept, warnings = apply_tier(parsed.plugin_id, parsed.frontend_entries, tier=tier)
@@ -634,6 +727,36 @@ def test_entries_pass_tier_filter_for_both_tiers():
         assert len(kept) == len(parsed.frontend_entries), tier
         assert {item['id'] for item in kept} == expected, tier
         assert all(item['tier'] == tier for item in kept), tier
+
+
+@pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
+def test_when_target_survives_the_host_normalizer():
+    """`when.target` 必须被宿主的规范化器**保留**下来（不是当作未知子键丢掉）。
+
+    这条是跨仓库契约回归：若主程序侧漏掉 `TARGET_KINDS` 校验分支，
+    `when.target` 会被静默丢弃 → 右键菜单里 context 入口对任何目标都可用，
+    「右键分类才可用」的约束形同虚设。
+    """
+    sys.path.insert(0, MAIN_APP_DIR)
+    try:
+        from core.plugins.entries import normalize_entries  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f'无法导入主程序 entries 模块: {exc}')
+    finally:
+        sys.path.remove(MAIN_APP_DIR)
+
+    entries, warnings = normalize_entries('demo-plugin', [
+        {'id': 'a', 'kind': 'context', 'label': 'x', 'when': {'target': 'folder'}},
+    ])
+    assert warnings == []
+    assert entries[0]['when'] == {'target': 'folder'}
+
+    # 非法值被拒（忽略 + 警告），而不是原样透传
+    bad, bad_warnings = normalize_entries('demo-plugin', [
+        {'id': 'b', 'kind': 'context', 'label': 'y', 'when': {'target': 'category'}},
+    ])
+    assert bad[0]['when'] == {}
+    assert any('target' in item for item in bad_warnings)
 
 
 @pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')

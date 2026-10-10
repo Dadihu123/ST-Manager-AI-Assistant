@@ -17,17 +17,44 @@
   | id | kind | 用途 | 条件 |
   |---|---|---|---|
   | `workbench` | `dock` | 主面板（四页签） | — |
-  | `analyze-selected` | `context` | 对选中卡片跑分析 | `requires_selection`，`when: {mode:["cards"], selection:"any"}` |
-  | `open-review` | `command` | 跳到「结果与审批」 | `when: {config: {requireKeys:["default_profile_id"]}}` |
+  | `analyze-folder` | `context` | 右键**分类** → 分析该分类全部卡片 | `when: {mode:["cards"], target:"folder"}` |
+  | `analyze-selected` | `batch` | 批量操作菜单 → 分析选中卡片 | `requires_selection`，`when: {mode:["cards"], selection:"any"}` |
   | `assistant-settings` | `settings` | 设置入口 | — |
 
   本插件已登记为 **`official`**（主程序 `static/plugins/catalog.json`，`tier` 只能由
-  宿主仓库清单决定），因此 dock 入口默认进坞槽位。尽管 official 允许全部 6 类 kind，
-  本插件**刻意只用 community 也允许的 4 类**（`dock` / `context` / `command` /
+  宿主仓库清单决定），因此 dock 入口默认进坞槽位。尽管 official 允许全部 7 类 kind，
+  本插件**刻意只用 community 也允许的 5 类**（`dock` / `context` / `batch` /
   `settings`），不声明 `nav` / `status`——降级后入口也不会被静默忽略。
 
+- **入口落点收敛（P2）**：旧版 4 个入口**全部指向同一个 surface**（`workbench`），
+  且「分析选中卡片」被放在 `context`（右键菜单）里——右键一个分类时作用域应该是
+  那个分类，插件却只能读到全局选中集，语义错位。本次收敛为：
+
+  - **删除 `open-review`**（与 `workbench` 落点重复，唯一区别只是初始页签）；
+    待审批角标从 `open-review` 改挂到 `workbench`（否则 `setBadge` 查不到条目会
+    静默返回 `false`，用户再也看不到待审批数）；
+  - **新增 `analyze-folder`**（`context` + `when.target: "folder"`）：右键**分类** →
+    分析该分类（含子分类）的全部卡片；
+  - **`analyze-selected` 由 `context` 改为 `batch`**：注册到**批量操作菜单**，
+    作用域 = 勾选的卡片；
+  - 4 个入口的 `kind` **两两不同**，各自落在真实的宿主位置。
+
+- **`workbench` 由 `panel` 改为 `modal`**：主工作台承载批量分析表单与审批列表，
+  需要宿主提供遮罩 + 焦点陷阱；旧 `panel`（右侧抽屉 `min(420px, 92vw)`）会把长表单
+  挤在窄栏里。manifest 与 `frontend/plugin.js` 的注册同步修改。
+
+- **入口作用域由宿主提供**：新增消费 `ctx.targetKind` / `ctx.targetPath` /
+  `ctx.targetIds`（`panel.js:applyEntryContext`）。分类 → 卡片 id 列表由**宿主**解析
+  （插件拿不到卡片列表接口，也不该读宿主的 `viewState.selectedIds`）。
+  带作用域时不再回读全局选中集（`workbench.js:refresh`），并在面板顶部显示本次作用域。
+
+- **`onOpen(ctx)` 处理作用域切换**：surface 已打开时宿主不重新 `mount`（会丢用户
+  已填的表单），只把新 `ctx` 交给 `onOpen`。没有它，「先右键 A 分类、再右键 B 分类」
+  会一直显示 A 的作用域。
+
 - **入口不再自绘**：删除可拖拽浮动按钮、`POSITION_KEY` 位置记忆、`clampPos` /
-  `restorePos` / `savePos` / `DRAG_THRESHOLD`。坞、命令面板、右键菜单与设置页由宿主渲染。
+  `restorePos` / `savePos` / `DRAG_THRESHOLD`。坞、命令面板、右键菜单、批量操作菜单
+  与设置页由宿主渲染。
 
 - **面板容器归宿主**：`createPanel` → `createPanelBody`。删除自绘 overlay / shell /
   顶栏 / 关闭按钮、`document.addEventListener('keydown')`（ESC）、遮罩点击关闭。
@@ -45,17 +72,19 @@
   `api.ui.prompt`。
 
 - **状态回报宿主入口**：启动自检结论 → `api.entries.setStatus('workbench', ok|warn|error)`；
-  作业进度 → `setProgress` / `setBusy`；待审批数 → `setBadge('open-review', n)`。
+  作业进度 → `setProgress` / `setBusy`；待审批数 → `setBadge('workbench', n)`。
   新增 `api.onConfigChange()` 订阅（替代轮询），设置页改完立即反映。
 
 - **选中集合读取集中化**：新增 `frontend/selection.js`，把
   `api.store.viewState.selectedIds` 这个 Provisional 耦合收进单一模块
   （设计文档 §8.3 已登记；宿主提供稳定 API 后只改这一个文件）。
+  P2 之后它**只剩坞 / 快捷键路径**使用——右键菜单与批量菜单的作用域已由
+  `ctx.targetIds`（Stable）提供。
 
-- **声明快捷键**：`workbench` 加 `Ctrl+Shift+A`、`open-review` 加 `Ctrl+Shift+R`。
-  宿主侧 `shortcut` 的语义是「建议快捷键，宿主可覆盖」——用户没改时直接生效，
-  改绑后以用户配置为准。此前该字段虽在白名单里但宿主无消费者，本次随宿主补齐
-  （见主程序 CHANGELOG）。
+- **声明快捷键**：只保留 `workbench` 的 `Ctrl+Shift+A`（`open-review` 已删除，
+  其 `Ctrl+Shift+R` 一并移除）。宿主侧 `shortcut` 的语义是「建议快捷键，宿主可覆盖」
+  ——用户没改时直接生效，改绑后以用户配置为准。入口总览页按 **surface 去重**，
+  `context` 类不提供快捷键设置。
 
 - **`activate()` 返回值**：清理逻辑收进函数并 `return`（D9.1）；`deactivate` 保留为兜底。
 

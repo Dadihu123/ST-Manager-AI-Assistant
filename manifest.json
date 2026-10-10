@@ -30,20 +30,39 @@
         "icon": "wand",
         "surface": {
           "id": "workbench",
-          "type": "panel"
+          "type": "modal"
         },
         "shortcut": "Ctrl+Shift+A",
         "priority": 40
       },
       {
-        "id": "analyze-selected",
+        "id": "analyze-folder",
         "kind": "context",
-        "label": "分析选中的角色卡",
-        "description": "对当前选中的卡片提交一次 AI 分析作业。",
+        "label": "分析此分类全部卡片",
+        "description": "对该分类（含子分类）下的所有卡片提交一次 AI 分析作业。",
+        "icon": "folder",
+        "surface": {
+          "id": "workbench",
+          "type": "modal"
+        },
+        "when": {
+          "mode": [
+            "cards"
+          ],
+          "target": "folder"
+        },
+        "disabledHint": "仅支持右键分类；请在角色卡视图里右键一个分类",
+        "priority": 55
+      },
+      {
+        "id": "analyze-selected",
+        "kind": "batch",
+        "label": "AI 分析选中卡片",
+        "description": "对批量操作里选中的卡片提交一次 AI 分析作业。",
         "icon": "tags",
         "surface": {
           "id": "workbench",
-          "type": "panel"
+          "type": "modal"
         },
         "requires_selection": true,
         "when": {
@@ -56,27 +75,6 @@
         "priority": 60
       },
       {
-        "id": "open-review",
-        "kind": "command",
-        "label": "AI 助手：结果与审批",
-        "description": "直接打开待审批的分析结果。",
-        "icon": "clipboard",
-        "surface": {
-          "id": "workbench",
-          "type": "panel"
-        },
-        "when": {
-          "config": {
-            "requireKeys": [
-              "default_profile_id"
-            ]
-          }
-        },
-        "disabledHint": "请先在「AI 助手 → 设置」里选择默认提示词档案",
-        "shortcut": "Ctrl+Shift+R",
-        "priority": 70
-      },
-      {
         "id": "assistant-settings",
         "kind": "settings",
         "label": "AI 助手设置",
@@ -84,7 +82,7 @@
         "icon": "settings-gear",
         "surface": {
           "id": "workbench",
-          "type": "panel"
+          "type": "modal"
         },
         "priority": 80
       }

@@ -69,11 +69,13 @@
 | C8 | 密钥不得进作业 payload（明文落库） | `api.py:299-307`、`jobs.py:777` | payload 只放 `{"secret_ref": "api_key"}`，运行时 `ctx.resolve_secret('api_key')` |
 | C9 | 数值护栏：单作业 20000 项、单条目结果 256KB（截断并标 `_truncated`）、ui_data 命名空间 256KB（超限整次回滚） | `jobs.py:39`、`job_store` 裁剪、`api.py:46-47`、`api.py:899-906` | 大对象一律落 `api.data_dir()` 下文件；ui_data 只存索引与热缓存，写入前做体积预算 |
 | C10 | CSS 作用域检查为**字符串包含**判定；`@media/@supports/@layer/@container/@keyframes/@font-face` 块内不检查。另有声明层检查（F13/F15）：`position: fixed`、未知令牌无回退、硬编码宿主 sprite、非作用域选择器上的 `!important` 均记 warning | `core/plugins/installer.py:595-640`（作用域）、`installer.py:863-938`（声明层） | 全部选择器以 `.plugin-stm-ai-assistant` 或 `[data-plugin="stm-ai-assistant"]` 开头；**零 `position: fixed`**（层级归宿主容器）；`var(--x)` 无回退时必须在宿主令牌清单内 |
-| C13 | 单插件入口上限 16 项；`entries[].id` 必须匹配 `^[a-z][a-z0-9-]{0,63}$`；`entries[]` 子键是**严格白名单**（多一个键 → 整个插件拒绝加载，不是忽略） | `core/plugins/entries.py:23-36`、`manifest.py:613-628` | 只声明 4 个入口（§8.1）；子键仅用 `KNOWN_ENTRY_KEYS` 内的字段；`tests/test_manifest_contract.py` 复刻白名单做静态自检 |
-| C14 | 归属分级（D5）：本插件已登记为 **`official`**（主程序 `static/plugins/catalog.json` 里 `tier: "official"`），`tier_for_plugin('stm-ai-assistant') == 'official'`。official 允许全部 6 类 kind；若降级为 `community`，则 `nav`/`status` 会被静默忽略 + 记 warning | `core/plugins/entries.py:55-62,97-102`、`core/plugins/catalog.py:275-304`、`static/plugins/catalog.json` | 尽管 official 允许 6 类，**仍只用 community 也允许的 4 类**（`dock`/`context`/`command`/`settings`）——降级后入口不会被静默忽略。`tier` 只能由宿主仓库清单决定，插件 manifest 无权声明；回归见 `tests/test_manifest_contract.py::test_plugin_is_registered_as_official_in_main_app_catalog` |
-| C15 | 坞按 `<pluginId>:<surface.id ?? entry.id>` 查表；两侧不一致时**点击无反应且不报错** | `static/js/components/entryDock.js:178-187`、`commandPalette.js:202-205`、`pluginSurfaceHost.js:88` | manifest 的 `surface.id` 与 `api.surfaces.register()` 的 id 必须字面一致（本插件统一用 `workbench` / `prompt-preview`）；`tests/test_manifest_contract.py::test_surface_ids_match_frontend_registrations` 做静态对齐 |
-| C18 | `entries[].shortcut` 是**建议值**（「宿主可覆盖」），不是装饰：用户没改时直接生效。宿主侧由 `commandPalette` 的 keydown 消费（`findByShortcut`），并在入口总览页提供改绑 UI | `static/js/entryRegistry.js:findByShortcut`、`commandPalette.js:handleEntryShortcut`、`pluginManager.js:assignEntryShortcut` | 声明 `Ctrl+Shift+A` / `Ctrl+Shift+R`；格式必须匹配宿主的折算规则（`Ctrl+Alt+Shift+Meta` 顺序 + 主键大写），且不占用宿主保留的 `Ctrl+K` |
-| C19 | `kind: "context"` 的落点是**右键菜单**（此前无消费者，只在命令面板可见） | `static/js/components/contextMenu.js`（`refreshPluginEntries` / `runPluginEntry`）、`templates/components/context_menu.html` | `analyze-selected` 现在同时出现在右键菜单与命令面板；置灰项可见、附 `disabledHint`、点击不执行 |
+| C13 | 单插件入口上限 16 项；`entries[].id` 必须匹配 `^[a-z][a-z0-9-]{0,63}$`；`entries[]` 子键是**严格白名单**（多一个键 → 整个插件拒绝加载，不是忽略） | `core/plugins/entries.py`（`KNOWN_ENTRY_KEYS` / `ENTRY_KINDS` / `KNOWN_WHEN_KEYS`）、`manifest.py` | 只声明 4 个入口（§8.1）；子键仅用 `KNOWN_ENTRY_KEYS` 内的字段；`when` 子键仅用 `KNOWN_WHEN_KEYS`（含 `target`）；`tests/test_manifest_contract.py` 复刻白名单做静态自检 |
+| C14 | 归属分级（D5）：本插件已登记为 **`official`**（主程序 `static/plugins/catalog.json` 里 `tier: "official"`），`tier_for_plugin('stm-ai-assistant') == 'official'`。official 允许全部 7 类 kind；若降级为 `community`，则 `nav`/`status` 会被静默忽略 + 记 warning | `core/plugins/entries.py`（`_KIND_TIER_ALLOWLIST` / `apply_tier`）、`core/plugins/catalog.py`、`static/plugins/catalog.json` | 尽管 official 允许 7 类，**仍只用 community 也允许的 5 类**（`dock`/`context`/`batch`/`settings`）——降级后入口不会被静默忽略。`tier` 只能由宿主仓库清单决定，插件 manifest 无权声明；回归见 `tests/test_manifest_contract.py::test_plugin_is_registered_as_official_in_main_app_catalog` |
+| C15 | 坞按 `<pluginId>:<surface.id ?? entry.id>` 查表；两侧不一致时**点击无反应且不报错** | `static/js/components/entryDock.js`、`commandPalette.js`、`pluginSurfaceHost.js:88` | manifest 的 `surface.id` 与 `api.surfaces.register()` 的 id 必须字面一致（本插件统一用 `workbench` / `prompt-preview`）；`tests/test_manifest_contract.py::test_surface_ids_match_frontend_registrations` 做静态对齐 |
+| C18 | `entries[].shortcut` 是**建议值**（「宿主可覆盖」），不是装饰：用户没改时直接生效。宿主侧由 `commandPalette` 的 keydown 消费（`findByShortcut`），并在入口总览页提供改绑 UI（按 surface 去重、`context` 类不提供） | `static/js/entryRegistry.js:findByShortcut`、`commandPalette.js:handleEntryShortcut`、`pluginManager.js:assignEntryShortcut` / `entryHoldsShortcutSlot` / `entryShortcutEditable` | 只声明 `Ctrl+Shift+A`（`workbench`）；格式必须匹配宿主的折算规则（`Ctrl+Alt+Shift+Meta` 顺序 + 主键大写），且不占用宿主保留的 `Ctrl+K` |
+| C19 | `kind: "context"` 的落点是**右键菜单**，且作用域是**右键目标**（`when.target` + `ctx.targetIds`），不是全局选中集 | `static/js/components/contextMenu.js`（`refreshPluginEntries` / `pluginEntryContext` / `resolvePluginEntryTargetIds` / `runPluginEntry`）、`templates/components/context_menu.html` | `analyze-folder` 只在右键**分类**时可用（`when.target: "folder"`）；置灰项可见、附 `disabledHint`、点击不执行；目标 id 列表由宿主解析后经 `ctx.targetIds` 交给插件 |
+| C20 | `kind: "batch"` 的落点是**批量操作菜单**（顶部工具栏「批量操作」展开项），作用域是**全局选中集**（`when.selection` 沿用全局求值） | `templates/components/header.html`（`pluginBatchEntries`）、`static/js/components/header.js`（`refreshPluginBatchEntries` / `runPluginBatchEntry`） | `analyze-selected` 只出现在批量菜单；未选卡时可见但置灰；`ctx.targetIds` = 选中集 |
+| C21 | 同一个 surface 被多个入口复用时，宿主**不会**在第二次打开时重新 `mount`（那会丢用户已填的表单），只把新 `ctx` 交给 `onOpen` | `static/js/pluginSurfaceHost.js:openSurface` | 插件必须同时实现 `mount` 与 `onOpen` 并调用同一个 `applyEntryContext(ctx)`，否则「先右键 A 分类、再右键 B 分类」会一直显示 A 的作用域 |
 | C16 | 宿主 surface 容器已完成定位、尺寸、滚动、`data-marquee-ignore`、`role="dialog"`/`aria-modal`、焦点陷阱、ESC 关闭；插件**只能**在容器内建 DOM，**不得**设置容器或其祖先的 `position`/`z-index`/`inset`。`mount()` 返回函数时宿主在关闭时调用 | `static/js/pluginSurfaceHost.js:117-200`、`static/css/modules/plugin-surfaces.css` | `mount(container, ctx)` 只往容器里 append；返回值用于摘 DOM；不碰容器样式 |
 | C17 | 宿主 surface 容器**刻意不提供** `backdrop-filter`（Chromium backdrop root 会画出黑块/平坦灰），插件 overlay 上的 `backdrop-filter: blur(5px)` 与 `body:has(...) .main-container { backdrop-filter: none }` 兜底规则都必须删除；`api.setFullscreenScrim()` 也不再需要 | `static/js/pluginSurfaceHost.js:15-17`、`static/css/modules/plugin-surfaces.css:9-15` | 两条规则已删除；插件 CSS 里 `backdrop-filter` 出现次数为 0（`tests/test_css_scope.py` 锁定） |
 | C11 | 插件后端以 `st_plugin_stm_ai_assistant` 模块名加载，**不注入 sys.path** | `core/plugins/registry.py:262-286` | 插件内一律相对导入（`from .core.prompt import ...`）；禁止 `import backend` |
@@ -676,10 +678,37 @@ def chat(messages, *, provider: dict, api_key: str, extra_headers: dict | None =
 
 | id | kind | label | icon | surface | 条件 | 落地位置 |
 |---|---|---|---|---|---|---|
-| `workbench` | `dock` | AI 助手 | `wand` | `workbench`（panel） | — | 入口坞（official，默认进坞槽位）；快捷键 `Ctrl+Shift+A` |
-| `analyze-selected` | `context` | 分析选中的角色卡 | `tags` | `workbench`（panel） | `requires_selection: true`，`when: {mode:["cards"], selection:"any"}`，`disabledHint: 请先在角色卡视图里选中至少一张卡片` | **右键菜单** / 命令面板；未选卡时**可见但置灰** |
-| `open-review` | `command` | AI 助手：结果与审批 | `clipboard` | `workbench`（panel） | `when: {config: {requireKeys:["default_profile_id"]}}`，`disabledHint: 请先在「AI 助手 → 设置」里选择默认提示词档案` | 命令面板；快捷键 `Ctrl+Shift+R`；未配档案时置灰，点击跳转到插件配置区 |
-| `assistant-settings` | `settings` | AI 助手设置 | `settings-gear` | `workbench`（panel） | — | 设置页插件区 |
+| `workbench` | `dock` | AI 助手 | `wand` | `workbench`（**modal**） | — | 入口坞（official，默认进坞槽位）+ 命令面板；快捷键 `Ctrl+Shift+A`；承载自检状态点与**待审批角标** |
+| `analyze-folder` | `context` | 分析此分类全部卡片 | `folder` | `workbench`（modal） | `when: {mode:["cards"], target:"folder"}`，`disabledHint: 仅支持右键分类；请在角色卡视图里右键一个分类` | **右键菜单**（右键**分类**时可用）；作用域 = 该分类含子分类的全部卡片 |
+| `analyze-selected` | `batch` | AI 分析选中卡片 | `tags` | `workbench`（modal） | `requires_selection: true`，`when: {mode:["cards"], selection:"any"}`，`disabledHint: 请先在角色卡视图里选中至少一张卡片` | **批量操作菜单**（顶部工具栏「批量操作」展开项）；作用域 = 全局选中集 |
+| `assistant-settings` | `settings` | AI 助手设置 | `settings-gear` | `workbench`（modal） | — | 设置页插件区 |
+
+**入口收敛的动机**（P1 阶段 2 修订）：旧版 4 个入口**全部指向同一个 surface**
+（`workbench`），且 `analyze-selected` 是 `context`（右键菜单）——结果有两处错位：
+
+1. **右键菜单的作用域被弄错了**。右键一个分类时，用户的意思是「分析这个分类」，
+   但旧实现把「分析选中卡片」放进了右键菜单，插件只能退回去读全局选中集。
+   正确设计是：右键菜单项对应**右键目标**，选中卡片对应**批量操作菜单**
+   （用户原话：「对于选中卡片的分析应该注册到批量处理的展开项中，这样才符合
+   当前整个项目的设计」）。
+2. **`open-review` 与 `workbench` 落点重复**。两者都打开同一个面板的同一批内容，
+   唯一区别是页签；保留它只会让入口总览里多一条重复快捷键。已删除，待审批角标
+   改挂到 `workbench`（否则角标会因目标入口不存在而静默丢失）。
+
+收敛后 4 个入口的 `kind` **两两不同**，各自落在真实的宿主位置：
+`dock` → 入口坞、`context` → 右键菜单、`batch` → 批量操作菜单、`settings` → 设置页。
+回归见 `tests/test_manifest_contract.py::test_entries_land_on_distinct_host_locations`。
+
+**`context` vs `batch` 的作用域**（本插件最重要的入口语义）：
+
+| kind | 求值输入 | 宿主传给插件的目标 | 语义 |
+|---|---|---|---|
+| `context` | `targetKind`（+ `selectionCount` 被覆盖） | `targetKind` / `targetPath` / `targetIds` | 右键**分类** → 分析该分类（含子分类）的全部卡片 |
+| `batch` | 全局 `selectionCount` | `targetIds`（= 选中集） | 批量菜单 → 分析勾选的卡片 |
+
+`targetIds` 由**宿主**解析后交给插件：插件拿不到主程序的卡片列表接口
+（只有 `/api/plugins/<id>/*`），也不该去读宿主的内部状态（`viewState.selectedIds`
+是 Provisional 耦合，且与右键分类的作用域无关）。
 
 **`shortcut` 的语义**（设计文档 2.2：「建议快捷键，宿主可覆盖」）：
 插件声明的是**建议值**，用户没改时**直接生效**（不是仅展示）；用户在入口总览页
@@ -690,13 +719,23 @@ def chat(messages, *, provider: dict, api_key: str, extra_headers: dict | None =
 不要占用宿主保留的 `Ctrl+K`（命令面板）。回归见
 `tests/test_manifest_contract.py::test_entry_shortcuts_are_wellformed_and_unique`。
 
-**tier = `official`**（C14）：登记在主程序 `static/plugins/catalog.json`。
-official 允许全部 6 类 kind，但本插件**刻意只用 community 也允许的 4 类**，
-不声明 `nav` / `status`——这样即使将来从 catalog 摘掉而降级，入口也不会被静默忽略。
-本插件共 4 项，远低于 16 项上限。
+**只有 `workbench` 声明快捷键**：入口总览页按 **surface 去重**，多个入口指向同一
+surface 时只有第一个入口持有快捷键位（`pluginManager.js:entryHoldsShortcutSlot`）；
+`context` 类**不提供**快捷键设置——右键菜单入口没有「右键目标」这个键盘概念，
+且所有 context 入口打开的是同一个面板，设了也没有可用落点。
 
-四个入口复用同一个 surface（`workbench`），由 `mount(container, ctx)` 按
-`ctx.targetId` 决定落到哪个页签（见 §8.2 的 `tabForTarget`）。
+**tier = `official`**（C14）：登记在主程序 `static/plugins/catalog.json`。
+official 允许全部 7 类 kind，但本插件**刻意只用 community 也允许的 5 类**
+（`dock` / `context` / `batch` / `settings`），不声明 `nav` / `status`——这样即使
+将来从 catalog 摘掉而降级，入口也不会被静默忽略。本插件共 4 项，远低于 16 项上限。
+
+四个入口复用同一个 surface（`workbench`），由 `onOpen(ctx)` 按
+`ctx.targetId` 决定落到哪个页签、按 `ctx.targetIds` 决定作用域
+（见 §8.2 的 `tabForTarget` / `applyEntryContext`）。
+
+> **`onOpen` 而非只在 `mount` 里处理**：surface 已打开时宿主**不会**重新 `mount`
+> （那会重建 DOM、丢掉用户已填的表单），只会把新 `ctx` 交给 `onOpen`。
+> 没有它，「先右键 A 分类、再右键 B 分类」会一直显示 A 的作用域。
 
 ### 8.2 surface 表与面板结构
 
@@ -705,8 +744,14 @@ manifest 字面一致（C15）。
 
 | surface.id | type | 用途 | `mount` 行为 |
 |---|---|---|---|
-| `workbench` | `panel` | 主面板（四个页签） | 把「状态条 + 页签栏 + 主体」append 进宿主容器；返回摘 DOM 的函数 |
+| `workbench` | **`modal`** | 主面板（四个页签） | 把「状态条 + 页签栏 + 主体」append 进宿主容器；返回摘 DOM 的函数 |
 | `prompt-preview` | `modal` | Prompt 全文预览（原本塞在页签里造成长滚动） | 由 `panel.js:createPromptPreview` 渲染消息块 |
+
+**`workbench` 从 `panel` 改为 `modal`**：这是主工作台，承载批量分析表单与审批列表，
+需要宿主提供遮罩 + 焦点陷阱；旧 `panel`（右侧抽屉，宽度 `min(420px, 92vw)`）会把
+长表单挤在窄栏里。manifest 与 `frontend/plugin.js` 的注册**必须同时改**，
+否则宿主按 manifest 建容器、插件按自己的理解排版。回归见
+`tests/test_manifest_contract.py::test_workbench_surface_is_a_modal`。
 
 **宿主负责、插件不重复实现**（C16 / C17）：定位、尺寸、滚动、`data-marquee-ignore`、
 `role="dialog"` / `aria-modal`、焦点陷阱、ESC 关闭、遮罩合成、`z-index`。
@@ -714,7 +759,7 @@ manifest 字面一致（C15）。
 `.plugin-surface__title` / `.plugin-surface__close`，插件 CSS 选不中也**不该**去选，硬约束坑 5）。
 
 ```
-宿主容器 .plugin-surface--panel（右侧抽屉，宽度 min(420px, 92vw)）
+宿主容器 .plugin-surface--modal（居中弹层 + 遮罩）
 ┌─ AI 助手                              [×]  ← 宿主渲染的标题栏
 ├───────────────────────────────────────────────────────┤
 │ 档案 5  Provider 2  写回 逐条审批  待审批 3            │ ← 插件：状态条（常驻）
@@ -756,20 +801,26 @@ manifest 字面一致（C15）。
 |---|---|---|---|
 | 入口可用/置灰 | `entries[].when`（宿主求值，D7） | Stable | 插件不自行判断 |
 | 快捷键 | `entries[].shortcut`（建议值）+ 用户配置（`_entry_layout_v1.shortcuts`） | Stable | 用户配置优先；格式见 C18 |
-| 待审批角标 | `api.entries.setBadge('open-review', n)` | Stable | — |
+| 待审批角标 | `api.entries.setBadge('workbench', n)` | Stable | 入口不存在时写入返回 false（`open-review` 删除后必须改挂 `workbench`） |
 | 自检结论 / 作业进度 | `api.entries.setStatus` / `setProgress` / `setBusy` | Stable | — |
+| **本次点击的作用域** | `mount(container, ctx)` / `onOpen(ctx)` 的 `ctx.targetKind` / `ctx.targetPath` / `ctx.targetIds` | Stable | 空数组 → 退回「主程序当前选中集」语义（`panel.js:applyEntryContext`） |
 | **读取用户选中的卡片** | `api.store.viewState.selectedIds`，**集中封装在 `frontend/selection.js`** | **Provisional** | 取不到 → 返回 `[]`，面板内提供卡片多选列表（走插件自己的 `/cards` 路由） |
 | 概览写后刷新列表 | `api.host.refresh('cards')` | Stable | 事件无人监听 → 提示用户手动刷新 |
 | 轻提示 | `api.host.toast(msg, 3000, 'check')` | Stable | — |
 | 配置变更 | `api.onConfigChange(handler)`（D10，替代轮询） | Stable | 旧宿主无此成员时跳过订阅 |
 | 打开作业面板 | `api.jobs.open(runId, {title})` | Provisional | 失败 → 插件自建进度区（`subscribeJob` 直连） |
 
+> **作用域优先于选中集**：入口带来的 `ctx.targetIds` 会覆盖 `context.selectedCardIds`
+> （`applyEntryContext`），且带作用域时**不再**回读 `viewState.selectedIds`
+> （`workbench.js:refresh`）。否则「右键分类 → 分析该分类」会被全局选中集覆盖，
+> 用户看到的作用域与实际分析范围不一致——这正是重写前的问题 1。
+
 > **Provisional 登记**：`api.store.viewState.selectedIds` 是宿主 Alpine store 的内部形状，
 > 随宿主重构而变。新契约把这部分责任交给宿主（`entries[].when.selection` 由宿主求值，
-> 插件只声明「需要至少选中一张」），但「提交作业」终究需要**具体 id 列表**，而
-> `ctx.targetId` 只给入口 id、`api.entries.list()` 只给 `enabled` 布尔值。
-> 因此保留最小读取，并把耦合**全部收进 `frontend/selection.js`**；宿主一旦提供稳定 API
-> （例如 `api.host.getSelection()`），只改这一个文件即可完成迁移。
+> 插件只声明「需要至少选中一张」），且**入口作用域**已由 `ctx.targetIds` 提供
+> （Stable）。`selection.js` 只剩「坞 / 快捷键打开时回读主程序当前选中集」这一条路径，
+> 并把耦合**全部收进该文件**；宿主一旦提供稳定 API（例如 `api.host.getSelection()`），
+> 只改这一个文件即可完成迁移。
 > 相关回归：`tests/test_manifest_contract.py::test_frontend_avoids_removed_host_apis`。
 
 ### 8.4 进度与审批
@@ -1125,4 +1176,125 @@ mask 只取 alpha 形状、颜色由 `background-color: currentColor` 决定，�
 `hardcoded_sprite` 误判（`_SPRITE_REFERENCE_PATTERN` 只匹配 `/static/icons/` 与
 `icons/{ui,detail,sidebar,preset}.svg`）。实测 `scan_css_declarations` 仍为 `{}`。
 回归用例：`tests/test_css_scope.py::test_plugin_brand_icon_is_a_plugin_owned_asset`。
+
+---
+
+## 附录 F · P2 入口落点收敛与作用域修正（2026-10-11）
+
+### F.1 触发的问题
+
+上一阶段（附录 E）把入口从「自绘浮动按钮」改成「manifest 声明 + 宿主渲染」，
+但**入口落点本身是错的**。用户验收时指出两处：
+
+1. **右键菜单的作用域错了**（用户原话）：
+   > 「右键菜单是对该分类下的所有卡片整体分析，不保留对选中卡片的分析，
+   > 对于选中卡片的分析应该注册到批量处理的展开项中，这样才符合当前整个项目的设计。」
+
+   旧版把「分析选中卡片」放在 `context`（右键菜单）里。右键一个分类时，
+   用户的意思是「分析这个分类」，但插件拿到的作用域只有 `ctx.targetId`
+   （= 入口 id），只能退回去读全局 `viewState.selectedIds`——**右键分类 → 实际
+   分析的是恰好勾选的那几张卡**，语义完全错位。
+
+2. **4 个入口指向同一个 surface**：`workbench` / `analyze-selected` / `open-review` /
+   `assistant-settings` 全部 `surface.id = "workbench"`。入口总览里看起来有 4 个
+   入口，点开都是同一个面板的同一批内容；`open-review` 与 `workbench` 的唯一区别
+   只是初始页签，属于重复入口。
+
+### F.2 契约新增（宿主侧）
+
+| 新增项 | 位置 | 说明 |
+|---|---|---|
+| `ENTRY_KINDS` += `'batch'` | `core/plugins/entries.py`、`static/js/entryRegistry.js` | 批量操作菜单的落点 |
+| `_KIND_TIER_ALLOWLIST['batch']` | `core/plugins/entries.py` | **所有 tier** 开放（只是菜单项，不是高权限落点） |
+| `KNOWN_WHEN_KEYS` += `'target'` | `core/plugins/entries.py` | 取值 `folder` / `card` / `any`（`TARGET_KINDS`），非法值忽略 + 警告 |
+| `evaluateWhen` 支持 `when.target` | `static/js/entryRegistry.js` | **只对提供 `targetKind` 的消费方求值**；不提供时跳过 |
+| `list({ contextOverride })` | `static/js/entryRegistry.js` | 让右键菜单用右键目标求值，而不是全局选中集 |
+| `openSurface` 的 ctx 新增 `targetKind` / `targetPath` / `targetIds` | `static/js/pluginSurfaceHost.js` | 右键目标由**宿主**解析后交给插件 |
+| `openSurface` 重复打开时投递新 ctx | `static/js/pluginSurfaceHost.js` | 已打开时不重新 `mount`（会丢表单），只调 `onOpen(ctx)` |
+| 批量菜单消费 `kind: 'batch'` | `templates/components/header.html`、`static/js/components/header.js` | 沿用全局 selection 语义求值 `when` |
+| 入口总览五项简化 | `templates/modals/plugin_manager.html`、`static/js/components/pluginManager.js` | 见 F.4 |
+
+**后端业务逻辑零改动**：`backend/` 目录 git diff 为空。新增契约全部落在宿主侧与
+插件声明层，插件后端一行业务代码都没变。
+
+### F.3 入口收敛结果
+
+| id | kind | 落点 | 作用域来源 |
+|---|---|---|---|
+| `workbench` | `dock` | 入口坞 + 命令面板 | 主程序当前选中集（回读） |
+| `analyze-folder` | `context` | 右键菜单（右键**分类**时） | `ctx.targetIds` = 该分类含子分类的全部卡片 |
+| `analyze-selected` | `batch` | 批量操作菜单 | `ctx.targetIds` = 全局选中集 |
+| `assistant-settings` | `settings` | 设置页 | — |
+
+- **删除 `open-review`**（与 `workbench` 重复），待审批角标从 `open-review`
+  改挂到 `workbench`——否则 `setBadge` 查不到条目会静默返回 `false`，
+  用户再也看不到「有几条待审批」。
+- **`workbench` 从 `panel` 改为 `modal`**：主工作台需要遮罩 + 焦点陷阱，
+  旧 `panel`（右侧抽屉 `min(420px, 92vw)`）会把长表单挤在窄栏里。
+- 4 个 kind **两两不同**，各自落在真实的宿主位置。
+
+### F.4 入口总览五项简化
+
+| # | 简化 | 理由 |
+|---|---|---|
+| 1 | 快捷键**按 surface 去重** | 多个入口指向同一 surface 时只有第一个持有快捷键位，否则出现多条指向同一面板的重复快捷键（改绑时互相顶掉） |
+| 2 | `context` 类**不提供**快捷键设置 | 右键菜单入口没有「右键目标」这个键盘概念，且都开同一个面板（用户原话：「设了也没用」） |
+| 3 | 删除「操作」列 | 该列只有一个「配置」按钮，插件卡片上本来就有配置按钮，同页两处入口属于重复；入口总览是**审计面**不是操作面 |
+| 4 | 删除页签内的重复刷新按钮 | 两个刷新按钮中，页签内那个调 `loadEntries()`，在「已安装」页签下点它会静默什么都不刷新，属于误导性控件；保留工具栏顶部走 `reloadActiveTab()` 的那个 |
+| 5 | 如实标注未实现的 kind | `settings` / `nav` / `status` 目前**没有任何渲染消费者**，旧文案却写着「设置页 / 侧栏导航 / 状态栏」。改为「宿主未实现」+ 显式的「（宿主未实现）」标记 |
+
+### F.5 验收结果
+
+```
+插件仓库  python -m pytest tests/ -q              → 348 passed（基线 341，+7）
+主程序    python -m pytest tests/ -q              → 3091 passed（基线 3066，+25）
+插件仓库  git diff -- backend/                    → 空
+```
+
+**测试有效性证据**（用户明确要求）：逐个把修复回退掉，对应测试必须失败。
+18 条回退全部导致测试失败，覆盖：
+
+| 回退点 | 失败用例数 |
+|---|---|
+| `entries.py`：`ENTRY_KINDS` 去掉 `batch` | 4 |
+| `entries.py`：tier 白名单去掉 `batch` | 7 |
+| `entries.py`：`KNOWN_WHEN_KEYS` 去掉 `target` | 2 |
+| `entries.py`：去掉 `when.target` 合法性校验分支 | 1 |
+| `entryRegistry.js`：`ENTRY_KINDS` 去掉 `batch` | 2 |
+| `entryRegistry.js`：`evaluateWhen` 去掉 `when.target` 分支 | 2 |
+| `entryRegistry.js`：`list()` 去掉 `contextOverride` | 2 |
+| `pluginSurfaceHost.js`：已打开的 surface 不投递新 ctx | 1 |
+| `pluginSurfaceHost.js`：mount ctx 不传 `targetKind`/`targetPath`/`targetIds` | 2 |
+| `contextMenu.js`：用全局选中集求值（去掉 `contextOverride`） | 1 |
+| `contextMenu.js`：不把右键目标传给插件 | 1 |
+| `header.html`：批量菜单不遍历 `pluginBatchEntries` | 1 |
+| `header.js`：去掉 batch 入口取数 | 1 |
+| `pluginManager.js`：未实现的 kind 仍写成具体界面 | 1 |
+| `pluginManager.js`：去掉按 surface 去重 | 1 |
+| `pluginManager.js`：行数据丢掉 `surfaceId` | 1 |
+| `plugin_manager.html`：恢复重复刷新按钮 | 1 |
+| `plugin_manager.html`：恢复「操作」列 | 1 |
+
+### F.6 尚未验证 / 存疑
+
+1. **端到端手工验收仍未执行**（与附录 E 第 4 条同一遗留）。自动化测试覆盖了
+   契约、注册表行为、模板静态断言，但以下只能手工确认：
+   - 右键分类 → 面板显示「作用域 分类「X」（含子分类）」且待分析数正确；
+   - 批量菜单里插件项的出现与置灰；
+   - `workbench` 改成 modal 后的实际观感（居中弹层 vs 右侧抽屉）；
+   - 入口坞拖拽重排（问题 2 的实现，已通过 `node --check` 但未在浏览器验证）。
+2. **`resolvePluginEntryTargetIds` 一次取回整个分类的卡片**：走
+   `/api/list_cards?page_size=100000&recursive=true`。分类很大时会拉一个较大的
+   JSON。当前是可接受的（分析作业本来就要对这些卡片逐个读文件），但若将来
+   出现万张级分类，应改成宿主提供「按分类取 id 列表」的轻量接口。
+3. **`when.target` 只有右键菜单会求值**：这是刻意的（否则 context 入口在坞 /
+   命令面板 / 批量菜单里会被误判为不可用），但也意味着**其它消费方无法表达
+   「只在某种目标下可用」**。若将来需要，应扩展成通用的 `context.targetKind`
+   而非在每个消费方各写一套。
+4. **入口总览的「共用」标记依赖 `entryRows` 的排序**：`buildEntryRows` 按
+   `pluginId` + `label` 排序，所以「第一个持有快捷键位」是**字母序**结果，
+   不是 priority 序。目前每个 surface 只有一个入口声明了 `shortcut`，
+   所以实际无差异；若将来同一 surface 的多个入口都声明快捷键，需要显式
+   定义优先级（建议改为按 `priority`）。
+
 

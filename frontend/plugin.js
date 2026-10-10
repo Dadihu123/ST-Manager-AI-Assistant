@@ -3,8 +3,14 @@
  *
  * 契约：导出 `activate(api)`，可选导出 `deactivate(api)`。
  * 本次重写后，入口**不再自绘浮动按钮**：入口在 `manifest.frontend.entries` 里声明，
- * 由宿主渲染到坞、命令面板 / 右键菜单与设置页；面板容器由宿主提供
+ * 由宿主渲染到坞、批量操作菜单、右键菜单与设置页；面板容器由宿主提供
  * （`static/js/pluginSurfaceHost.js`，其头部注释把本插件旧版的固定定位浮层列为反面教材）。
+ *
+ * 入口落点（4 个入口，各自落在不同的宿主位置）：
+ * - `workbench`（dock）—— 入口坞 / 命令面板，主面板，承载自检状态点与待审批角标；
+ * - `analyze-folder`（context，`when.target: "folder"`）—— 右键**分类** → 分析该分类全部卡片；
+ * - `analyze-selected`（batch，`when.selection: "any"`）—— 批量操作菜单 → 分析选中卡片；
+ * - `assistant-settings`（settings）—— 设置页入口。
  *
  * 插件剩下三件事：
  * 1. 注册 surface 与它们的 `mount(container, ctx)` 内容渲染器；
@@ -45,7 +51,7 @@ function createEntryStatusReporter(api) {
       if (api.entries.setStatus('workbench', status)) writtenStatus = status;
     }
     if (hasBadge && writtenBadge !== badge) {
-      if (api.entries.setBadge('open-review', badge)) writtenBadge = badge;
+      if (api.entries.setBadge('workbench', badge)) writtenBadge = badge;
     }
   };
 
@@ -61,13 +67,13 @@ function createEntryStatusReporter(api) {
         if (api.entries.setStatus('workbench', status)) writtenStatus = status;
       }
     },
-    /** 待审批角标；`null` 表示清除。 */
+    /** 待审批角标；`null` 表示清除。挂在主面板入口 `workbench` 上。 */
     setPendingBadge(value) {
       const count = Number(value) || 0;
       badge = count > 0 ? (count > 99 ? '99+' : count) : null;
       hasBadge = true;
       if (writtenBadge === badge) return;
-      if (api.entries.setBadge('open-review', badge)) writtenBadge = badge;
+      if (api.entries.setBadge('workbench', badge)) writtenBadge = badge;
     },
     dispose() {
       if (typeof off === 'function') off();
@@ -81,6 +87,14 @@ export async function activate(api) {
   // 跨视图共享的运行上下文（选中的卡片、当前作业、参数）
   const context = {
     selectedCardIds: [],
+    /**
+     * 本次入口打开的作用域（`kind: "context"` 的右键目标 / `kind: "batch"` 的选中集）。
+     *
+     * `null` 表示「无特定作用域」（坞 / 快捷键打开），此时沿用主程序当前选中集。
+     * 非 null 时形如 `{ kind: 'folder' | 'card' | 'selection', path, count }`，
+     * 由 `panel.applyEntryContext()` 从宿主传入的 `ctx` 折算。
+     */
+    openTarget: null,
     runId: '',
     providerId: '',
     profileId: '',
@@ -106,13 +120,23 @@ export async function activate(api) {
   // 面板：`surface.id` 必须与 manifest 保持一致（坞按 `<pluginId>:<surface.id ?? entry.id>` 查表）。
   api.surfaces.register('workbench', {
     title: 'AI 助手',
-    type: 'panel',
-    mount(container, ctx) {
-      // 同一个 surface 服务 4 个入口：按 `ctx.targetId` 决定落到哪个页签
-      panel.showTab(panel.tabForTarget(ctx && ctx.targetId));
+    // modal：这是**主工作台**，承载批量分析与审批，需要宿主提供遮罩 + 焦点陷阱，
+    // 而不是与卡片网格并排的侧边抽屉（旧 `panel` 类型会让长表单挤在窄栏里）。
+    type: 'modal',
+    mount(container) {
       container.append(panel.element);
       // 宿主关闭时调用（D8 契约）：只摘 DOM，视图实例留待下次 mount 复用
       return () => panel.detach();
+    },
+    /**
+     * 应用本次入口的作用域与页签。
+     *
+     * 宿主在 `mount` 之后**必定**调用一次 `onOpen`（见 `pluginSurfaceHost.js`
+     * 的 `openSurface`），所以这里是唯一的落点：初次打开与「surface 已打开时
+     * 再次从别的入口进入」走的是同一条路径，不会出现两套逻辑分叉。
+     */
+    onOpen(ctx) {
+      panel.applyEntryContext(ctx);
     },
   });
 

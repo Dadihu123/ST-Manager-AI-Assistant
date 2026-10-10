@@ -56,6 +56,8 @@ export function createWorkbench(api, client, context) {
     }),
     button('清空', 'is-secondary', () => {
       context.selectedCardIds = [];
+      // 手动清空 = 放弃入口带来的作用域，否则 renderCards 会一直显示旧作用域
+      context.openTarget = null;
       renderCards();
     }),
     button('手动选择', 'is-secondary', () => {
@@ -68,6 +70,8 @@ export function createWorkbench(api, client, context) {
   cardsSection.append(selectionInfo, cardActions, picker);
 
   function readMainSelection() {
+    // 用户显式改选 → 放弃入口作用域，回到「主程序当前选中集」语义
+    context.openTarget = null;
     context.selectedCardIds = readSelectedCardIds(api);
   }
 
@@ -85,6 +89,28 @@ export function createWorkbench(api, client, context) {
   function renderCards() {
     const count = context.selectedCardIds.length;
     clear(selectionInfo);
+
+    // 入口带来的作用域（右键分类 / 批量选中）优先展示：用户点「分析此分类」后
+    // 必须能看出这次分析的范围，而不是只看到「已选 N 张」。
+    const target = context.openTarget;
+    if (target) {
+      const label = target.kind === 'folder'
+        ? `分类「${target.path === '' ? '根目录' : target.path}」（含子分类）`
+        : target.kind === 'selection'
+          ? '批量选中的卡片'
+          : '右键的卡片';
+      selectionInfo.append(
+        badge(`作用域 ${label}`, count ? 'is-ok' : 'is-muted'),
+        el('span', 'plugin-stm-ai-assistant-hint', `共 ${count} 张待分析`),
+      );
+      if (!count) {
+        selectionInfo.append(el('p', 'plugin-stm-ai-assistant-hint',
+          '该作用域下没有可分析的卡片；可改用「读取主程序选择」或「手动选择」。'));
+      }
+      picker.classList.add('is-hidden');
+      return;
+    }
+
     selectionInfo.append(
       badge(`已选 ${count} 张`, count ? 'is-ok' : 'is-muted'),
       el('span', 'plugin-stm-ai-assistant-hint',
@@ -449,8 +475,9 @@ export function createWorkbench(api, client, context) {
       api.host.toast(`读取档案失败：${error.message}`, 3200, 'close');
     }
 
-    // 宿主尚未把选中集合交给插件，这里按需再读一次（见 selection.js 的说明）
-    if (!context.selectedCardIds.length) readMainSelection();
+    // 宿主尚未把选中集合交给插件，这里按需再读一次（见 selection.js 的说明）。
+    // 入口带来作用域时**不**回读：右键分类的作用域与全局选中集无关，回读会把它覆盖掉。
+    if (!context.selectedCardIds.length && !context.openTarget) readMainSelection();
     renderCards();
     renderProgress();
   }

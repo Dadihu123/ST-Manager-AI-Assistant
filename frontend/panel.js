@@ -134,7 +134,7 @@ export function createPanelBody(api, client, context) {
     }
   }
 
-  /** 把待审批数同步到 `open-review` 入口角标；为 0 时清除。
+  /** 把待审批数同步到 `workbench` 入口角标；为 0 时清除。
    *
    * 交给 `context.setPendingBadge`（由 `plugin.js` 注入）而不是直接调
    * `api.entries.setBadge`：注册表可能还没建表（见 `plugin.js` 的
@@ -147,20 +147,52 @@ export function createPanelBody(api, client, context) {
       context.setPendingBadge(value);
       return;
     }
-    api.entries.setBadge('open-review', value > 0 ? (value > 99 ? '99+' : value) : null);
+    api.entries.setBadge('workbench', value > 0 ? (value > 99 ? '99+' : value) : null);
   }
 
-  /** 入口打开时按 `ctx.targetId` 落到对应页签（一个 surface 服务 4 个入口）。 */
+  /** 入口打开时按 `ctx.targetId` 落到对应页签（一个 surface 服务多个入口）。 */
   function tabForTarget(targetId) {
     const target = String(targetId || '');
-    if (target === 'open-review') return 'review';
     if (target === 'assistant-settings') return 'settings';
     return 'workbench';
   }
 
+  /**
+   * 应用入口打开时的宿主上下文（`mount(container, ctx)` 的 ctx）。
+   *
+   * 宿主把「这次点击的作用域」放在 `ctx.targetIds` 里交给插件：
+   * - 右键分类 → 该分类（含子分类）下的全部卡片 id；
+   * - 批量菜单 → 当前选中的卡片 id；
+   * - 坞 / 快捷键 → 空数组（沿用主程序当前选中集）。
+   *
+   * 插件据此**不必**再去读宿主的 `viewState.selectedIds`（那是 Provisional 耦合，
+   * 而且右键分类的作用域与全局选中集根本不是一回事）。
+   */
+  function applyEntryContext(ctx) {
+    const source = String((ctx && ctx.source) || '');
+    const targetIds = Array.isArray(ctx && ctx.targetIds) ? ctx.targetIds.map(String) : [];
+    // 作用域只看**来源**，不看 id 数量：右键一个空分类也是「分类作用域」，
+    // 此时正确行为是如实显示「该分类下没有卡片」，而不是悄悄退回全局选中集
+    // （那会让用户以为要分析的是自己勾选的那几张，与右键意图不符）。
+    const scoped = source === 'context' || source === 'batch';
+
+    context.openTarget = scoped
+      ? {
+        kind: String((ctx && ctx.targetKind) || ''),
+        path: String((ctx && ctx.targetPath) || ''),
+        count: targetIds.length,
+      }
+      : null;
+
+    // 只有带作用域的入口才覆盖选中集；坞 / 快捷键打开时保留用户已有选择。
+    if (scoped) context.selectedCardIds = targetIds;
+
+    showTab(tabForTarget(ctx && ctx.targetId));
+  }
   return {
     element: root,
     showTab,
+    applyEntryContext,
     refreshStatus,
     tabForTarget,
     /** 宿主关闭 surface 时调用：只摘 DOM，视图实例留待下次 mount 复用。 */
