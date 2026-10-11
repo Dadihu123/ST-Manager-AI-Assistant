@@ -120,9 +120,23 @@ export async function activate(api) {
   // 面板：`surface.id` 必须与 manifest 保持一致（坞按 `<pluginId>:<surface.id ?? entry.id>` 查表）。
   api.surfaces.register('workbench', {
     title: 'AI 助手',
-    // modal：这是**主工作台**，承载批量分析与审批，需要宿主提供遮罩 + 焦点陷阱，
-    // 而不是与卡片网格并排的侧边抽屉（旧 `panel` 类型会让长表单挤在窄栏里）。
+    description: '角色卡分析工作台',
+    // 图标走**插件自己的品牌资源**：同一个插件的坞入口、右键菜单、批量菜单、
+    // 入口总览与弹层标题都用它，辨识度一致（宿主解析为
+    // `/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg`）。
+    icon: 'frontend/assets/icon.svg',
+    // modal + lg：主工作台承载批量分析表单与审批列表，需要遮罩、焦点陷阱与
+    // 完整宽度；`lg` 给出**固定**的 1080×760（切换页签时容器不再跳动）。
     type: 'modal',
+    size: 'lg',
+    /**
+     * 状态胶囊放进**宿主的标题行**（与图标、标题、关闭按钮同一行）。
+     *
+     * 旧版插件自绘第二条状态栏，弹层顶部因此有两行，比宿主自己的弹窗「多一层」。
+     */
+    headerExtra(container) {
+      panel.mountHeaderExtra(container);
+    },
     mount(container) {
       container.append(panel.element);
       // 宿主关闭时调用（D8 契约）：只摘 DOM，视图实例留待下次 mount 复用

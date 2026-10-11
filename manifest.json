@@ -27,7 +27,7 @@
         "kind": "dock",
         "label": "AI 助手",
         "description": "角色卡批量分析工作台：概览与标签建议、结果审批、提示词档案与设置。",
-        "icon": "wand",
+        "icon": "frontend/assets/icon.svg",
         "surface": {
           "id": "workbench",
           "type": "modal"
@@ -40,7 +40,7 @@
         "kind": "context",
         "label": "分析此分类全部卡片",
         "description": "对该分类（含子分类）下的所有卡片提交一次 AI 分析作业。",
-        "icon": "folder",
+        "icon": "frontend/assets/icon.svg",
         "surface": {
           "id": "workbench",
           "type": "modal"
@@ -59,7 +59,7 @@
         "kind": "batch",
         "label": "AI 分析选中卡片",
         "description": "对批量操作里选中的卡片提交一次 AI 分析作业。",
-        "icon": "tags",
+        "icon": "frontend/assets/icon.svg",
         "surface": {
           "id": "workbench",
           "type": "modal"
@@ -79,7 +79,7 @@
         "kind": "settings",
         "label": "AI 助手设置",
         "description": "Provider、密钥、用量与新标签建议。",
-        "icon": "settings-gear",
+        "icon": "frontend/assets/icon.svg",
         "surface": {
           "id": "workbench",
           "type": "modal"

@@ -42,13 +42,13 @@ function toneOf(legacy) {
 }
 
 export function createPanelBody(api, client, context) {
-  // 状态条：常驻容器。品牌图标与徽章槽分开——refreshStatus 只清徽章槽，
-  // 否则每次刷新都会把图标一起清掉。
-  const statusRow = el('div', 'plugin-stm-ai-assistant-status-row');
-  const glyph = el('span', 'plugin-stm-ai-assistant-glyph');
-  glyph.setAttribute('aria-hidden', 'true');
+  // 状态胶囊槽：**由宿主标题行承载**（`spec.headerExtra`）。
+  //
+  // 旧版插件自绘「品牌图标 + 徽章」第二条状态栏，与宿主标题行叠在一起 →
+  // 弹层顶部出现两行，视觉上比宿主自己的弹窗「多一层」。
+  // 现在图标与标题归宿主标题行（`.plugin-surface__header`），插件只把状态胶囊
+  // 塞进宿主的附加槽，两者同行。
   const badgeSlot = el('span', 'plugin-stm-ai-assistant-status-badges');
-  statusRow.append(glyph, badgeSlot);
 
   const tabBar = el('nav', 'plugin-stm-ai-assistant-tabs');
   tabBar.setAttribute('role', 'tablist');
@@ -83,9 +83,9 @@ export function createPanelBody(api, client, context) {
     tabBar.append(node);
   });
 
-  // 内容顺序：状态条 → 横向页签 → 主体（宿主的标题栏在上方）
+  // 内容顺序：页签 → 主体（标题行与状态胶囊归宿主容器）
   const root = el('div', 'plugin-stm-ai-assistant-panel');
-  root.append(statusRow, tabBar, body);
+  root.append(tabBar, body);
 
   function cleanupView(view, { destroy = false } = {}) {
     if (!view) return;
@@ -195,6 +195,16 @@ export function createPanelBody(api, client, context) {
     applyEntryContext,
     refreshStatus,
     tabForTarget,
+    /**
+     * 把状态胶囊挂进宿主的标题行（`spec.headerExtra` 的回调目标）。
+     *
+     * 宿主在标题行给了一个空容器，这里把胶囊槽搬进去——**同一行**显示
+     * 「图标 + 标题 + 状态胶囊 + 关闭」，与主程序自己的弹窗观感一致。
+     * 状态刷新只清空胶囊槽，图标与标题是宿主 DOM，不受影响。
+     */
+    mountHeaderExtra(container) {
+      if (container && badgeSlot.parentNode !== container) container.append(badgeSlot);
+    },
     /** 宿主关闭 surface 时调用：只摘 DOM，视图实例留待下次 mount 复用。 */
     detach() {
       cleanupView(views[activeTab]);

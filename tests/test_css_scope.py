@@ -8,6 +8,7 @@
 `position_fixed` / `unknown_tokens` / `important` / `hardcoded_sprite`。
 """
 
+import json
 import os
 import re
 import sys
@@ -330,17 +331,21 @@ def test_css_has_no_hardcoded_host_sprite():
 
 
 def test_plugin_brand_icon_is_a_plugin_owned_asset():
-    """品牌图标走**插件自己的**资源 URL，不是宿主 sprite。
+    """品牌图标走**插件自己的**资源，且全插件**只有一个**图标（问题 4）。
 
-    两条路径的能力不同（宿主实测结论）：
-    - `/api/plugins/<id>/assets/…`：`core/plugins/assets.py` 提供，`.svg` 在
-      `ALLOWED_EXTENSIONS` 里 → 插件自带图标可用。
-    - `entries[].icon` / `api.ui.icon()`：只吃**宿主图标名**
-      （`static/js/utils/icons.js:resolveIconUrl` 对含 `.` 的值返回空串并降级为占位），
-      所以品牌图标不能走那条路。
+    用户原话：「既然是同一个插件，应该保持相同的图标更有辨识度，包括右键菜单，
+    包括批量处理，入口总览哪里直接调成相同的插件图标即可。」
 
-    本用例锁定：① 资源文件存在；② CSS 用插件资源 URL 引用它；
-    ③ 该 URL 不会被 F15 误判为硬编码宿主 sprite。
+    实现方式：`entries[].icon` 与 `surfaces.register().icon` 都写
+    `frontend/assets/icon.svg`（插件内相对路径）。宿主 `utils/icons.js:resolveIcon`
+    三态解析：含 `/` 或 `.` 的值 → `/api/plugins/<id>/assets/<path>`，
+    `uiPrimitives.js:icon()` 对资源路径渲染 `<span>` + CSS mask。
+    `core/plugins/assets.py` 的 `ALLOWED_EXTENSIONS` 含 `.svg`，该路由可用。
+
+    ⚠️ 这取代了更早的写法：当时 `resolveIconUrl` 只支持宿主图标名，插件只好在
+    自己的 CSS 里用 mask 引资源 URL 画品牌图标，而入口图标只能退而用宿主图标名
+    （`wand` / `tags` / `folder` / `settings-gear`）——同一个插件在不同落点显示
+    不同图标，辨识度差。现在两侧统一走插件资源。
     """
     icon_path = os.path.join(ROOT, 'frontend', 'assets', 'icon.svg')
     assert os.path.isfile(icon_path), '插件品牌图标 frontend/assets/icon.svg 缺失'
@@ -350,11 +355,25 @@ def test_plugin_brand_icon_is_a_plugin_owned_asset():
     assert 'currentColor' in svg, '图标必须用 currentColor 才能跟随主题前景色'
     assert '<path' in svg
 
+    # ① manifest 的每个入口都用同一个插件资源路径
+    with open(os.path.join(ROOT, 'manifest.json'), 'r', encoding='utf-8') as handle:
+        manifest = json.load(handle)
+    icons = [entry.get('icon') for entry in manifest['frontend']['entries']]
+    assert set(icons) == {'frontend/assets/icon.svg'}, (
+        f'所有入口必须用同一个插件图标（含右键/批量/总览）：{icons}'
+    )
+
+    # ② surface 注册也用同一个图标（弹层标题行）
+    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
+        plugin_source = handle.read()
+    assert "icon: 'frontend/assets/icon.svg'" in plugin_source
+
+    # ③ CSS 不再需要自己画品牌图标（图标归宿主标题行）
     source = _strip_comments(_read_css())
-    expected = f'/api/plugins/{PLUGIN_ID}/assets/frontend/assets/icon.svg'
-    assert expected in source, f'CSS 必须用插件资源 URL 引用品牌图标：{expected}'
-    # 反例：不得引用宿主 sprite
-    assert '/static/icons/' not in source
+    assert '/static/icons/' not in source, '插件 CSS 不得引用宿主 sprite'
+    assert 'plugin-stm-ai-assistant-glyph' not in source, (
+        '品牌图标已归宿主标题行（`surface.icon`），插件 CSS 不该再自绘 glyph'
+    )
 
     findings = scan_css_declarations(CSS_PATH, PLUGIN_ID)
     assert findings.get('hardcoded_sprite') is None, (
@@ -362,20 +381,50 @@ def test_plugin_brand_icon_is_a_plugin_owned_asset():
     )
 
 
-def test_brand_glyph_survives_status_refresh():
-    """回归：`refreshStatus()` 只清徽章槽，不得把品牌图标一起清掉。
+def test_status_pills_live_in_the_host_header_row():
+    """状态胶囊挂在**宿主标题行**，插件不再自绘第二条状态栏（问题 3）。
 
-    旧实现里 `statusRow` 是「清空后重填」的，若把 glyph 直接放进 statusRow，
-    每次状态刷新都会让图标闪一下 / 消失。
+    用户原话：「当前的第二行应该合并到第一行去，也就是图标应该放到左上角，
+    胶囊应该挪到顶部。」
+
+    旧实现：宿主标题行（标题 + ×）+ 插件自绘状态行（品牌图标 + 胶囊）→ 顶部两行。
+    新实现：图标归宿主标题行左侧，胶囊走 `spec.headerExtra` 注入的附加槽，
+    与标题、关闭按钮**同一行**；插件只保留页签 + 主体。
     """
     with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
         source = handle.read()
 
-    assert 'plugin-stm-ai-assistant-status-badges' in source, '必须有独立的徽章槽'
-    assert 'plugin-stm-ai-assistant-glyph' in source, '品牌图标节点必须存在'
-    # refreshStatus 清的是 badgeSlot，不是 statusRow
+    # 胶囊槽仍存在，且 `refreshStatus` 只清它
+    assert 'plugin-stm-ai-assistant-status-badges' in source, '必须有状态胶囊槽'
     assert 'clear(badgeSlot)' in source
-    assert 'clear(statusRow)' not in source, '清空 statusRow 会把品牌图标一起清掉'
+
+    # 自绘状态行已删除
+    assert 'plugin-stm-ai-assistant-status-row' not in source, (
+        '状态行已合并进宿主标题行，不该再自绘'
+    )
+    assert 'plugin-stm-ai-assistant-glyph' not in source, (
+        '品牌图标归宿主标题行（`surface.icon`），插件不该再自绘'
+    )
+
+    # 胶囊通过 mountHeaderExtra 注入宿主标题行的附加槽
+    assert 'mountHeaderExtra' in source
+    assert 'container.append(badgeSlot)' in source
+
+    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
+        plugin_source = handle.read()
+    assert 'headerExtra(container) {' in plugin_source
+    assert 'panel.mountHeaderExtra(container)' in plugin_source
+
+
+def test_panel_root_only_has_tabs_and_body():
+    """插件根节点只含「页签 + 主体」——标题行与状态胶囊都归宿主容器。"""
+    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
+        source = handle.read()
+
+    assert 'root.append(tabBar, body)' in source, (
+        '根节点只应 append 页签与主体'
+    )
+    assert 'root.append(statusRow' not in source
 
 
 def test_css_important_only_on_scoped_selectors():
@@ -442,11 +491,17 @@ def test_active_tab_matches_detail_page_contract():
     assert '999px' not in tab, '页签不得使用胶囊圆角'
 
 
-def test_status_row_is_in_flow_not_floating():
-    """状态条是容器内的普通流式区块（不再 `position: fixed` / 右对齐浮标）。"""
-    body = _rule_body(_read_css(), '.plugin-stm-ai-assistant-status-row')
-    assert 'position' not in body, '状态条不得自行定位'
-    assert 'flex' in body
+def test_panel_and_pills_are_in_flow_not_floating():
+    """面板与胶囊槽都是容器内的普通流式区块（不再 `position: fixed` / 右对齐浮标）。"""
+    source = _read_css()
+
+    panel = _rule_body(source, '.plugin-stm-ai-assistant-panel')
+    assert 'position' not in panel, '面板不得自行定位'
+    assert 'flex' in panel
+
+    pills = _rule_body(source, '.plugin-stm-ai-assistant-status-badges')
+    assert 'position' not in pills, '胶囊槽不得自行定位'
+    assert 'inline-flex' in pills
 
 
 def test_plugin_does_not_style_host_surface_dom():

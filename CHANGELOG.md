@@ -29,7 +29,6 @@
 - **入口落点收敛（P2）**：旧版 4 个入口**全部指向同一个 surface**（`workbench`），
   且「分析选中卡片」被放在 `context`（右键菜单）里——右键一个分类时作用域应该是
   那个分类，插件却只能读到全局选中集，语义错位。本次收敛为：
-
   - **删除 `open-review`**（与 `workbench` 落点重复，唯一区别只是初始页签）；
     待审批角标从 `open-review` 改挂到 `workbench`（否则 `setBadge` 查不到条目会
     静默返回 `false`，用户再也看不到待审批数）；
@@ -101,23 +100,68 @@
 
 ### 保留
 
-- **`frontend/assets/icon.svg`（插件品牌图标）**：**保留**，并接到面板状态条左侧的
-  `.plugin-stm-ai-assistant-glyph`（CSS `mask` 抠形 + `var(--accent-text)` 着色，
-  深浅主题自适应）。
+- **`frontend/assets/icon.svg`（插件品牌图标）**：**保留**，并在 P3 之后成为
+  **全部图标位的唯一来源**（见下）。
 
-  新契约下插件图标的**三条路径能力不同**（实测结论，详见设计文档附录 E.5）：
+  P2 及更早的选择是「入口用宿主图标名 + 品牌图标挂在插件自己的状态条」，
+  同一个插件在不同落点显示四个不同图标（`wand` / `folder` / `tags` /
+  `settings-gear`），看起来像四个插件。
 
-  | 路径 | 插件自带图标 |
-  |---|---|
-  | 插件资源 URL（CSS `mask` / `<img>`） | ✅ `assets.py` 路由 + `.svg` 在白名单 |
-  | `entries[].icon`（坞 / 命令面板图标槽） | ❌ 只吃宿主图标名 |
-  | `manifest.icon`（插件级图标） | ⚠️ 后端下发，前端无渲染者 |
+  P3 起：`entries[].icon` 与 `surfaces.register().icon` 全部写
+  `frontend/assets/icon.svg`，由宿主解析成
+  `/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg` 并用
+  `<span>` + CSS `mask` 渲染（跟随主题前景色）。宿主侧 `resolveIcon()` 的三态
+  返回（host / asset / missing）让这条路径成为 `Stable` 契约。
 
-  宿主对新契约下的插件品牌图标没有展示位，因此挂回插件自己的内容区。
-  入口图标仍走宿主图标名（`wand` / `tags` / `clipboard` / `settings-gear`）。
+  插件 CSS 不再需要自绘 glyph —— 图标归宿主的 surface 标题行。
 
-  状态条相应拆成「glyph + 徽章槽」两层：`refreshStatus()` 只清徽章槽，
-  否则每次刷新都会把品牌图标一起清掉。
+## P3 可用性修复（2026-10-11，用户验收反馈）
+
+用户在实际使用中报了 5 个问题，其中前两个是功能性 bug。
+
+### 修复
+
+- **找不到「固定入口」（坞不可见）**：坞的自动收起规则用了
+  `body:has(.modal-overlay)`。`:has()` 只看元素**是否存在于 DOM**，不看可见性，
+  而主程序 28 个模态框全部用 `x-show`（常驻 DOM，仅 `display: none`）——
+  该选择器**几乎永久成立**，坞被永久压成 `width: 0`。
+  现在只对**真正与坞重叠**的 surface 类型收起
+  （`body:has(.plugin-surface--panel)` / `--sheet`）：这两个类型在关闭时会把
+  shell 从 DOM 摘掉，所以「元素存在」恰好等价于「surface 打开」；
+  `modal` 居中且层级远高于坞，天然盖住它，不需要收起。
+
+- **勾选卡片后批量项仍显示「请先选中至少一张卡片」**：注册表只**监听**
+  `selection-changed`，但全仓没有任何地方派发它（`cardGrid` 直接写
+  `viewState.selectedIds`，6 个写入点）。现在宿主用 `Alpine.effect` 直接观察
+  `viewState.selectedIds`，值变化才广播 `entries:changed`。
+  （插件侧无需改动——`when` 一直由宿主求值。）
+
+- **弹层顶部有两行**：图标与状态胶囊现在都在**宿主标题行**（图标左上、
+  胶囊置顶、关闭用宿主通用关闭图标），插件内容区只剩「页签 + 主体」。
+  插件的 `headerExtra(container)` 把胶囊注入宿主的附加槽。
+
+- **切换页签时弹层大小跳动**：`workbench` 改用宿主的新尺寸档位
+  `size: 'lg'`（固定 1080×760，即旧版自绘 shell 的尺寸）。
+  宿主 modal 现在给的是确定的 `height`，不是 `max-height` + 内容自适应。
+
+- **同一个插件应使用同一个图标**：见上方「保留」段落。
+
+- **批量入口只应在角色卡视图出现**：`refreshPluginBatchEntries` 只列
+  `enabled` 的入口。`when.mode: ["cards"]` 已在 manifest 里声明，因此世界书 /
+  会话 / 预设视图下该菜单项自动消失，而不是留一条永远点不动的灰项。
+  （右键菜单相反：不适用时**可见但置灰**并给出原因。）
+
+### 变更
+
+- `frontend/panel.js`：删除自绘状态行与品牌 glyph；新增
+  `mountHeaderExtra(container)` 把胶囊槽注入宿主标题行。
+- `frontend/plugin.js`：`workbench` 的 surface 注册补 `description` /
+  `icon` / `size` / `headerExtra`。
+- `manifest.json`：四个入口的 `icon` 统一为 `frontend/assets/icon.svg`。
+- `frontend/plugin.css`：删除 `.plugin-stm-ai-assistant-status-row` 与
+  `.plugin-stm-ai-assistant-glyph*`；胶囊槽改为不换行的单行布局。
+- `tests/test_css_scope.py`：三条旧契约用例改为锁定新设计
+  （图标统一、胶囊在宿主标题行、面板根节点只含页签 + 主体）。
 
 > **关于旧版的 backdrop-filter 兜底规则**：那条规则是对旧宿主
 > `.main-container { backdrop-filter: blur(var(--bg-blur)) }` 退化成恒等滤镜的绕行

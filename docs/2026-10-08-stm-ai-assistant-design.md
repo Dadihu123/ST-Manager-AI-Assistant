@@ -76,6 +76,10 @@
 | C19 | `kind: "context"` 的落点是**右键菜单**，且作用域是**右键目标**（`when.target` + `ctx.targetIds`），不是全局选中集 | `static/js/components/contextMenu.js`（`refreshPluginEntries` / `pluginEntryContext` / `resolvePluginEntryTargetIds` / `runPluginEntry`）、`templates/components/context_menu.html` | `analyze-folder` 只在右键**分类**时可用（`when.target: "folder"`）；置灰项可见、附 `disabledHint`、点击不执行；目标 id 列表由宿主解析后经 `ctx.targetIds` 交给插件 |
 | C20 | `kind: "batch"` 的落点是**批量操作菜单**（顶部工具栏「批量操作」展开项），作用域是**全局选中集**（`when.selection` 沿用全局求值） | `templates/components/header.html`（`pluginBatchEntries`）、`static/js/components/header.js`（`refreshPluginBatchEntries` / `runPluginBatchEntry`） | `analyze-selected` 只出现在批量菜单；未选卡时可见但置灰；`ctx.targetIds` = 选中集 |
 | C21 | 同一个 surface 被多个入口复用时，宿主**不会**在第二次打开时重新 `mount`（那会丢用户已填的表单），只把新 `ctx` 交给 `onOpen` | `static/js/pluginSurfaceHost.js:openSurface` | 插件必须同时实现 `mount` 与 `onOpen` 并调用同一个 `applyEntryContext(ctx)`，否则「先右键 A 分类、再右键 B 分类」会一直显示 A 的作用域 |
+| C22 | 宿主 surface 的**标题行**承载图标（`spec.icon`）、副标题（`spec.description`）与插件注入的附加内容（`spec.headerExtra`）；关闭按钮是宿主通用关闭图标。modal 的尺寸由 `spec.size` 档位给出**固定**宽高 | `static/js/pluginSurfaceHost.js:register` / `openSurface`、`static/css/modules/plugin-surfaces.css` | 插件**不得**自绘第二条状态栏——图标与状态胶囊都在宿主标题行（图标左上、胶囊置顶、关闭用通用图标）；`size: 'lg'` = 固定 1080×760，切换页签时容器不跳动 |
+| C23 | **`when` 的求值必须随上下文实时变化**：宿主用 `Alpine.effect` 观察 `viewState.selectedIds`，值变化才广播 `entries:changed` | `static/js/entryRegistry.js:installSelectionWatcher` | 插件不要自己判断选中数（`when.selection` 由宿主求值）；也不要依赖 `selection-changed` 事件——全仓没有任何地方派发它 |
+| C24 | `batch` 入口在**不适用时不出现在菜单里**（批量菜单只列 `enabled` 项）；`context` 入口保持**可见但置灰** | `static/js/components/header.js:refreshPluginBatchEntries`、`static/js/components/contextMenu.js:refreshPluginEntries` | 本插件只处理角色卡，`when.mode: ["cards"]` 让批量项在世界书 / 会话 / 预设视图下自动消失 |
+| C25 | **同一个插件用同一个图标**：`entries[].icon` 与 `surfaces.register().icon` 都写插件自有资源路径（`frontend/assets/icon.svg`） | `static/js/utils/icons.js:resolveIcon`（三态：host / asset / missing）、`static/js/uiPrimitives.js:icon`、`core/plugins/assets.py` | 坞 / 右键菜单 / 批量菜单 / 入口总览 / 弹层标题显示同一个品牌图形；**不得**在不同落点用不同宿主图标名（那会让一个插件看起来像四个） |
 | C16 | 宿主 surface 容器已完成定位、尺寸、滚动、`data-marquee-ignore`、`role="dialog"`/`aria-modal`、焦点陷阱、ESC 关闭；插件**只能**在容器内建 DOM，**不得**设置容器或其祖先的 `position`/`z-index`/`inset`。`mount()` 返回函数时宿主在关闭时调用 | `static/js/pluginSurfaceHost.js:117-200`、`static/css/modules/plugin-surfaces.css` | `mount(container, ctx)` 只往容器里 append；返回值用于摘 DOM；不碰容器样式 |
 | C17 | 宿主 surface 容器**刻意不提供** `backdrop-filter`（Chromium backdrop root 会画出黑块/平坦灰），插件 overlay 上的 `backdrop-filter: blur(5px)` 与 `body:has(...) .main-container { backdrop-filter: none }` 兜底规则都必须删除；`api.setFullscreenScrim()` 也不再需要 | `static/js/pluginSurfaceHost.js:15-17`、`static/css/modules/plugin-surfaces.css:9-15` | 两条规则已删除；插件 CSS 里 `backdrop-filter` 出现次数为 0（`tests/test_css_scope.py` 锁定） |
 | C11 | 插件后端以 `st_plugin_stm_ai_assistant` 模块名加载，**不注入 sys.path** | `core/plugins/registry.py:262-286` | 插件内一律相对导入（`from .core.prompt import ...`）；禁止 `import backend` |
@@ -678,10 +682,23 @@ def chat(messages, *, provider: dict, api_key: str, extra_headers: dict | None =
 
 | id | kind | label | icon | surface | 条件 | 落地位置 |
 |---|---|---|---|---|---|---|
-| `workbench` | `dock` | AI 助手 | `wand` | `workbench`（**modal**） | — | 入口坞（official，默认进坞槽位）+ 命令面板；快捷键 `Ctrl+Shift+A`；承载自检状态点与**待审批角标** |
-| `analyze-folder` | `context` | 分析此分类全部卡片 | `folder` | `workbench`（modal） | `when: {mode:["cards"], target:"folder"}`，`disabledHint: 仅支持右键分类；请在角色卡视图里右键一个分类` | **右键菜单**（右键**分类**时可用）；作用域 = 该分类含子分类的全部卡片 |
-| `analyze-selected` | `batch` | AI 分析选中卡片 | `tags` | `workbench`（modal） | `requires_selection: true`，`when: {mode:["cards"], selection:"any"}`，`disabledHint: 请先在角色卡视图里选中至少一张卡片` | **批量操作菜单**（顶部工具栏「批量操作」展开项）；作用域 = 全局选中集 |
-| `assistant-settings` | `settings` | AI 助手设置 | `settings-gear` | `workbench`（modal） | — | 设置页插件区 |
+| `workbench` | `dock` | AI 助手 | 品牌图标 | `workbench`（**modal** / `lg`） | — | 入口坞（official，默认进坞槽位）+ 命令面板；快捷键 `Ctrl+Shift+A`；承载自检状态点与**待审批角标** |
+| `analyze-folder` | `context` | 分析此分类全部卡片 | 品牌图标 | `workbench`（modal / lg） | `when: {mode:["cards"], target:"folder"}`，`disabledHint: 仅支持右键分类；请在角色卡视图里右键一个分类` | **右键菜单**（右键**分类**时可用）；作用域 = 该分类含子分类的全部卡片 |
+| `analyze-selected` | `batch` | AI 分析选中卡片 | 品牌图标 | `workbench`（modal / lg） | `requires_selection: true`，`when: {mode:["cards"], selection:"any"}`，`disabledHint: 请先在角色卡视图里选中至少一张卡片` | **批量操作菜单**（顶部工具栏「批量操作」展开项）；作用域 = 全局选中集；**非角色卡视图不出现** |
+| `assistant-settings` | `settings` | AI 助手设置 | 品牌图标 | `workbench`（modal / lg） | — | 设置页插件区 |
+
+**四个入口用同一个图标**（C25，问题 4）：`entries[].icon` 与
+`surfaces.register().icon` 都写 `frontend/assets/icon.svg`（插件内相对路径）。
+宿主 `utils/icons.js:resolveIcon()` 对含 `/` 的值解析成
+`/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg`，
+`uiPrimitives.js:icon()` 渲染 `<span>` + CSS `mask`。
+
+> 用户原话：「既然是同一个插件，应该保持相同的图标更有辨识度，包括右键菜单，
+> 包括批量处理，入口总览哪里直接调成相同的插件图标即可。」
+>
+> 这取代了更早的写法：当时前端 `resolveIconUrl` 只支持宿主图标名，插件只好
+> 在不同落点用不同的宿主图标名（`wand` / `tab` / `folder` / `settings-gear`），
+> 同一个插件看起来像四个插件。宿主侧已补齐资源路径支持，现在两侧统一。
 
 **入口收敛的动机**（P1 阶段 2 修订）：旧版 4 个入口**全部指向同一个 surface**
 （`workbench`），且 `analyze-selected` 是 `context`（右键菜单）——结果有两处错位：
@@ -742,10 +759,10 @@ official 允许全部 7 类 kind，但本插件**刻意只用 community 也允�
 `api.surfaces.register(surfaceId, spec)`；容器由宿主提供（C16），`surface.id` 与
 manifest 字面一致（C15）。
 
-| surface.id | type | 用途 | `mount` 行为 |
-|---|---|---|---|
-| `workbench` | **`modal`** | 主面板（四个页签） | 把「状态条 + 页签栏 + 主体」append 进宿主容器；返回摘 DOM 的函数 |
-| `prompt-preview` | `modal` | Prompt 全文预览（原本塞在页签里造成长滚动） | 由 `panel.js:createPromptPreview` 渲染消息块 |
+| surface.id | type | size | icon | 用途 | `mount` 行为 |
+|---|---|---|---|---|---|
+| `workbench` | **`modal`** | **`lg`** | `frontend/assets/icon.svg` | 主面板（四个页签） | 把「页签栏 + 主体」append 进宿主容器；返回摘 DOM 的函数 |
+| `prompt-preview` | `modal` | `md` | — | Prompt 全文预览（原本塞在页签里造成长滚动） | 由 `panel.js:createPromptPreview` 渲染消息块 |
 
 **`workbench` 从 `panel` 改为 `modal`**：这是主工作台，承载批量分析表单与审批列表，
 需要宿主提供遮罩 + 焦点陷阱；旧 `panel`（右侧抽屉，宽度 `min(420px, 92vw)`）会把
@@ -753,19 +770,31 @@ manifest 字面一致（C15）。
 否则宿主按 manifest 建容器、插件按自己的理解排版。回归见
 `tests/test_manifest_contract.py::test_workbench_surface_is_a_modal`。
 
+**`size: 'lg'` = 固定 1080×760**（旧版自绘 shell 的 `min(1080px, 94vw) × min(760px, 90vh)`）。
+宿主 modal 的尺寸档位给的是**确定的 `height`**，不是 `max-height` + 内容自适应——
+后者会让弹层高度随内容长度变化，切换页签时看起来像「窗口在自己缩放」（用户实测反馈）。
+固定档位让容器在打开期间恒定，切换页签只换内部内容。
+
+**标题行设计元素**（与主程序自己的弹窗对齐，见 C22）：
+
+- 图标在**左上角**，开放字形、无边框无底色（对应主程序 `.ui-modal-header-icon`）；
+- 副标题（`description`）在标题上方，小号大写弱色（对应 `.ui-modal-eyebrow`）；
+- 状态胶囊通过 `headerExtra(container)` 注入宿主标题行的附加槽，与图标、标题、
+  关闭按钮**同一行**；
+- 关闭按钮用**宿主通用关闭图标**（`icon('close')`），不是文字「×」。
+
 **宿主负责、插件不重复实现**（C16 / C17）：定位、尺寸、滚动、`data-marquee-ignore`、
 `role="dialog"` / `aria-modal`、焦点陷阱、ESC 关闭、遮罩合成、`z-index`。
 插件**不创建** overlay / shell / 顶栏 / 关闭按钮（标题与关闭钮是宿主 DOM，
 `.plugin-surface__title` / `.plugin-surface__close`，插件 CSS 选不中也**不该**去选，硬约束坑 5）。
 
 ```
-宿主容器 .plugin-surface--modal（居中弹层 + 遮罩）
-┌─ AI 助手                              [×]  ← 宿主渲染的标题栏
-├───────────────────────────────────────────────────────┤
-│ 档案 5  Provider 2  写回 逐条审批  待审批 3            │ ← 插件：状态条（常驻）
-├───────────────────────────────────────────────────────┤
-│ [工作台] [结果与审批] [提示词档案] [设置]               │ ← 插件：页签
-├───────────────────────────────────────────────────────┤
+宿主容器 .plugin-surface--modal[data-surface-size="lg"]（居中弹层 + 遮罩，固定 1080×760）
+┌─ [icon] 角色卡分析工作台         档案5 Provider2 写回… 待审批3  [×]  ← 全在宿主标题行
+│         AI 助手                                                      （图标+副标题+标题+
+├────────────────────────────────────────────────────────────────────── 胶囊+关闭 同一行）
+│ [工作台] [结果与审批] [提示词档案] [设置]               │ ← 插件：页签（常驻顶部）
+├──────────────────────────────────────────────────────────────────────
 │ 工作台                                                 │
 │  1 · 选择卡片                                          │
 │   已选 12 张 · 卡片A、卡片B、卡片C …                    │
@@ -782,6 +811,10 @@ manifest 字面一致（C15）。
 └───────────────────────────────────────────────────────┘
 ```
 
+> **为什么状态胶囊要挪进标题行**（C22）：旧版宿主标题行只有「标题 + ×」，插件只好
+> 在自己内容区**再画一条**状态栏放品牌图标与胶囊 → 弹层顶部出现两行，比主程序
+> 自己的弹窗「多一层」，观感上不像同一套设计（用户实测反馈）。
+> 现在图标归宿主标题行左侧、胶囊走 `headerExtra` 附加槽，插件内容区只剩页签 + 主体。
 **文件分工**：
 
 | 文件 | 职责 |
@@ -1145,12 +1178,17 @@ python -m pytest tests/ -q                                     → 334 passed
 | **`entries[].icon`**（坞 / 命令面板的图标槽） | ✅ **支持**（宿主侧已补齐） | 设计文档 2.2 原本就承诺「宿主图标名**或**插件内资源路径（含 `/`）」，但前端 `resolveIconUrl` 早期只实现了前者（对含 `.` 的值返回空串 → 静默降级占位）。现已补齐：`utils/icons.js:resolveIcon()` 三态返回（host / asset / missing），`uiPrimitives.js:icon()` 对资源路径渲染 `<span>` + CSS `mask`，坞 / 命令面板 / 入口总览都传 `pluginId` |
 | **`manifest.icon`**（插件级图标） | ⚠️ 后端下发了，**全仓无渲染者** | `core/plugins/registry.py:84` 把 `manifest.icon` 放进 header，但 `static/`、`templates/` 里没有任何消费者读取它 |
 
-**本插件的选择**：品牌图标（`frontend/assets/icon.svg`，VTracer 生成的图形，
-`fill: currentColor`）挂在面板状态条左侧的 `.plugin-stm-ai-assistant-glyph`，
-用 CSS `mask` 抠形、颜色取 `var(--accent-text)`，深浅主题自适应。
-入口图标（坞 / 命令面板）用宿主图标名（`wand` / `tags` / `clipboard` / `settings-gear`）
-——宿主图标名随主题与禁用态自动变色，且不需要额外资源请求。
-两种写法现在都受支持，选择哪个是视觉/维护权衡，不是能力限制。
+**本插件的选择**（P3 修订，见 C25）：品牌图标（`frontend/assets/icon.svg`，
+VTracer 生成的图形，`fill: currentColor`）**统一用于全部图标位**——
+`entries[].icon`（坞 / 右键菜单 / 批量菜单 / 入口总览）、`surfaces.register().icon`
+（弹层标题行）。全部走插件资源路径，由宿主渲染成 `<span>` + CSS `mask`。
+
+> 用户原话：「既然是同一个插件，应该保持相同的图标更有辨识度。」
+>
+> P2 及更早的选择是「入口用宿主图标名（`wand` / `tags` / `folder` /
+> `settings-gear`）+ 品牌图标挂在插件自己的状态条」——同一个插件在不同落点
+> 显示四个不同图标，看起来像四个插件；品牌图标还只能在插件内容区里自绘。
+> 现在两侧统一走插件资源路径，且品牌图标归宿主标题行（C22）。
 
 **两个易踩的坑**：
 
@@ -1158,11 +1196,11 @@ python -m pytest tests/ -q                                     → 334 passed
    所以宿主渲染侧（坞 / 命令面板 / 入口总览）必须把 `entry.pluginId` 传下去；
    拿不到 id 时按 `missing` 处理（占位图标），**不会**猜一个 URL。
    这是宿主侧实现细节，插件作者无需关心——插件只写相对插件根目录的路径即可。
-2. **glyph 不能与徽章同层**。`refreshStatus()` 是「清空后重填」的，若把品牌图标
-   放进同一个容器，每次状态刷新都会让图标消失。因此状态条拆成
-   `.plugin-stm-ai-assistant-glyph` + `.plugin-stm-ai-assistant-status-badges` 两层，
-   `refreshStatus()` 只清后者。回归用例：
-   `tests/test_css_scope.py::test_brand_glyph_survives_status_refresh`。
+2. **状态胶囊不能与宿主的标题元素同层重建**。`refreshStatus()` 是「清空后重填」的，
+   所以胶囊槽（`.plugin-stm-ai-assistant-status-badges`）是插件自己的节点、
+   由 `headerExtra` 注入宿主标题行；宿主标题（图标 + 标题 + 关闭按钮）是宿主 DOM，
+   插件刷新状态时**不碰**它们。回归用例：
+   `tests/test_css_scope.py::test_status_pills_live_in_the_host_header_row`。
 
 **为什么品牌图标用 `<span>` + mask，而不是 `<use>` 或 `<img>`**：
 
@@ -1296,5 +1334,143 @@ mask 只取 alpha 形状、颜色由 `background-color: currentColor` 决定，�
    不是 priority 序。目前每个 surface 只有一个入口声明了 `shortcut`，
    所以实际无差异；若将来同一 surface 的多个入口都声明快捷键，需要显式
    定义优先级（建议改为按 `priority`）。
+
+---
+
+## 附录 G · P3 可用性修复（2026-10-11，用户验收反馈）
+
+用户在实际使用中报了 5 个问题。前两个是**功能性 bug**（入口完全找不到、
+批量项永远置灰），后三个是**观感与一致性**问题。
+
+### G.1 问题 1：找不到「固定入口」
+
+**症状**：右键菜单与批量菜单的入口都能找到，但**坞里的固定入口完全不可见**。
+
+**根因**（`static/css/modules/entry-dock.css`）：坞用纯 CSS 在弹窗打开时自动收起：
+
+```css
+body:has(.modal-overlay) .entry-rail .entry-rail__panel { width: 0; }
+```
+
+`:has()` 只看元素**是否存在于 DOM**，不看可见性。而主程序 **28 个模态框全部用
+`x-show`**（常驻 DOM，仅 `display: none`）——该选择器**几乎永久成立**，
+坞被永久压成 `width: 0`（配合折叠态原本也是 `width: 0`，坞在视觉上彻底消失）。
+
+**修法**：只对**真正与坞重叠**的 surface 类型收起：
+
+```css
+body:has(.plugin-surface--panel) .entry-rail .entry-rail__panel,
+body:has(.plugin-surface--sheet) .entry-rail .entry-rail__panel { width: 0; }
+```
+
+`panel` / `sheet` 贴着屏幕右侧/底部，与坞抢空间；这两个类型没有 `:has()` 陷阱——
+surface 宿主在关闭时会把整个 shell 从 DOM 摘掉，所以「元素存在」恰好等价于
+「surface 打开」。`modal` 居中且 `z-index`（3400）远高于坞（80），天然盖住坞，
+不需要也不该收起。
+
+回归用例：`tests/test_plugin_entry_dock_contracts.py::test_dock_collapses_only_for_surfaces_that_actually_overlap_it`。
+
+### G.2 问题 2：勾选卡片后批量项仍显示「请先选中至少一张卡片」
+
+**根因**（`static/js/entryRegistry.js`）：注册表只**监听** `selection-changed` /
+`mode-changed`，但**全仓没有任何地方 `dispatchEvent` 它们**——`cardGrid` 直接写
+`viewState.selectedIds`（6 个写入点），不发事件。于是 `when` 的求值结果永远停在
+首次快照。
+
+**修法**：在注册表侧用 `Alpine.effect` 直接观察 `viewState.selectedIds`，
+值变化才广播 `entries:changed`。不逐个给写入点补 `dispatchEvent`——那样迟早漏一个。
+
+**时机陷阱**：`alpine:init` 派发时 `window.Alpine` **还没挂上**（实测：bundle 里
+该事件在 1385 字节处派发，`window.Alpine=` 在 43389 字节处）。因此 `init()` 里
+同步取会拿到 `undefined`，必须留 `alpine:initialized` 重试路径（安装幂等）。
+
+回归用例：
+`tests/test_plugin_entry_registry_frontend_contracts.py::test_selection_change_reevaluates_when`
+与 `::test_selection_watcher_broadcasts_entries_changed`。
+
+### G.3 问题 3：弹层观感与尺寸
+
+用户原话：
+> 「当前的第二行应该合并到第一行去，也就是图标应该放到左上角，胶囊应该挪到顶部，
+> 关闭使用通用关闭图标，这样设计元素与主程序保持相同，还有在切换不同导航时，
+> 目前的模态框大小会不断发生变化，这样也不太好。」
+
+三项修复（宿主 surface 契约扩展，见 C22）：
+
+| 子问题 | 修法 |
+|---|---|
+| 顶部有两行 | 新增 `spec.icon` / `spec.description` / `spec.headerExtra`：图标与副标题归宿主标题行，状态胶囊由 `headerExtra` 注入**同一行**；插件不再自绘状态条 |
+| 关闭按钮不像主程序 | 宿主改用 `icon('close')` 通用关闭图标，不再是文字「×」 |
+| 切换页签时弹层大小跳动 | 新增 `spec.size` 档位（`sm`/`md`/`lg`/`xl`），给 modal **确定的 `height`**；本插件用 `lg` = 固定 1080×760（旧版自绘 shell 的尺寸） |
+
+回归用例：`tests/test_plugin_surface_contracts.py::test_surface_header_renders_icon_title_and_generic_close`
+与 `::test_modal_size_tier_is_fixed_and_reflected_on_the_shell`、`::test_modal_css_uses_fixed_height_not_content_sized`。
+
+### G.4 问题 4：同一个插件应使用同一个图标
+
+用户原话：
+> 「既然是同一个插件，应该保持相同的图标更有辨识度，包括右键菜单，包括批量处理，
+> 入口总览哪里直接调成相同的插件图标即可。」
+
+**修法**：`entries[].icon` 与 `surfaces.register().icon` 全部写
+`frontend/assets/icon.svg`（插件内相对路径），由宿主解析成
+`/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg` 并用
+`<span>` + CSS `mask` 渲染（见 C25 / E.5）。
+
+这取代了 P2 的写法（`wand` / `folder` / `tags` / `settings-gear` 四个不同的宿主
+图标名 + 品牌图标只能在插件内容区自绘）。宿主侧 `resolveIcon()` 已支持资源路径，
+是 `Stable` 契约。
+
+### G.5 问题 5：批量入口只应在角色卡视图注册
+
+用户原话：
+> 「目前 AI 助手对于批量处理只涉及角色卡视图，因此在世界书等其他视图，
+> 这个批量处理菜单就不应该注册了。」
+
+**修法**：`header.js:refreshPluginBatchEntries` 只列 `enabled` 的入口：
+
+```js
+this.pluginBatchEntries = EntryRegistry.list({ kind: "batch" })
+  .filter((entry) => entry.enabled);
+```
+
+`when.mode: ["cards"]` 已在 manifest 里声明，因此世界书 / 会话 / 预设视图下
+该入口自动从菜单消失。
+
+> **与右键菜单的区别**：右键菜单里 `when` 不满足要**可见但置灰**（D7），因为用户
+> 是在「对某个目标操作」的语境下期待看到它；批量菜单是**动作清单**，不适用就该
+> 收起，而不是留一条永远点不动的灰项。
+
+回归用例：`tests/test_plugin_context_and_shortcuts.py::test_batch_entries_are_hidden_when_not_applicable`。
+
+### G.6 验收结果
+
+```
+插件仓库  python -m pytest tests/ -q     → 349 passed（基线 341）
+主程序    python -m pytest tests/ -q     → 3102 passed（基线 3066）
+插件仓库  git diff -- backend/           → 空
+```
+
+**测试有效性**：17 条回退逐条验证，每条都导致对应测试失败（覆盖上述 5 个问题的
+全部修复点，含 `:has()` 选择器、响应式 effect 安装 / 变化检测 / 重试路径、
+尺寸档位、标题行三要素、图标统一、批量项过滤）。
+
+### G.7 尚未验证 / 存疑
+
+1. **端到端手工验收仍未执行**（与附录 E 第 4 条、F.6 第 1 条同一遗留）。以下只能
+   在真实浏览器里确认：
+   - 坞在弹窗打开 / 关闭时的收起与恢复（`:has()` 选择器行为）；
+   - 勾选卡片后批量菜单项即时可用（响应式 effect 的真实触发时机）；
+   - 弹层切换页签时高度确实不动；
+   - 四个落点的图标是否都渲染出品牌图形（而非占位）。
+2. **`Alpine.effect` 的可用性依赖 Alpine 版本**：当前 `static/lib/alpine.js` 是
+   3.13.3，`Alpine.effect` 存在于公开 API。若将来升级 Alpine 且移除该成员，
+   `installSelectionWatcher()` 会返回 false 并回退到「只在 `alpine:initialized`
+   重试」——即不再实时重算，但不会崩。建议在升级 Alpine 时回归本用例。
+3. **`when.selection` 的置灰状态在**非**卡片视图下仍会重算**：例如切到世界书视图后
+   选中集被清空，`batch` 项会消失（这是期望行为），但 `context` 项会显示「请先
+   选中卡片」的置灰提示，而实际原因是视图不对。`when.mode` 与 `when.selection`
+   同时不满足时只显示第一个 reason 的文案——可接受，但文案可以更精确。
+
 
 

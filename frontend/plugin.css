@@ -14,14 +14,15 @@
  */
 
 /* ------------------------------------------------------------ 面板内容
- * 宿主的 `.plugin-surface--panel` 已经是「右侧抽屉」：标题（`plugin-surface__title`）
- * 与关闭按钮（`plugin-surface__close`）都由宿主渲染，插件**不重复画**。
- * 插件只在容器内填三段：状态条 + 横向页签 + 可滚动主体。
+ * 宿主的标题行（图标 + 标题 + 状态胶囊 + 关闭按钮）由宿主渲染，插件不重复画。
+ * 插件只在容器内填两段：横向页签 + 可滚动主体。
  *
  * 布局：宿主的 `.plugin-surface__body` 自己有 `overflow: auto` + `padding: 1rem`。
  * 若直接用那个滚动条，页签会随内容滚走。因此插件根节点撑满容器并自建**内部**
- * 滚动区（`flex` 列 + 主体 `overflow-y: auto`），使「状态条 + 页签」常驻顶部——
- * 这与旧版 shell 的观感一致，但定位与层级仍全部归宿主。
+ * 滚动区（`flex` 列 + 主体 `overflow-y: auto`），使页签常驻顶部。
+ *
+ * 弹层尺寸由宿主的 `size` 档位决定（本插件用 `lg` = 1080×760 固定尺寸），
+ * 插件不再自己算宽高——切换页签时容器不跳动。
  */
 
 .plugin-stm-ai-assistant-panel {
@@ -32,51 +33,15 @@
   min-width: 0;
 }
 
-.plugin-stm-ai-assistant-status-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  flex: 0 0 auto;
-  padding-bottom: 0.6rem;
-  border-bottom: 1px solid var(--border-divider);
-}
-
-/* 徽章槽：refreshStatus 只清这一层，品牌图标留在外面不被清掉。 */
+/* 状态胶囊槽：挂在**宿主标题行**的 `.plugin-surface__header-extra` 里，
+ * 与图标、标题、关闭按钮同一行（不再自绘第二条状态栏）。 */
 .plugin-stm-ai-assistant-status-badges {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   min-width: 0;
-}
-
-/* 品牌图标：用 CSS mask 抠形，颜色跟随主题前景色，深浅主题自适应。
- *
- * 这里引用的是**插件自己的**资源（`/api/plugins/<id>/assets/…`），不是宿主 sprite，
- * 因此符合 F15「不得硬编码宿主 sprite 路径」；`core/plugins/assets.py` 的
- * `ALLOWED_EXTENSIONS` 含 `.svg`，该路由可用。
- *
- * 为什么不用 `api.ui.icon()`：那个原语只解析**宿主图标名**
- * （`utils/icons.js:resolveIconUrl` 对含 `.` 的值返回空串 → 降级为占位图标），
- * 而坞的图标槽也只吃宿主图标名。品牌图标因此挂在插件自己的内容区，
- * 与宿主图标名体系互不干扰。 */
-.plugin-stm-ai-assistant-glyph {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
-}
-
-.plugin-stm-ai-assistant-glyph::before {
-  content: '';
-  width: 20px;
-  height: 20px;
-  background-color: var(--accent-text, var(--content-primary));
-  -webkit-mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
-  mask: url('/api/plugins/stm-ai-assistant/assets/frontend/assets/icon.svg') center / contain no-repeat;
+  overflow: hidden;
 }
 
 /* ------------------------------------------------------------ 页签导航
