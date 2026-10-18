@@ -24,6 +24,12 @@ PROVIDER = {
 
 MESSAGES = [{'role': 'user', 'content': '你好'}]
 
+#: 带 system 的消息组——用来验证 Anthropic 会把 system 抽到顶层
+MESSAGES_WITH_SYSTEM = [
+    {'role': 'system', 'content': '你是助手'},
+    {'role': 'user', 'content': '你好'},
+]
+
 
 class FakeResponse:
     def __init__(self, status_code=200, payload=None, text='', lines=None):
@@ -87,7 +93,91 @@ def run(transport, **overrides):
         'sleep': sleep,
     }
     kwargs.update(overrides)
-    return llm.chat(MESSAGES, **kwargs), delays
+    messages = kwargs.pop('messages', MESSAGES)
+    return llm.chat(messages, **kwargs), delays
+
+
+# ------------------------------------------------------------------ 协议分派
+
+
+def test_chat_uses_chat_completions_by_default():
+    transport = FakeTransport([FakeResponse(payload=ok_payload())])
+    run(transport)
+
+    call = transport.calls[0]
+    assert call['url'] == 'https://api.example.com/v1/chat/completions'
+    assert call['kwargs']['headers']['Authorization'] == 'Bearer sk-test'
+    assert 'messages' in call['kwargs']['json']
+
+
+def test_chat_dispatches_to_responses_endpoint():
+    provider = dict(PROVIDER, api_style='openai_responses')
+    transport = FakeTransport([FakeResponse(payload={
+        'output_text': '{"summary": "S", "tags": []}',
+        'usage': {'input_tokens': 11, 'output_tokens': 4},
+    })])
+    result, _delays = run(transport, provider=provider)
+
+    assert transport.calls[0]['url'] == 'https://api.example.com/v1/responses'
+    body = transport.calls[0]['kwargs']['json']
+    assert 'input' in body and 'messages' not in body
+    assert body['max_output_tokens']
+    assert result['content'].startswith('{')
+    assert result['usage'] == {'prompt_tokens': 11, 'completion_tokens': 4}
+    assert result['protocol'] == 'openai_responses'
+
+
+def test_chat_dispatches_to_anthropic_endpoint_and_headers():
+    provider = dict(
+        PROVIDER, base_url='https://api.anthropic.com', api_style='anthropic_messages',
+    )
+    transport = FakeTransport([FakeResponse(payload={
+        'content': [{'type': 'text', 'text': '{"summary": "S", "tags": []}'}],
+        'usage': {'input_tokens': 21, 'output_tokens': 7},
+    })])
+    result, _delays = run(transport, provider=provider, messages=MESSAGES_WITH_SYSTEM)
+
+    assert transport.calls[0]['url'] == 'https://api.anthropic.com/v1/messages'
+
+    headers = transport.calls[0]['kwargs']['headers']
+    assert headers['x-api-key'] == 'sk-test'
+    assert headers['anthropic-version']
+    assert 'Authorization' not in headers, 'Anthropic 不认 Bearer'
+
+    body = transport.calls[0]['kwargs']['json']
+    assert body['system'] == '你是助手', 'system 必须抽到顶层'
+    assert all(item['role'] != 'system' for item in body['messages'])
+    assert body['max_tokens']
+    assert result['usage'] == {'prompt_tokens': 21, 'completion_tokens': 7}
+    assert result['protocol'] == 'anthropic_messages'
+
+
+def test_chat_streams_anthropic_events():
+    provider = dict(
+        PROVIDER, base_url='https://api.anthropic.com',
+        api_style='anthropic_messages', use_stream=True,
+    )
+    lines = [
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}',
+        'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}',
+        'data: {"type":"message_delta","usage":{"output_tokens":3},'
+        '"delta":{"stop_reason":"end_turn"}}',
+    ]
+    transport = FakeTransport([FakeResponse(lines=lines)])
+    result, _delays = run(transport, provider=provider)
+
+    assert result['content'] == 'ok'
+    assert result['usage'] == {'prompt_tokens': 9, 'completion_tokens': 3}
+    assert transport.calls[0]['kwargs']['json']['stream'] is True
+
+
+def test_unknown_api_style_falls_back_to_chat_completions():
+    provider = dict(PROVIDER, api_style='something_else')
+    transport = FakeTransport([FakeResponse(payload=ok_payload())])
+    result, _delays = run(transport, provider=provider)
+
+    assert transport.calls[0]['url'].endswith('/chat/completions')
+    assert result['protocol'] == 'openai_chat'
 
 
 # ------------------------------------------------------------------ 出站约束

@@ -16,6 +16,7 @@ import re
 import time
 from urllib.parse import urlparse
 
+from . import protocols
 from .core import tokens
 from .core.errors import (
     CODE_INVALID_PAYLOAD,
@@ -82,14 +83,9 @@ def validate_base_url(base_url, *, allow_local: bool = False) -> str:
     return ''
 
 
-def endpoint_for(base_url: str) -> str:
-    """拼出 chat completions 端点（允许用户直接填完整端点）。"""
-    text = str(base_url or '').strip().rstrip('/')
-    if not text:
-        return ''
-    if text.endswith('/chat/completions'):
-        return text
-    return f'{text}/chat/completions'
+def endpoint_for(base_url: str, protocol: str = protocols.DEFAULT_PROTOCOL) -> str:
+    """拼出目标协议的请求端点（协议感知，委托 `protocols.endpoint_for`）。"""
+    return protocols.endpoint_for(base_url, protocol)
 
 
 # ------------------------------------------------------------------ 内部工具
@@ -144,29 +140,8 @@ def _classify_status(status: int, response) -> AiAssistantError:
     )
 
 
-def _build_payload(messages, *, model: str, temperature, top_p, max_tokens, stop,
-                   extra_body, stream: bool) -> dict:
-    payload = {'model': model, 'messages': list(messages or [])}
-
-    if temperature is not None:
-        payload['temperature'] = float(temperature)
-    if top_p is not None:
-        payload['top_p'] = float(top_p)
-    if max_tokens:
-        payload['max_tokens'] = int(max_tokens)
-    if stop:
-        payload['stop'] = [str(item) for item in stop][:MAX_STOP_SEQUENCES]
-    if stream:
-        payload['stream'] = True
-        payload['stream_options'] = {'include_usage': True}
-    if isinstance(extra_body, dict):
-        payload.update(extra_body)
-
-    return payload
-
-
-def _parse_success(response) -> tuple:
-    """解析成功响应，返回 `(content, usage_raw)`。"""
+def _parse_success(response, protocol: str = protocols.DEFAULT_PROTOCOL) -> tuple:
+    """解析成功响应，返回 `(content, usage_raw)`（协议差异委托 protocols 层）。"""
     payload = None
     try:
         payload = response.json()
@@ -186,36 +161,24 @@ def _parse_success(response) -> tuple:
             detail={'excerpt': _excerpt(json.dumps(payload, ensure_ascii=False))},
         )
 
-    choices = payload.get('choices')
-    if not isinstance(choices, list) or not choices:
+    try:
+        return protocols.parse_response(protocol, payload)
+    except ValueError as exc:
         raise AiAssistantError(
-            CODE_LLM_BAD_RESPONSE, '响应缺少 choices', http_status=502,
+            CODE_LLM_BAD_RESPONSE, str(exc), http_status=502,
             detail={'excerpt': _excerpt(json.dumps(payload, ensure_ascii=False))},
-        )
-
-    first = choices[0] if isinstance(choices[0], dict) else {}
-    message = first.get('message') if isinstance(first.get('message'), dict) else {}
-    content = message.get('content')
-    if content is None:
-        content = first.get('text')
-    if content is None:
-        raise AiAssistantError(CODE_LLM_BAD_RESPONSE, '响应缺少 message.content', http_status=502)
-
-    usage_raw = payload.get('usage') if isinstance(payload.get('usage'), dict) else {}
-    return str(content), usage_raw
+        ) from exc
 
 
 def _normalize_usage(usage_raw, messages, content) -> tuple:
-    """返回 `(usage, estimated)`；供应商未返回用量时按公式估算。"""
-    prompt_tokens = int(
-        usage_raw.get('prompt_tokens') or usage_raw.get('input_tokens') or 0
-    )
-    completion_tokens = int(
-        usage_raw.get('completion_tokens') or usage_raw.get('output_tokens') or 0
-    )
+    """返回 `(usage, estimated)`；供应商未返回用量时按公式估算。
 
-    if prompt_tokens or completion_tokens:
-        return {'prompt_tokens': prompt_tokens, 'completion_tokens': completion_tokens}, False
+    usage 字段名差异（`prompt_tokens` vs `input_tokens` vs `total_input_tokens`）
+    由 `protocols.normalize_usage` 统一处理。
+    """
+    usage = protocols.normalize_usage(usage_raw)
+    if usage['prompt_tokens'] or usage['completion_tokens']:
+        return usage, False
 
     return {
         'prompt_tokens': tokens.estimate_messages(messages)['total'],
@@ -246,6 +209,7 @@ def chat(messages, *, provider, api_key, extra_headers=None, model: str = '',
     spec = provider if isinstance(provider, dict) else {}
     base_url = str(spec.get('base_url') or '')
     allow_local = bool(spec.get('allow_local'))
+    protocol = protocols.normalize_protocol(spec.get('api_style'))
 
     blocked = validate_base_url(base_url, allow_local=allow_local)
     if blocked:
@@ -260,17 +224,14 @@ def chat(messages, *, provider, api_key, extra_headers=None, model: str = '',
         raise AiAssistantError(CODE_INVALID_PAYLOAD, '缺少模型名（provider 与请求都未指定）')
 
     use_stream = bool(spec.get('use_stream'))
-    payload = _build_payload(
-        messages, model=target_model, temperature=temperature, top_p=top_p,
+    payload = protocols.build_payload(
+        protocol, messages, model=target_model, temperature=temperature, top_p=top_p,
         max_tokens=max_tokens, stop=stop, extra_body=extra_body, stream=use_stream,
     )
 
-    headers = {'Authorization': f'Bearer {secret}', 'Content-Type': 'application/json'}
-    if isinstance(extra_headers, dict):
-        for key, value in extra_headers.items():
-            headers[str(key)] = str(value)
+    headers = protocols.build_headers(protocol, secret, extra_headers)
 
-    url = endpoint_for(base_url)
+    url = protocols.endpoint_for(base_url, protocol)
     max_retries = max(0, int(spec.get('max_retries') or 0))
     timeout = (
         max(1, int(spec.get('connect_timeout') or 10)),
@@ -291,7 +252,7 @@ def chat(messages, *, provider, api_key, extra_headers=None, model: str = '',
                 return _chat_stream(
                     post, url, headers=headers, payload=payload, timeout=timeout,
                     messages=messages, model=target_model, cancel_check=cancel_check,
-                    started=started, attempt=attempt,
+                    started=started, attempt=attempt, protocol=protocol,
                 )
 
             response = post(url, headers=headers, json=payload, timeout=timeout)
@@ -300,13 +261,14 @@ def chat(messages, *, provider, api_key, extra_headers=None, model: str = '',
             if status >= 400:
                 raise _classify_status(status, response)
 
-            content, usage_raw = _parse_success(response)
+            content, usage_raw = _parse_success(response, protocol)
             usage, estimated = _normalize_usage(usage_raw, messages, content)
             return {
                 'content': content,
                 'usage': usage,
                 'usage_estimated': estimated,
                 'model': target_model,
+                'protocol': protocol,
                 'latency_ms': int((time.monotonic() - started) * 1000),
                 'attempts': attempt + 1,
             }
@@ -333,15 +295,18 @@ def chat(messages, *, provider, api_key, extra_headers=None, model: str = '',
 
 
 def _chat_stream(post, url, *, headers, payload, timeout, messages, model,
-                 cancel_check, started, attempt) -> dict:
-    """流式调用：逐块累积内容，并在每个数据块之间检查取消。"""
+                 cancel_check, started, attempt, protocol) -> dict:
+    """流式调用：逐块累积内容，并在每个数据块之间检查取消。
+
+    协议差异（Chat SSE / Anthropic `content_block_delta` / Responses
+    `response.output_text.delta`）全部由 `protocols.StreamAccumulator` 吸收。
+    """
     response = post(url, headers=headers, json=payload, timeout=timeout, stream=True)
     status = int(getattr(response, 'status_code', 0) or 0)
     if status >= 400:
         raise _classify_status(status, response)
 
-    chunks = []
-    usage_raw = {}
+    accumulator = protocols.StreamAccumulator(protocol)
 
     for raw_line in response.iter_lines(decode_unicode=True):
         if cancel_check is not None and cancel_check():
@@ -351,40 +316,31 @@ def _chat_stream(post, url, *, headers, payload, timeout, messages, model,
                 pass
             raise CancelledError('已取消')
 
-        line = raw_line.decode('utf-8', errors='ignore') if isinstance(raw_line, bytes) else raw_line
-        line = str(line or '').strip()
-        if not line or not line.startswith('data:'):
-            continue
+        accumulator.feed(raw_line)
 
-        data = line[len('data:'):].strip()
-        if data == '[DONE]':
+        if accumulator.error:
+            if accumulator.content.strip():
+                # 已拿到部分正文：当作成功（与 Chat SSE 的截断行为一致）
+                logger.warning('流式响应中途报错，已保留 %s 字正文', len(accumulator.content))
+                break
+            raise AiAssistantError(
+                CODE_LLM_BAD_RESPONSE, f'流式响应报错: {accumulator.error}', http_status=502,
+            )
+
+        if accumulator.done:
             break
 
-        try:
-            chunk = json.loads(data)
-        except (TypeError, ValueError):
-            continue
-
-        if isinstance(chunk.get('usage'), dict):
-            usage_raw = chunk['usage']
-
-        choices = chunk.get('choices')
-        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-            delta = choices[0].get('delta') if isinstance(choices[0].get('delta'), dict) else {}
-            text = delta.get('content')
-            if text:
-                chunks.append(str(text))
-
-    content = ''.join(chunks)
+    content = accumulator.content
     if not content.strip():
         raise AiAssistantError(CODE_LLM_BAD_RESPONSE, '流式响应为空', http_status=502)
 
-    usage, estimated = _normalize_usage(usage_raw, messages, content)
+    usage, estimated = _normalize_usage(accumulator.usage_raw, messages, content)
     return {
         'content': content,
         'usage': usage,
         'usage_estimated': estimated,
         'model': model,
+        'protocol': protocol,
         'latency_ms': int((time.monotonic() - started) * 1000),
         'attempts': attempt + 1,
     }
@@ -408,6 +364,76 @@ def probe(provider, api_key, *, model: str = '', transport=None, sleep=None) -> 
         'ok': True,
         'latency_ms': int((time.monotonic() - started) * 1000),
         'model': result['model'],
+        'protocol': result.get('protocol', protocols.DEFAULT_PROTOCOL),
         'preview': str(result['content'])[:80],
         'usage': result['usage'],
     }
+
+
+def list_models(provider, api_key, *, extra_headers=None, transport=None) -> dict:
+    """拉取供应商的模型列表（`GET /models`）。
+
+    很多第三方网关**不实现** `/models`，因此本函数**永不抛异常**：
+    失败时返回 `{'ok': False, 'models': [], 'message': ...}`，
+    由 UI 退回手填模型名。这一点很重要 —— 拉取模型不该阻塞配置。
+
+    Returns:
+        `{'ok': bool, 'models': [str], 'protocol': str, 'message': str}`
+    """
+    spec = provider if isinstance(provider, dict) else {}
+    base_url = str(spec.get('base_url') or '')
+    allow_local = bool(spec.get('allow_local'))
+    protocol = protocols.normalize_protocol(spec.get('api_style'))
+
+    def _fail(message: str) -> dict:
+        return {'ok': False, 'models': [], 'protocol': protocol, 'message': message}
+
+    blocked = validate_base_url(base_url, allow_local=allow_local)
+    if blocked:
+        return _fail(blocked)
+
+    secret = str(api_key or '').strip()
+    if not secret:
+        return _fail('缺少 API Key')
+
+    url = protocols.models_endpoint_for(base_url, protocol)
+    if not url:
+        return _fail('base_url 为空，无法推导 /models 端点')
+
+    headers = protocols.build_headers(protocol, secret, extra_headers)
+    timeout = (
+        max(1, int(spec.get('connect_timeout') or 10)),
+        min(max(5, int(spec.get('request_timeout') or 120)), 30),
+    )
+
+    get = transport or _default_get
+    try:
+        response = get(url, headers=headers, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - 拉取模型失败不应抛给调用方
+        return _fail(_wrap_transport_error(exc).message)
+
+    status = int(getattr(response, 'status_code', 0) or 0)
+    if status >= 400:
+        excerpt = _excerpt(getattr(response, 'text', '') or '', 200)
+        return _fail(f'HTTP {status}：{excerpt or "无响应体"}')
+
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        raw = getattr(response, 'text', '') or ''
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return _fail('响应不是合法 JSON')
+
+    models = protocols.parse_models(protocol, payload)
+    if not models:
+        return _fail('响应里没有可识别的模型列表')
+
+    return {'ok': True, 'models': models, 'protocol': protocol, 'message': ''}
+
+
+def _default_get(url, **kwargs):
+    import requests  # noqa: PLC0415 - 延迟导入，便于无网络环境下加载模块
+
+    return requests.get(url, **kwargs)

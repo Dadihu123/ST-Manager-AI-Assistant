@@ -34,7 +34,7 @@ def normalize_text(value) -> str:
 def card_data_block(card) -> dict:
     """取出卡片的数据块。
 
-    `api.read_card()` 的返回兼容 V2（字段在顶层）与 V3（字段在 `data` 下）
+    `api.cards.read()` 的返回兼容 V2（字段在顶层）与 V3（字段在 `data` 下）
     两种结构（主程序 `core/plugins/api.py:437-442` 也是这么处理的）。
     """
     if not isinstance(card, dict):
@@ -85,7 +85,7 @@ def card_content_hash(card, wi_entry_names=()) -> str:
     """计算内容哈希。
 
     Args:
-        card: `api.read_card()` 的返回值。
+        card: `api.cards.read()` 的返回值。
         wi_entry_names: 额外参与哈希的世界书条目名（如内嵌世界书之外的来源）。
     """
     fields = card_fields(card)
