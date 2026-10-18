@@ -226,6 +226,87 @@
   line-height: 1.5;
 }
 
+/* 内容选择器区块 */
+.plugin-stm-ai-assistant-selector {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-default, var(--accent-outline));
+  border-radius: 8px;
+}
+
+.plugin-stm-ai-assistant-selector h4 {
+  margin: 0 0 4px;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.plugin-stm-ai-assistant-label {
+  margin: 10px 0 4px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--content-secondary);
+}
+
+/* 多选行：自动换行，窄容器也不会溢出 */
+.plugin-stm-ai-assistant-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+}
+
+/* 选择器提示列表 */
+.plugin-stm-ai-assistant-gaps {
+  margin: 2px 0 0;
+  padding-left: 18px;
+  font-size: 0.74rem;
+  line-height: 1.55;
+}
+
+/* token 明细（等宽，方便纵向对比数值） */
+.plugin-stm-ai-assistant-budget {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--surface-sunken, rgba(0, 0, 0, 0.04));
+  border-radius: 6px;
+}
+
+/* 世界书改写：条目勾选行 */
+.plugin-stm-ai-assistant-wi-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.76rem;
+  line-height: 1.5;
+}
+
+.plugin-stm-ai-assistant-wi-item.is-disabled {
+  opacity: 0.55;
+}
+
+/* 高级设置折叠区（完整 schema / 写回动作） */
+.plugin-stm-ai-assistant-advanced {
+  margin-top: 12px;
+  padding: 8px 12px;
+  border: 1px dashed var(--border-default, var(--accent-outline));
+  border-radius: 8px;
+}
+
+.plugin-stm-ai-assistant-advanced > summary {
+  cursor: pointer;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--content-secondary);
+}
+
+.plugin-stm-ai-assistant-advanced > summary:hover {
+  color: var(--content-primary);
+}
+
 .plugin-stm-ai-assistant-field {
   display: flex;
   flex-direction: column;

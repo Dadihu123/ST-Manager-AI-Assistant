@@ -68,3 +68,54 @@ def estimate_cost(prompt_tokens: int, completion_tokens: int, *,
         'currency': str(currency or 'CNY'),
         'priced': priced,
     }
+
+
+def estimate_blocks(variable_hits, variables, *, total_tokens: int = 0) -> dict:
+    """按变量拆解 token 消耗（让用户看清「钱花在哪」）。
+
+    Args:
+        variable_hits: `{变量名: 出现次数}`（出现次数来自模板扫描）。
+        variables: `{变量名: 值}`。
+        total_tokens: 实际渲染后的总 token；用于反推模板骨架的开销。
+
+    Returns:
+        `{'items': [{'name','tokens','count','empty'}], 'by_variable': {...},
+           'variables_total': int, 'template_overhead': int, 'total': int}`
+    """
+    hits = variable_hits if isinstance(variable_hits, dict) else {}
+    values = variables if isinstance(variables, dict) else {}
+
+    items = []
+    by_variable = {}
+    variables_total = 0
+
+    for name, count in hits.items():
+        occurrences = max(0, int(count or 0))
+        if occurrences <= 0:
+            continue
+        raw = values.get(name)
+        text = '' if raw is None else str(raw)
+        unit = estimate(text)
+        cost = unit * occurrences
+        variables_total += cost
+        by_variable[name] = cost
+        items.append({
+            'name': name,
+            'tokens': cost,
+            'count': occurrences,
+            'empty': not text.strip(),
+        })
+
+    items.sort(key=lambda entry: (-entry['tokens'], entry['name']))
+
+    total = max(0, int(total_tokens or 0))
+    # 「骨架」= 模板里的固定文字 + 消息包装开销。可能为负（估算误差），夹到 0。
+    overhead = max(0, total - variables_total)
+
+    return {
+        'items': items,
+        'by_variable': by_variable,
+        'variables_total': variables_total,
+        'template_overhead': overhead,
+        'total': total,
+    }

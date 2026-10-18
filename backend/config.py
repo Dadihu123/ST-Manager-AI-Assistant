@@ -4,6 +4,9 @@
 这里只做「默认值兜底 + 类型/区间收敛」，避免坏配置把作业带进不可预期状态。
 """
 
+from .core import selector as selector_core
+from .core import tagpool as tagpool_core
+
 DEFAULT_CONFIG = {
     'default_profile_id': '',
     'max_tags': 8,
@@ -102,13 +105,16 @@ def normalize_config(raw) -> dict:
         'price_per_1k_prompt': _to_float(data.get('price_per_1k_prompt'), 0.0, minimum=0.0),
         'price_per_1k_completion': _to_float(data.get('price_per_1k_completion'), 0.0, minimum=0.0),
         'currency': _to_text(data.get('currency'), DEFAULT_CONFIG['currency']).strip() or 'CNY',
+        # 新档案的初值；档案自己的 content_selector / tag_pool 会覆盖它（档案优先）
+        'content_selector': selector_core.normalize_selector(data.get('content_selector')),
+        'tag_pool': tagpool_core.normalize_pool(data.get('tag_pool')),
     }
 
 
 def load_config(api) -> dict:
     """从主程序读取并规范化配置。"""
     try:
-        raw = api.get_config()
+        raw = api.config.get()
     except Exception:  # noqa: BLE001 - 配置读取失败不应让插件不可用
         raw = {}
     return normalize_config(raw)

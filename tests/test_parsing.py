@@ -4,9 +4,25 @@ import pytest
 
 from stm_ai_core import parsing
 
-FORMAT = {'json_only': True, 'required_keys': ['summary', 'tags'], 'strip_think': True}
-LIMITS = {'summary_max_chars': 100, 'summary_min_chars': 0, 'tags_max': 3, 'tags_min': 0,
-          'confidence_min': 0.5}
+#: v2 task spec 里「生成约束 + 后置校验」共用的那份声明
+SCHEMA = {
+    'json_only': True,
+    'strip_think': True,
+    'forbidden_wrappers': [],
+    'required': ['summary', 'tags'],
+    'properties': {
+        'summary': {'type': 'string', 'min_chars': 0, 'max_chars': 100},
+        'tags': {
+            'type': 'array', 'min_items': 0, 'max_items': 3,
+            'min_confidence': 0.5, 'order_by': 'confidence',
+            'item': {
+                'name': {'type': 'string'},
+                'confidence': {'type': 'number', 'min': 0, 'max': 1},
+            },
+        },
+        'suggested_new_tags': {'type': 'array', 'max_items': 6},
+    },
+}
 
 
 # ------------------------------------------------------------------ 清洗
@@ -107,7 +123,7 @@ def test_normalize_result_truncates_tag_name():
 
 
 def test_validate_result_truncates_long_summary():
-    outcome = parsing.validate_result({'summary': '甲' * 150, 'tags': []}, FORMAT, LIMITS)
+    outcome = parsing.validate_result({'summary': '甲' * 150, 'tags': []}, SCHEMA)
     assert len(outcome['result']['summary']) <= 100
     assert any('裁剪' in item for item in outcome['warnings'])
     assert outcome['ok'] is True
@@ -115,13 +131,13 @@ def test_validate_result_truncates_long_summary():
 
 def test_validate_result_prefers_sentence_boundary():
     text = '甲' * 60 + '。' + '乙' * 200
-    outcome = parsing.validate_result({'summary': text, 'tags': []}, FORMAT, LIMITS)
+    outcome = parsing.validate_result({'summary': text, 'tags': []}, SCHEMA)
     assert outcome['result']['summary'] == '甲' * 60 + '。'
 
 
 def test_validate_result_falls_back_to_hard_truncate_when_break_is_too_early():
     text = '短。' + '乙' * 200
-    outcome = parsing.validate_result({'summary': text, 'tags': []}, FORMAT, LIMITS)
+    outcome = parsing.validate_result({'summary': text, 'tags': []}, SCHEMA)
     assert outcome['result']['summary'].endswith('…')
     assert len(outcome['result']['summary']) <= 100
 
@@ -130,47 +146,59 @@ def test_validate_result_drops_low_confidence_tags():
     outcome = parsing.validate_result({
         'summary': 'ok',
         'tags': [{'name': 'a', 'confidence': 0.2}, {'name': 'b', 'confidence': 0.9}],
-    }, FORMAT, LIMITS)
+    }, SCHEMA)
     assert [item['name'] for item in outcome['result']['tags']] == ['b']
 
 
 def test_validate_result_truncates_tags_by_confidence():
     tags = [{'name': f't{index}', 'confidence': 0.5 + index / 100} for index in range(6)]
-    outcome = parsing.validate_result({'summary': 'ok', 'tags': tags}, FORMAT, LIMITS)
+    outcome = parsing.validate_result({'summary': 'ok', 'tags': tags}, SCHEMA)
     assert len(outcome['result']['tags']) == 3
     assert outcome['result']['tags'][0]['name'] == 't5'
 
 
 def test_validate_result_keeps_tags_without_confidence():
-    outcome = parsing.validate_result({'summary': 'ok', 'tags': ['无置信度']}, FORMAT, LIMITS)
+    outcome = parsing.validate_result({'summary': 'ok', 'tags': ['无置信度']}, SCHEMA)
     assert [item['name'] for item in outcome['result']['tags']] == ['无置信度']
     assert any('缺少置信度' in item for item in outcome['warnings'])
 
 
 def test_validate_result_reports_missing_required_keys():
-    outcome = parsing.validate_result({'summary': '', 'tags': []}, FORMAT, LIMITS)
+    outcome = parsing.validate_result({'summary': '', 'tags': []}, SCHEMA)
     assert outcome['ok'] is False
     assert any('summary' in item for item in outcome['issues'])
 
 
 def test_validate_result_empty_tag_list_is_not_missing():
-    outcome = parsing.validate_result({'summary': 'ok', 'tags': []}, FORMAT, LIMITS)
+    outcome = parsing.validate_result({'summary': 'ok', 'tags': []}, SCHEMA)
     assert outcome['ok'] is True
 
 
 def test_validate_result_strict_flags_short_summary():
-    strict_limits = dict(LIMITS, summary_min_chars=50)
+    strict_schema = {
+        **SCHEMA,
+        'properties': {
+            **SCHEMA['properties'],
+            'summary': {'type': 'string', 'min_chars': 50, 'max_chars': 100},
+        },
+    }
     outcome = parsing.validate_result(
         {'summary': '太短', 'tags': [{'name': 'a', 'confidence': 0.9}]},
-        FORMAT, strict_limits, strict=True,
+        strict_schema, strict=True,
     )
     assert outcome['ok'] is False
     assert any('短于下限' in item for item in outcome['issues'])
 
 
 def test_validate_result_non_strict_warns_short_summary():
-    lenient_limits = dict(LIMITS, summary_min_chars=50)
-    outcome = parsing.validate_result({'summary': '太短', 'tags': []}, FORMAT, lenient_limits)
+    lenient_schema = {
+        **SCHEMA,
+        'properties': {
+            **SCHEMA['properties'],
+            'summary': {'type': 'string', 'min_chars': 50, 'max_chars': 100},
+        },
+    }
+    outcome = parsing.validate_result({'summary': '太短', 'tags': []}, lenient_schema)
     assert outcome['ok'] is True
     assert any('短于下限' in item for item in outcome['warnings'])
 
@@ -183,7 +211,7 @@ def test_validate_result_drops_new_tags_duplicating_selected():
             {'name': '战斗', 'reason': 'x'},
             {'name': '赛博朋克', 'reason': 'y'},
         ],
-    }, FORMAT, LIMITS)
+    }, SCHEMA)
     assert [item['name'] for item in outcome['result']['suggested_new_tags']] == ['赛博朋克']
 
 
@@ -192,7 +220,7 @@ def test_validate_result_drops_new_tags_duplicating_selected():
 
 def test_parse_llm_result_handles_fenced_noise():
     text = '好的，结果如下：\n```json\n{"summary": "一个骑士", "tags": ["战斗"]}\n```\n希望有帮助。'
-    outcome = parsing.parse_llm_result(text, FORMAT, LIMITS)
+    outcome = parsing.parse_llm_result(text, SCHEMA)
     assert outcome['ok'] is True
     assert outcome['result']['summary'] == '一个骑士'
     assert outcome['result']['tags'][0]['name'] == '战斗'
@@ -201,13 +229,13 @@ def test_parse_llm_result_handles_fenced_noise():
 
 def test_parse_llm_result_handles_think_block():
     outcome = parsing.parse_llm_result('<think>先想想</think>{"summary": "S", "tags": []}',
-                                       FORMAT, LIMITS)
+                                       SCHEMA)
     assert outcome['ok'] is True
     assert outcome['strategy'] == 'direct'
 
 
 def test_parse_llm_result_reports_failure_with_excerpt():
-    outcome = parsing.parse_llm_result('对不起，我无法完成。', FORMAT, LIMITS)
+    outcome = parsing.parse_llm_result('对不起，我无法完成。', SCHEMA)
     assert outcome['ok'] is False
     assert outcome['result'] is None
     assert outcome['raw_excerpt']
@@ -215,5 +243,49 @@ def test_parse_llm_result_reports_failure_with_excerpt():
 
 
 def test_parse_llm_result_keeps_excerpt_short():
-    outcome = parsing.parse_llm_result('x' * 5000, FORMAT, LIMITS)
+    outcome = parsing.parse_llm_result('x' * 5000, SCHEMA)
     assert len(outcome['raw_excerpt']) == 2048
+
+
+# ------------------------------------------------------------------ 预填充拼回
+
+
+def test_prefill_is_stitched_back_before_parsing():
+    """`assistant_prefill='{'` 时模型只返回续写片段，必须先拼回再解析。
+
+    回归用例：修复前 `loads_lenient` 找不到 `{` 会退去按 `[` 提取，
+    命中 `tags` 数组（那是合法 JSON），于是**解析「成功」但 summary/tags 全空
+    且 ok=True** —— 静默丢数据。
+    """
+    continuation = '"summary": "这是一段概览", "tags": [{"name": "校园", "confidence": 0.9}]}'
+
+    # 不拼回：正是修复前的错误行为（ok=True 但结果为空）
+    broken = parsing.parse_llm_result(continuation, SCHEMA)
+    assert broken['result']['summary'] == ''
+    assert broken['result']['tags'] == []
+
+    # 拼回：必须拿到完整结果
+    fixed = parsing.parse_llm_result(continuation, SCHEMA, prefill='{')
+    assert fixed['ok'] is True
+    assert fixed['result']['summary'] == '这是一段概览'
+    assert [item['name'] for item in fixed['result']['tags']] == ['校园']
+    assert any('预填充' in item for item in fixed['warnings'])
+
+
+def test_prefill_does_not_break_complete_response():
+    """原文已完整时**原文优先**，拼接兜底不得抢先（否则括号不配平）。"""
+    complete = '{"summary": "完整", "tags": [{"name": "战斗", "confidence": 0.9}]}'
+    outcome = parsing.parse_llm_result(complete, SCHEMA, prefill='{')
+    assert outcome['ok'] is True
+    assert outcome['result']['summary'] == '完整'
+    assert not any('预填充' in item for item in outcome['warnings'])
+
+
+def test_prefill_boundary_with_brace_array():
+    """预填充是 `[` 时同样能拼回（JSON 数组形态的输出）。"""
+    outcome = parsing.parse_llm_result(
+        '{"summary": "S", "tags": []}]', SCHEMA, prefill='[{',
+    )
+    # 拼接后为 `[{"summary": ...}]`，取首项
+    assert outcome['ok'] is True
+    assert outcome['result']['summary'] == 'S'

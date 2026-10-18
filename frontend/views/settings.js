@@ -18,16 +18,25 @@ import {
 } from '../dom.js';
 
 const API_STYLES = [
-  { value: 'openai', label: 'OpenAI 兼容（推荐）' },
-  { value: 'openai_compatible', label: '自建 / 第三方网关' },
+  { value: 'openai_chat', label: 'OpenAI Chat Completions（/chat/completions）' },
+  { value: 'openai_responses', label: 'OpenAI Responses（/responses）' },
+  { value: 'anthropic_messages', label: 'Anthropic Messages（/messages）' },
 ];
+
+/** 协议 → 该协议的鉴权/字段差异提示，显示在协议选择器下方。 */
+const API_STYLE_HINTS = {
+  openai_chat: '鉴权用 Authorization: Bearer；支持 stop 停止序列。',
+  openai_responses: '鉴权同上；最大 token 字段为 max_output_tokens，且不支持 stop。',
+  anthropic_messages: '鉴权用 x-api-key + anthropic-version；system 会移到顶层，'
+    + 'stop 映射为 stop_sequences，temperature 上限为 1。',
+};
 
 const BLANK_PROVIDER = {
   id: '',
   name: '',
   base_url: 'https://api.openai.com/v1',
   model: '',
-  api_style: 'openai',
+  api_style: 'openai_chat',
   connect_timeout: 10,
   request_timeout: 120,
   max_retries: 3,
@@ -136,20 +145,42 @@ export function createSettings(api, client, context) {
     const grid = el('div', 'plugin-stm-ai-assistant-grid');
     fields.id = input(draft.id, 'text', '小写字母/数字/连字符，如 openai');
     fields.name = input(draft.name || draft.id);
-    fields.base_url = input(draft.base_url, 'text', '不含 /chat/completions');
-    fields.model = input(draft.model, 'text', '如 gpt-4o-mini / deepseek-chat');
+    fields.base_url = input(draft.base_url, 'text', '只填到 /v1 即可；协议路径会自动补');
+    fields.model = input(draft.model, 'text', '如 gpt-4o-mini / claude-sonnet-4-5');
     fields.api_style = select(API_STYLES, draft.api_style);
     editorControls = [fields.api_style];
     fields.connect_timeout = numberInput(draft.connect_timeout, { min: 1, step: 1 });
     fields.request_timeout = numberInput(draft.request_timeout, { min: 1, step: 1 });
     fields.max_retries = numberInput(draft.max_retries, { min: 0, step: 1 });
 
+    // 协议差异提示：跟着选择器变化，避免用户填了 Anthropic 地址却期待 stop 生效
+    const styleHint = el('p', 'plugin-stm-ai-assistant-hint',
+      API_STYLE_HINTS[draft.api_style] || '');
+    fields.api_style.addEventListener('change', () => {
+      styleHint.textContent = API_STYLE_HINTS[fields.api_style.value] || '';
+    });
+
+    // 模型列表：拉取失败必须能退回手填（很多网关不实现 /models）
+    const modelRow = el('div', 'plugin-stm-ai-assistant-row');
+    const modelSelect = el('select', 'plugin-stm-ai-assistant-select');
+    modelSelect.append(el('option', '', '（尚未拉取）'));
+    modelSelect.value = '';
+    modelSelect.addEventListener('change', () => {
+      if (modelSelect.value) fields.model.value = modelSelect.value;
+    });
+    modelRow.append(
+      modelSelect,
+      button('拉取模型列表', 'is-secondary', () => fetchModels(fields, modelSelect)),
+    );
+
     grid.append(
       field('id', fields.id),
       field('名称', fields.name),
       field('API 地址', fields.base_url),
       field('默认模型', fields.model),
-      field('接口风格', fields.api_style),
+      field('模型候选', modelRow, '点「拉取模型列表」从 /models 读取；失败时直接手填上方'),
+      field('接口协议', fields.api_style),
+      styleHint,
       field('连接超时（秒）', fields.connect_timeout),
       field('读取超时（秒）', fields.request_timeout),
       field('最大重试次数', fields.max_retries),
@@ -189,6 +220,40 @@ export function createSettings(api, client, context) {
   }
 
   // ---------------------------------------------------------------- 操作
+
+  async function fetchModels(fields, modelSelect) {
+    const id = fields.id.value.trim().toLowerCase();
+    if (!id) {
+      api.host.toast('先填 provider id（保存前也可以拉取）', 3200, 'close');
+      return;
+    }
+
+    try {
+      const data = await client.listModels(id, {
+        base_url: fields.base_url.value.trim(),
+        api_style: fields.api_style.value,
+      });
+
+      clear(modelSelect);
+      if (!data.ok) {
+        modelSelect.append(el('option', '', '（拉取失败：请手填模型名）'));
+        modelSelect.value = '';
+        api.host.toast(`拉取模型失败：${data.message || '未知原因'}`, 5200, 'close');
+        return;
+      }
+
+      modelSelect.append(el('option', '', `（${data.models.length} 个模型）`));
+      data.models.forEach((name) => {
+        const option = el('option', '', name);
+        option.value = name;
+        modelSelect.append(option);
+      });
+      modelSelect.value = '';
+      api.host.toast(`已拉取 ${data.models.length} 个模型`, 2600, 'check');
+    } catch (error) {
+      api.host.toast(`拉取模型失败：${error.message}`, 4200, 'close');
+    }
+  }
 
   async function saveProvider(fields) {
     const provider = {

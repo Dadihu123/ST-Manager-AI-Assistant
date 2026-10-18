@@ -31,7 +31,7 @@ def test_backend_package_loads_without_sys_path(backend):
 def test_register_wires_jobs_routes_and_cli(backend, api):
     backend.register(api)
 
-    assert 'ai.analyze' in api.jobs
+    assert 'ai.analyze' in api.registered_jobs
 
     rules = {rule for rule, _methods, _func in api.routes}
     assert {'/status', '/health', '/cards', '/prompt/preview', '/jobs/analyze'} <= rules
@@ -40,14 +40,14 @@ def test_register_wires_jobs_routes_and_cli(backend, api):
     assert '/suggestions' in rules
     assert '/usage' in rules
 
-    assert {'status', 'profiles', 'preview', 'analyze'} <= set(api.cli)
+    assert {'status', 'profiles', 'preview', 'analyze'} <= set(api.registered_cli)
 
 
 def test_registered_job_types_are_declared_in_manifest(backend, api):
     backend.register(api)
     with open(MANIFEST_PATH, 'r', encoding='utf-8') as handle:
         manifest = json.load(handle)
-    assert set(api.jobs) <= set(manifest['backend']['jobs'])
+    assert set(api.registered_jobs) <= set(manifest['backend']['jobs'])
 
 
 def test_registered_routes_are_unique_per_rule_and_methods(backend, api):
@@ -89,18 +89,18 @@ def test_register_initializes_provider_file(backend, api, tmp_path):
 
 def test_register_writes_profile_index_into_ui_namespace(backend, api):
     backend.register(api)
-    index = api.ui_data_read().get('prompt_index')
+    index = api.private.read().get('prompt_index')
     assert isinstance(index, list)
-    assert len(index) == 5
+    assert len(index) == 9
     assert {item['id'] for item in index} >= {'builtin-default', 'builtin-gpt'}
 
 
 def test_register_preserves_foreign_ui_keys(backend, api):
     """C3 回归：装配过程不得清掉主程序管理的 `config` / `enabled` 等键。"""
-    api.ui_data_update(lambda entry: entry.update({'config': {'max_tags': 3}, 'enabled': True}))
+    api.private.update(lambda entry: entry.update({'config': {'max_tags': 3}, 'enabled': True}))
     backend.register(api)
 
-    namespace = api.ui_data_read()
+    namespace = api.private.read()
     assert namespace.get('config') == {'max_tags': 3}
     assert namespace.get('enabled') is True
     assert namespace.get('prompt_index')

@@ -262,8 +262,14 @@ def _pick_payload(data):
     return {}, False
 
 
-def normalize_result(data) -> dict:
-    """把任意解析结果归一化为统一结构。"""
+def normalize_result(data, output_schema=None) -> dict:
+    """把任意解析结果归一化为统一结构。
+
+    Args:
+        output_schema: 声明了哪些字段。**schema 里声明、但内置归一化不认识的自定义
+            字段会原样透传** —— 否则 task spec 新增字段（如 `card_type` 的枚举、
+            `new_content`）会在归一化阶段被静默丢弃，永远取不到值。
+    """
     payload, is_batch = _pick_payload(data)
 
     tags, tag_warnings = normalize_tag_list(payload.get('tags'))
@@ -282,7 +288,7 @@ def normalize_result(data) -> dict:
     if is_batch:
         warnings.append('响应包含多项结果，已取第一项')
 
-    return {
+    result = {
         'summary': _to_text(payload.get('summary')),
         'tags': tags,
         'suggested_new_tags': new_tags,
@@ -292,6 +298,17 @@ def normalize_result(data) -> dict:
         'quality_notes': _to_text(payload.get('quality_notes'), limit=500),
         '_warnings': warnings,
     }
+
+    # schema 声明的自定义字段透传（内置归一化不认识的键）
+    if isinstance(output_schema, dict):
+        declared = output_schema.get('properties')
+        if isinstance(declared, dict):
+            for name in declared:
+                key = str(name or '').strip()
+                if key and key not in result and key in payload:
+                    result[key] = payload[key]
+
+    return result
 
 
 # ------------------------------------------------------------------ 后置校验
@@ -315,20 +332,23 @@ def truncate_text(text, limit: int) -> str:
     return window.rstrip()[:max(1, limit - 1)].rstrip() + '…'
 
 
-def validate_result(result, format_rules=None, length_rules=None, *, strict: bool = False) -> dict:
+def validate_result(result, output_schema=None, *, strict: bool = False) -> dict:
     """对归一化结果做后置校验与挽救。
 
-    规则与生成侧同源（设计文档 §5.5）：`format_rules` 与 `length_rules` 既拼进
-    system，也在这里逐条核对。
+    规则来自 task spec 的 `output_schema`（设计文档 §8.5）：
+    「生成约束」由 `schema.describe_constraints` 拼进 system，
+    「后置校验」由本函数逐条核对 —— 两者读同一份声明，不会漂移。
 
     Returns:
         `{'result', 'issues', 'warnings', 'ok'}` —— `ok=False` 表示 strict 模式下判失败。
     """
     data = result if isinstance(result, dict) else {}
-    rules = format_rules if isinstance(format_rules, dict) else {}
-    limits = length_rules if isinstance(length_rules, dict) else {}
 
-    issues = []
+    # 延迟导入：`schema` 模块依赖本模块的 `truncate_text`，模块级导入会成环
+    from . import schema as schema_core  # noqa: PLC0415
+
+    spec = schema_core.normalize_schema(output_schema)
+
     # tags / suggested_new_tags 允许传入「未归一化」的形态（字符串数组等），此处再做一次幂等归一化
     tags_normalized, tag_warnings = normalize_tag_list(data.get('tags'))
     new_tags_normalized, new_tag_warnings = normalize_new_tags(data.get('suggested_new_tags'))
@@ -344,97 +364,100 @@ def validate_result(result, format_rules=None, length_rules=None, *, strict: boo
         'quality_notes': str(data.get('quality_notes') or '').strip(),
     }
 
-    # ---- 必填键 ----
-    # 注意：空数组视为「已提供但为空」（模型确实没找到标签），只有缺失或空字符串才判失败。
-    required_keys = rules.get('required_keys') or []
-    for key in required_keys:
-        name = str(key or '').strip()
-        if not name:
-            continue
-        value = normalized.get(name)
-        if value is None or value == '' or (isinstance(value, dict) and not value):
-            issues.append(f'缺少必需字段: {name}')
+    # schema 声明的自定义字段：从入参透传（内置归一化不认识它们）
+    for name in spec['properties']:
+        if name not in normalized and name in data:
+            normalized[name] = data[name]
 
-    # ---- 概览字数 ----
-    summary_max = int(limits.get('summary_max_chars') or 0)
-    summary_min = int(limits.get('summary_min_chars') or 0)
+    # ---- 置信度下限：先筛掉低分的（在数量截断之前，否则会把低分项也算进上限）----
+    confidence_min = schema_core.confidence_floor(spec, 'tags')
+    if confidence_min:
+        kept = []
+        dropped_low = []
+        for item in normalized['tags']:
+            name = str(item.get('name') or '').strip()
+            if not name:
+                continue
+            confidence = item.get('confidence')
+            if confidence is None:
+                warnings.append(f'标签「{name}」缺少置信度，已保留')
+                kept.append({'name': name, 'confidence': None})
+                continue
+            if float(confidence) < confidence_min:
+                dropped_low.append(name)
+                continue
+            kept.append({'name': name, 'confidence': confidence})
+        if dropped_low:
+            warnings.append(
+                f'已丢弃 {len(dropped_low)} 个低置信度标签: {"、".join(dropped_low[:5])}',
+            )
+        normalized['tags'] = kept
 
-    if normalized['summary'] and summary_max and len(normalized['summary']) > summary_max:
-        trimmed = truncate_text(normalized['summary'], summary_max)
-        warnings.append(f'概览超过 {summary_max} 字，已裁剪')
-        normalized['summary'] = trimmed
-
-    if summary_min and len(normalized['summary']) < summary_min:
-        message = f'概览短于下限 {summary_min} 字（实际 {len(normalized["summary"])} 字）'
-        if strict:
-            issues.append(message)
-        else:
-            warnings.append(message)
-
-    # ---- 标签数量与置信度 ----
-    tags_max = int(limits.get('tags_max') or 0)
-    tags_min = int(limits.get('tags_min') or 0)
-    confidence_min = float(limits.get('confidence_min') or 0.0)
-
-    kept = []
-    dropped_low = []
-    for item in normalized['tags']:
-        name = str(item.get('name') or '').strip()
-        if not name:
-            continue
-        confidence = item.get('confidence')
-        if confidence is None:
-            warnings.append(f'标签「{name}」缺少置信度，已保留')
-            kept.append({'name': name, 'confidence': None})
-            continue
-        if confidence_min and float(confidence) < confidence_min:
-            dropped_low.append(name)
-            continue
-        kept.append({'name': name, 'confidence': confidence})
-
-    if dropped_low:
-        warnings.append(f'已丢弃 {len(dropped_low)} 个低置信度标签: {"、".join(dropped_low[:5])}')
-
-    if tags_max and len(kept) > tags_max:
-        kept.sort(key=lambda item: (item.get('confidence') is None, -(item.get('confidence') or 0)))
-        warnings.append(f'标签超过 {tags_max} 个，已按置信度截断')
-        kept = kept[:tags_max]
-
-    if tags_min and len(kept) < tags_min:
-        message = f'标签数少于下限 {tags_min}（实际 {len(kept)}）'
-        if strict:
-            issues.append(message)
-        else:
-            warnings.append(message)
-
-    normalized['tags'] = kept
+    # ---- 超量标签按置信度保留（`order_by` 声明了排序字段才排）----
+    tags_prop = spec['properties'].get('tags') or {}
+    tags_max = int(tags_prop.get('max_items') or 0)
+    if tags_max and len(normalized['tags']) > tags_max:
+        if tags_prop.get('order_by') == 'confidence':
+            normalized['tags'].sort(
+                key=lambda item: (item.get('confidence') is None,
+                                  -(item.get('confidence') or 0)),
+            )
+        warnings.append(f'标签超过 {tags_max} 个，已截断')
+        normalized['tags'] = normalized['tags'][:tags_max]
 
     # ---- 与现有标签重复的新标签建议 ----
-    existing = {str(item.get('name') or '').strip() for item in kept}
+    existing = {str(item.get('name') or '').strip() for item in normalized['tags']}
     normalized['suggested_new_tags'] = [
         item for item in normalized['suggested_new_tags']
         if str(item.get('name') or '').strip() not in existing
     ]
 
+    # ---- 逐字段按 schema 校验（字数、枚举值域、数组长度、必填）----
+    # schema 声明了但归一化没产出的字段补成空值，否则 `schema.validate` 的
+    # `if name not in values: continue` 会把它们整段跳过 —— 枚举越界就查不出来。
+    for name in spec['properties']:
+        normalized.setdefault(name, '')
+
+    checked = schema_core.validate(normalized, spec, strict=strict)
+
     return {
-        'result': normalized,
-        'issues': issues,
-        'warnings': warnings,
-        'ok': not issues,
+        'result': checked['values'],
+        'issues': checked['issues'],
+        'warnings': warnings + checked['warnings'],
+        'ok': checked['ok'],
     }
 
 
 # ------------------------------------------------------------------ 组合入口
 
 
-def parse_llm_result(text, format_rules=None, length_rules=None, *, strict: bool = False) -> dict:
-    """完整解析链路：清洗 → 解析 → 归一化 → 校验。
+def parse_llm_result(text, output_schema=None, *, strict: bool = False,
+                     prefill: str = '') -> dict:
+    """完整解析链路：清洗 →（拼回预填充）→ 解析 → 归一化 → 校验。
+
+    Args:
+        text: 模型返回的 `content`。
+        prefill: 本次请求使用的 `assistant_prefill`。
+
+    **为什么需要 `prefill`**：预填充的语义是「模型从这里续写」，所以返回的
+    `content` **不含**预填充那一段。例如发出 `{role:'assistant', content:'{'}`，
+    模型返回的是 `'"summary": "…", "tags": [...]}'`（没有开头的 `{`）。
+
+    不拼回会发生什么（已实测）：`loads_lenient` 找不到 `{`，退而按 `[` 提取，
+    命中 `tags` 数组 —— 那是**合法 JSON**，于是解析「成功」，
+    但 `summary` 与 `tags` 全空且 `ok=True`。**静默丢数据**。
+
+    拼回顺序不可反：shujuku 的实测记录指出，对已完整的原文再拼 `prefill`
+    必然括号不配平，会被当成截断抢救出一份空载荷。所以这里是
+    **原文优先、拼接兜底**。
 
     Returns:
         `{'ok', 'result', 'issues', 'warnings', 'strategy', 'raw_excerpt'}`。
         解析彻底失败时 `ok=False`，`issues` 内含原因，`raw_excerpt` 为响应片段（≤2KB）。
     """
-    rules = format_rules if isinstance(format_rules, dict) else {}
+    from . import schema as schema_core  # noqa: PLC0415 - 循环导入：schema 依赖本模块
+
+    rules = schema_core.normalize_schema(output_schema)
     source = '' if text is None else str(text)
     excerpt = source[:2048]
 
@@ -448,20 +471,53 @@ def parse_llm_result(text, format_rules=None, length_rules=None, *, strict: bool
     if fenced:
         warnings.append('响应包含 Markdown 代码块包裹，已剥离')
 
-    try:
-        data, strategy = loads_lenient(cleaned)
-    except ValueError as exc:
+    # 候选顺序：**先判断原文是否已完整**，再决定先后。
+    #
+    # 不能简单地「原文优先」——续写片段往往也能被 `loads_lenient` 「解析成功」
+    # （例如片段里有 `tags` 数组，退去按 `[` 提取就成了合法 JSON），
+    # 于是原文优先会抢先命中一个**退化结果**，永远走不到拼接。
+    #
+    # 判据与 shujuku 一致（`agent-protocol.ts:182`）：剥掉围栏后以 `{` / `[`
+    # 开头，视为模型完整重输；否则视为续写预填充。
+    prefix = '' if prefill is None else str(prefill)
+    stripped_head = cleaned.lstrip()
+    looks_complete = stripped_head.startswith(('{', '['))
+
+    candidates = [(cleaned, '')]
+    if prefix and not looks_complete:
+        # 续写形态：拼接在前，原文兜底
+        candidates = [(f'{prefix}{cleaned}', 'prefill'), (cleaned, '')]
+
+    data = None
+    strategy = ''
+    last_error = None
+    stitched = False
+
+    for candidate, tag in candidates:
+        try:
+            data, strategy = loads_lenient(candidate)
+        except ValueError as exc:
+            last_error = exc
+            continue
+        if tag == 'prefill':
+            stitched = True
+        break
+
+    if data is None:
         return {
             'ok': False,
             'result': None,
-            'issues': [f'无法解析响应: {exc}'],
+            'issues': [f'无法解析响应: {last_error}'],
             'warnings': warnings,
             'strategy': '',
             'raw_excerpt': excerpt,
         }
 
-    normalized = normalize_result(data)
-    validation = validate_result(normalized, rules, length_rules, strict=strict)
+    if stitched:
+        warnings.append('模型响应续写了预填充，已在解析前拼回')
+
+    normalized = normalize_result(data, rules)
+    validation = validate_result(normalized, output_schema, strict=strict)
 
     return {
         'ok': bool(validation['ok']),

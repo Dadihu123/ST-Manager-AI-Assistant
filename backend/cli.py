@@ -39,19 +39,19 @@ class _CliContext:
 
 def register_cli(api, store) -> None:
     """注册 CLI 子命令。"""
-    api.register_cli(
+    api.cli.register(
         'status', lambda namespace: cmd_status(api, store, namespace),
         description='打印配置、provider、提示词档案与用量台账',
     )
-    api.register_cli(
+    api.cli.register(
         'profiles', lambda namespace: cmd_profiles(api, store, namespace),
         description='档案管理：list / show <id> / export [--out=路径]',
     )
-    api.register_cli(
+    api.cli.register(
         'preview', lambda namespace: cmd_preview(api, store, namespace),
         description='渲染提示词预览：preview <card_id> [--profile=] [--provider=] [--model=]',
     )
-    api.register_cli(
+    api.cli.register(
         'analyze', lambda namespace: cmd_analyze(api, store, namespace),
         description='同步分析卡片（不写盘，除非加 --apply）：' + ANALYZE_USAGE,
     )
@@ -246,9 +246,9 @@ def cmd_analyze(api, store, namespace) -> int:
 
     exit_code = 0
     for card_id in args:
-        card = api.read_card(card_id)
+        card = api.cards.read(card_id)
         content_hash = hashing.card_content_hash(card) if isinstance(card, dict) else ''
-        ui_key = summary_bridge.resolve_key(card_id)
+        ui_key = summary_bridge.resolve_key(api, card_id)
 
         try:
             outcome = analyze_one(

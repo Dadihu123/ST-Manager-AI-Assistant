@@ -86,12 +86,12 @@ def stub_bridge(monkeypatch):
     """打桩概览 bridge：默认成功写入主程序侧。"""
     written = {}
 
-    def fake_write_summary(store_obj, card_id, summary, *, ui_key=''):
+    def fake_write_summary(api_obj, store_obj, card_id, summary, *, ui_key=''):
         written[str(card_id)] = str(summary)
         return {'ok': True, 'origin': 'ui_data', 'ui_key': ui_key or card_id, 'message': ''}
 
     monkeypatch.setattr(jobs_module.summary_bridge, 'write_summary', fake_write_summary)
-    monkeypatch.setattr(jobs_module.summary_bridge, 'resolve_key', lambda card_id: str(card_id))
+    monkeypatch.setattr(jobs_module.summary_bridge, 'resolve_key', lambda api_obj, card_id: str(card_id))
     return written
 
 
@@ -136,7 +136,7 @@ def register(api, store):
 
 
 def test_missing_api_key_aborts_job(api, store, stub_llm):
-    api.set_secret('api_key', None)
+    api.secrets.set('api_key', None)
     ctx = FakeCtx(make_items(), {})
     with pytest.raises(AiAssistantError) as excinfo:
         jobs_module.run_analyze(ctx, api=api, store=store)
@@ -236,13 +236,17 @@ def test_bridge_failure_degrades_to_namespace(api, store, stub_llm, monkeypatch)
     monkeypatch.setattr(jobs_module.summary_bridge, 'write_summary', lambda *a, **k: {
         'ok': False, 'origin': 'namespace', 'ui_key': 'Alice.png', 'message': '主程序拒绝写入',
     })
-    monkeypatch.setattr(jobs_module.summary_bridge, 'resolve_key', lambda card_id: str(card_id))
+    monkeypatch.setattr(jobs_module.summary_bridge, 'resolve_key', lambda api_obj, card_id: str(card_id))
 
     ctx = run_job(api, store, payload={'apply_mode': 'auto'})
     result = ctx.reports[0]['result']
 
     assert result['summary_origin'] == 'namespace'
-    assert any('未写入主程序' in item for item in result['warnings'])
+    # 降级原因现在由 apply_actions 的执行记录给出（不再由 jobs 手写文案）
+    assert any('主程序拒绝写入' in item for item in result['warnings'])
+    note = [a for a in result['actions'] if a['action'] == 'write_card_note'][0]
+    assert note['ok'] is False
+    assert note['origin'] == 'namespace'
 
 
 # ------------------------------------------------------------------ review / dry-run
@@ -316,13 +320,20 @@ def test_unparseable_output_is_reported(api, store, monkeypatch, stub_bridge):
     assert ctx.reports[0]['result']['detail']['excerpt']
 
 
+def _schema_with_min_summary(min_chars: int) -> dict:
+    """构造一份「概览至少 N 字」的 output_schema（v2）。"""
+    base = profiles_core.DEFAULT_OUTPUT_SCHEMA
+    schema = json.loads(json.dumps(base))
+    schema['properties']['summary']['min_chars'] = min_chars
+    return schema
+
+
 def test_strict_validation_failure_is_reported(api, store, monkeypatch, stub_bridge):
-    """strict 模式下，概览短于档案下限 → 判失败（不挽救）。"""
+    """strict 模式下，概览短于 schema 下限 → 判失败（不挽救）。"""
     store.save_profile(dict(
         profiles_core.builtin_profile('builtin-default'),
         id='strict-profile', name='strict',
-        length_rules={'summary_min_chars': 100, 'summary_max_chars': 300,
-                      'tags_min': 0, 'tags_max': 8, 'confidence_min': 0.5},
+        output_schema=_schema_with_min_summary(100),
     ))
     monkeypatch.setattr(jobs_module.llm, 'chat', lambda messages, **kwargs: {
         'content': '{"summary": "太短", "tags": []}',
@@ -339,8 +350,7 @@ def test_non_strict_mode_salvages_short_summary(api, store, monkeypatch, stub_br
     store.save_profile(dict(
         profiles_core.builtin_profile('builtin-default'),
         id='lenient-profile', name='lenient',
-        length_rules={'summary_min_chars': 100, 'summary_max_chars': 300,
-                      'tags_min': 0, 'tags_max': 8, 'confidence_min': 0.5},
+        output_schema=_schema_with_min_summary(100),
     ))
     monkeypatch.setattr(jobs_module.llm, 'chat', lambda messages, **kwargs: {
         'content': '{"summary": "太短", "tags": []}',
@@ -452,17 +462,34 @@ def test_missing_required_variable_fails_item(api, store, stub_llm, stub_bridge)
 
 def test_register_jobs_registers_declared_type(api, store):
     register(api, store)
-    assert 'ai.analyze' in api.jobs
+    assert 'ai.analyze' in api.registered_jobs
 
 
 # ------------------------------------------------------------------ 辅助函数
 
 
 def test_split_tags_separates_known_and_new():
-    accepted, suggested = jobs_module.split_tags(
+    accepted, suggested, blocked = jobs_module.split_tags(
         [{'name': '奇幻'}, {'name': '北境'}], {'奇幻'})
     assert accepted == ['奇幻']
     assert suggested == [{'name': '北境', 'reason': '标签库中不存在'}]
+    assert blocked == []
+
+
+def test_split_tags_hard_filters_by_blocked_set():
+    """`blocked` 给了就是硬过滤：隔离分类的标签即使 AI 输出也进不了 accepted。
+
+    注意：只有**明确被禁**的标签才挡；陌生标签仍走「新标签建议」。
+    """
+    accepted, suggested, blocked = jobs_module.split_tags(
+        [{'name': '奇幻'}, {'name': 'R18'}, {'name': '北境'}],
+        {'奇幻', 'R18'}, blocked={'R18'},
+    )
+    assert accepted == ['奇幻']
+    assert blocked == ['R18'], '被挡下的要如实报出来'
+    assert suggested == [{'name': '北境', 'reason': '标签库中不存在'}], (
+        '陌生标签不能被硬过滤吃掉，它该进建议队列'
+    )
 
 
 def test_merge_suggestions_dedupes():

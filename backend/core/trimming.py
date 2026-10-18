@@ -144,7 +144,8 @@ def _value_score(entry: dict, keywords) -> tuple:
 
 
 def select_wi_excerpt(entries, budget_tokens: int, *, keywords=None,
-                      outline_ratio: float = 0.2) -> dict:
+                      outline_ratio: float = 0.2, pinned_uids=None,
+                      only_uids=None) -> dict:
     """按 token 预算做分层取样。
 
     Args:
@@ -152,13 +153,27 @@ def select_wi_excerpt(entries, budget_tokens: int, *, keywords=None,
         budget_tokens: 世界书部分的总预算（≤0 表示不出内容）。
         keywords: 高价值关键词表；默认 `DEFAULT_KEYWORDS`。
         outline_ratio: 索引层最多占用的预算比例。
+        pinned_uids: **优先装入**的条目 uid（用户显式勾选的）。它们排在价值排序
+            之前，因此不会因为「名字没命中关键词」而被挤掉；但仍受预算限制
+            （超出预算是唯一能压过用户意愿的东西，此时标注 `truncated`）。
+        only_uids: **只允许**这些 uid（非空时其余条目完全不参与，连索引也不出现）。
+            用于「世界书：仅选定条目」模式。
 
     Returns:
         `{'outline', 'excerpt', 'count', 'total_tokens', 'excerpt_tokens',
-           'truncated', 'selected', 'dropped'}`
+           'truncated', 'selected', 'dropped', 'pinned', 'pinned_missing'}`
     """
     word_list = list(keywords) if keywords else list(DEFAULT_KEYWORDS)
+
     normalized = [normalize_entry(entry) for entry in (entries or []) if is_enabled(entry)]
+
+    # 只保留指定条目（选择器「仅选定」模式）
+    allowed = [str(item) for item in (only_uids or []) if str(item or '').strip()]
+    pinned = [str(item) for item in (pinned_uids or []) if str(item or '').strip()]
+
+    if allowed:
+        allowed_set = set(allowed)
+        normalized = [item for item in normalized if item['uid'] in allowed_set]
 
     total_tokens = sum(item['tokens'] for item in normalized)
     result = {
@@ -170,12 +185,17 @@ def select_wi_excerpt(entries, budget_tokens: int, *, keywords=None,
         'truncated': False,
         'selected': [],
         'dropped': [],
+        'pinned': [],
+        'pinned_missing': [],
     }
 
     budget = max(0, int(budget_tokens or 0))
     if not normalized or budget <= 0:
         result['dropped'] = [item['name'] for item in normalized if item['name']]
         result['truncated'] = bool(normalized)
+        # 勾选了但根本不在（或已停用）的条目要报出来，否则用户以为发出去了
+        present = {item['uid'] for item in normalized}
+        result['pinned_missing'] = [uid for uid in pinned if uid not in present]
         return result
 
     ratio = min(max(float(outline_ratio or 0.0), 0.0), 0.8)
@@ -200,14 +220,25 @@ def select_wi_excerpt(entries, budget_tokens: int, *, keywords=None,
         result['truncated'] = True
         result['outline'] += f'\n（索引已截断，共 {len(normalized)} 条）'
 
-    # ---- 第 2 层：按价值排序装入内容 ----
+    # ---- 第 2 层：按价值排序装入内容（pinned 优先）----
     remaining = budget - outline_tokens
     selected = []
     dropped = []
     excerpt_blocks = []
     excerpt_tokens = 0
 
-    for item in sorted(normalized, key=lambda entry: _value_score(entry, word_list)):
+    if pinned:
+        pinned_set = set(pinned)
+        pinned_items = [item for item in normalized if item['uid'] in pinned_set]
+        rest_items = [item for item in normalized if item['uid'] not in pinned_set]
+        result['pinned'] = [item['name'] for item in pinned_items if item['name']]
+        present = {item['uid'] for item in normalized}
+        result['pinned_missing'] = [uid for uid in pinned if uid not in present]
+        ordered = pinned_items + sorted(rest_items, key=lambda entry: _value_score(entry, word_list))
+    else:
+        ordered = sorted(normalized, key=lambda entry: _value_score(entry, word_list))
+
+    for item in ordered:
         if remaining <= 0:
             dropped.append(item['name'])
             continue

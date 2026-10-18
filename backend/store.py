@@ -1,7 +1,7 @@
 """持久化层：提示词档案、provider、卡片元数据、标签建议队列、用量台账。
 
 设计要点（设计文档 §4.2 / §4.3）：
-- 大对象一律落 `api.data_dir()` 下的文件；`ui_data` 只放索引与热缓存。
+- 大对象一律落 `api.private.dir()` 下的文件；`ui_data` 只放索引与热缓存。
 - 所有 `ui_data` 写入都通过 `_mutate()`：mutator **只原地修改子键并返回 `None`**。
   这是硬性约定——`PluginAPI.ui_data_update` 在 mutator 返回 dict 时会
   `entry.clear()` 后整体替换（`core/plugins/api.py:892-897`），会把 `config` /
@@ -17,6 +17,7 @@ import shutil
 import time
 from urllib.parse import urlparse
 
+from . import protocols
 from .core import profiles as profiles_core
 from .core.errors import (
     CODE_INVALID_PAYLOAD,
@@ -44,7 +45,9 @@ JSONL_COMPACT_BYTES = 8 * 1024 * 1024
 
 PROVIDER_ID_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,31}$')
 DEFAULT_BASE_URL = 'https://api.openai.com/v1'
-API_STYLES = ('openai', 'openai_compatible')
+
+#: 支持的 API 协议（唯一来源是 `backend/protocols.py`，这里只做本地引用以便校验）
+API_STYLES = protocols.PROTOCOLS
 
 API_KEY_SECRET_TEMPLATE = 'provider__{provider_id}__api_key'
 EXTRA_HEADERS_SECRET_TEMPLATE = 'provider__{provider_id}__extra_headers'
@@ -89,16 +92,14 @@ def normalize_provider(raw) -> dict:
     """规范化 provider 结构（坏值回落默认，不做校验失败）。"""
     data = raw if isinstance(raw, dict) else {}
     provider_id = str(data.get('id') or '').strip().lower()
-    api_style = str(data.get('api_style') or 'openai').strip().lower()
-    if api_style not in API_STYLES:
-        api_style = 'openai'
 
     return {
         'id': provider_id,
         'name': str(data.get('name') or provider_id),
         'base_url': str(data.get('base_url') or '').strip(),
         'model': str(data.get('model') or '').strip(),
-        'api_style': api_style,
+        # 协议：未知/缺失一律回落 openai_chat（`protocols.normalize_protocol`）
+        'api_style': protocols.normalize_protocol(data.get('api_style')),
         'connect_timeout': _to_int(data.get('connect_timeout'), 10, minimum=1, maximum=120),
         'request_timeout': _to_int(data.get('request_timeout'), 120, minimum=5, maximum=900),
         'max_retries': _to_int(data.get('max_retries'), 3, minimum=0, maximum=6),
@@ -141,7 +142,7 @@ class PluginStore:
     def data_dir(self) -> str:
         if not self._data_dir:
             try:
-                self._data_dir = str(self._api.data_dir() or '')
+                self._data_dir = str(self._api.private.dir() or '')
             except Exception:  # noqa: BLE001
                 self._data_dir = ''
         return self._data_dir
@@ -254,7 +255,7 @@ class PluginStore:
 
     def read_ui(self) -> dict:
         try:
-            data = self._api.ui_data_read()
+            data = self._api.private.read()
         except Exception:  # noqa: BLE001
             logger.debug('读取插件 ui_data 命名空间失败', exc_info=True)
             return {}
@@ -268,7 +269,7 @@ class PluginStore:
             return None
 
         try:
-            return bool(self._api.ui_data_update(_inner))
+            return bool(self._api.private.update(_inner))
         except Exception:  # noqa: BLE001
             logger.warning('写入插件 ui_data 命名空间失败', exc_info=True)
             return False
@@ -510,16 +511,12 @@ class PluginStore:
         return payload
 
     def _default_providers(self) -> dict:
-        """首次运行：用 `secret_schema` 的默认值生成一条 provider（不复制明文密钥）。"""
-        base_url = ''
-        model = ''
-        try:
-            base_url = str(self._api.get_secret('base_url') or '')
-            model = str(self._api.get_secret('model') or '')
-        except Exception:  # noqa: BLE001
-            logger.debug('读取默认 provider 配置失败', exc_info=True)
+        """首次运行：生成一条默认 provider。
 
-        base_url = base_url or DEFAULT_BASE_URL
+        `base_url` / `model` 已是**插件私有配置**（不再来自 `secret_schema`）：
+        主程序设置页只保留回退用的 `api_key`，地址与模型一律在插件 Provider 页维护。
+        """
+        base_url = DEFAULT_BASE_URL
         provider_id = provider_id_from_base_url(base_url)
         return {
             'schema_version': 1,
@@ -528,7 +525,7 @@ class PluginStore:
                 'id': provider_id,
                 'name': provider_id,
                 'base_url': base_url,
-                'model': model,
+                'model': '',
             })],
         }
 
@@ -626,7 +623,7 @@ class PluginStore:
 
     def _get_secret(self, key: str):
         try:
-            value = self._api.get_secret(key)
+            value = self._api.secrets.get(key)
         except Exception:  # noqa: BLE001
             logger.debug('读取密钥 %s 失败', key, exc_info=True)
             return None
@@ -634,14 +631,14 @@ class PluginStore:
 
     def _set_secret(self, key: str, value) -> bool:
         try:
-            return bool(self._api.set_secret(key, value))
+            return bool(self._api.secrets.set(key, value))
         except Exception:  # noqa: BLE001
             logger.warning('写入密钥 %s 失败', key, exc_info=True)
             return False
 
     def describe_secrets(self) -> dict:
         try:
-            payload = self._api.list_secrets()
+            payload = self._api.secrets.list()
         except Exception:  # noqa: BLE001
             logger.debug('读取密钥元数据失败', exc_info=True)
             return {}

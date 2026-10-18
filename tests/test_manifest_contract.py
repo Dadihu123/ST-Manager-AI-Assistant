@@ -524,8 +524,14 @@ def test_core_layer_stays_free_of_flask_and_main_app(manifest):
     assert offenders == []
 
 
-def test_only_summary_bridge_imports_main_app_modules(manifest):
-    """决策 Q5：只有 summary_bridge 允许导入主程序 `core.*`。"""
+def test_no_backend_module_imports_main_app_modules(manifest):
+    """插件后端**零越界**：不再有任何模块导入主程序 `core.*`。
+
+    历史：决策 Q5 曾允许 `summary_bridge.py` 导入 `core.data.ui_store` +
+    `core.services.card_service` 来写「概览」，因为主程序当时没有对应 API。
+    主程序的域命名空间已提供 `api.cards.read_note` / `write_note`，
+    该越界点已消除——本测试从此断言**零容忍**，防止它再被引入。
+    """
     pattern = re.compile(r'^\s*(?:import|from)\s+core\b', re.MULTILINE)
     offenders = []
     for dirpath, _dirnames, filenames in os.walk(os.path.join(ROOT, 'backend')):
@@ -536,7 +542,7 @@ def test_only_summary_bridge_imports_main_app_modules(manifest):
             with open(path, 'r', encoding='utf-8') as handle:
                 if pattern.search(handle.read()):
                     offenders.append(os.path.relpath(path, ROOT).replace('\\', '/'))
-    assert offenders == ['backend/summary_bridge.py']
+    assert offenders == [], f'插件后端不得导入主程序内部模块: {offenders}'
 
 
 # --------------------------------------------------------------- 前端契约
@@ -694,7 +700,9 @@ def test_manifest_passes_main_app_validator():
     assert parsed.plugin_id == 'stm-ai-assistant'
     assert parsed.api_version == 2
     assert parsed.manifest_version == 2
-    assert parsed.backend_jobs == ['ai.analyze']
+    assert parsed.backend_jobs == [
+        'ai.analyze', 'ai.wi_rewrite', 'ai.classify', 'ai.propose', 'ai.agent',
+    ]
     assert parsed.has_backend and parsed.has_frontend
     assert len(parsed.frontend_entries) == 4
     # 「新契约零警告」是最强断言：图标名、entries 子键、权限、hook 全部干净

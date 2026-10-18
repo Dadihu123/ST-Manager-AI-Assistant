@@ -152,19 +152,19 @@ def test_resolve_unknown_profile_raises(store):
 
 def test_profile_index_is_written_into_ui_namespace(store, api):
     store.sync_profile_index()
-    index = api.ui_data_read().get('prompt_index')
+    index = api.private.read().get('prompt_index')
     assert isinstance(index, list)
     assert all('system' not in item for item in index), '索引不应包含模板正文'
 
 
 def test_ui_mutation_preserves_foreign_keys(store, api):
     """C3 回归：store 的任何写入都不得清掉主程序管理的键。"""
-    api.ui_data_update(lambda entry: entry.update({'config': {'x': 1}, 'enabled': True}))
+    api.private.update(lambda entry: entry.update({'config': {'x': 1}, 'enabled': True}))
     store.sync_profile_index()
     store.record_usage({'prompt_tokens': 1, 'completion_tokens': 2})
     store.record_tag_suggestions([{'name': 'T'}], card_key='c1')
 
-    namespace = api.ui_data_read()
+    namespace = api.private.read()
     assert namespace['config'] == {'x': 1}
     assert namespace['enabled'] is True
 
@@ -301,7 +301,7 @@ def test_card_meta_ui_snapshot_is_size_limited(store, api):
     for index in range(20):
         store.update_card_meta(f'card-{index}', {'blob': 'x' * 20000})
 
-    snapshot = api.ui_data_read().get('card_meta') or {}
+    snapshot = api.private.read().get('card_meta') or {}
     size = len(json.dumps(snapshot, ensure_ascii=False).encode('utf-8'))
     assert size <= store_module.CARD_META_UI_BYTES_LIMIT
 
@@ -310,7 +310,7 @@ def test_card_meta_ui_snapshot_is_count_limited(store, api):
     for index in range(store_module.CARD_META_UI_LIMIT + 50):
         store.update_card_meta(f'card-{index}', {'n': index})
 
-    snapshot = api.ui_data_read().get('card_meta') or {}
+    snapshot = api.private.read().get('card_meta') or {}
     assert len(snapshot) <= store_module.CARD_META_UI_LIMIT
 
 

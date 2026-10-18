@@ -51,12 +51,36 @@ export function createClient(api) {
       call(`/providers/${encodeURIComponent(id)}/secrets`, { method: 'DELETE' }),
     testProvider: (id, model = '') =>
       call(`/providers/${encodeURIComponent(id)}/test`, { method: 'POST', body: { model } }),
+    listModels: (id, overrides = {}) =>
+      call(`/providers/${encodeURIComponent(id)}/models`, { method: 'POST', body: overrides }),
 
     preview: (payload) => call('/prompt/preview', { method: 'POST', body: payload }),
     validateTemplates: (templates) =>
       call('/prompt/validate', { method: 'POST', body: { templates } }),
 
     submitAnalyze: (payload) => call('/jobs/analyze', { method: 'POST', body: payload }),
+
+    // 世界书改写
+    listWorldbookEntries: (payload) =>
+      call('/wi/entries', { method: 'POST', body: payload }),
+    submitWiRewrite: (payload) =>
+      call('/jobs/wi-rewrite', { method: 'POST', body: payload }),
+
+    // 自动归类
+    listCategories: () => call('/categories'),
+    submitClassify: (payload) =>
+      call('/jobs/classify', { method: 'POST', body: payload }),
+
+    // 结构化提议（分析卡片库 → 提议分类与标签池）
+    previewProposalSample: (payload) =>
+      call('/proposal/sample', { method: 'POST', body: payload }),
+    submitProposal: (payload) =>
+      call('/jobs/propose', { method: 'POST', body: payload }),
+
+    // Agent（多轮：看目录 → 分批读 → 提交提议）
+    submitAgent: (payload) =>
+      call('/jobs/agent', { method: 'POST', body: payload }),
+
     job: (runId) => call(`/jobs/${encodeURIComponent(runId)}`),
     applyJob: (runId, payload = {}) =>
       call(`/jobs/${encodeURIComponent(runId)}/apply`, { method: 'POST', body: payload }),

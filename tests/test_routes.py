@@ -56,7 +56,7 @@ def test_status_reports_configuration(env):
 
     assert response.status_code == 200
     assert payload['success'] is True
-    assert payload['profiles']['count'] == 5
+    assert payload['profiles']['count'] == 9
     assert payload['providers']['count'] >= 1
     assert payload['config']['apply_mode'] == 'review'
 
@@ -103,7 +103,7 @@ def test_profiles_list_and_detail(env):
     client, _api, _store = env
     listing = client.get('/profiles').get_json()
     assert listing['success'] is True
-    assert len(listing['items']) == 5
+    assert len(listing['items']) == 9
 
     detail = client.get('/profiles/builtin-gpt').get_json()
     assert detail['profile']['id'] == 'builtin-gpt'
@@ -146,11 +146,11 @@ def test_profiles_delete_and_duplicate(env):
 def test_profiles_export_and_import(env):
     client, _api, _store = env
     exported = client.get('/profiles/export').get_json()
-    assert len(exported['profiles']) == 5
+    assert len(exported['profiles']) == 9
 
     imported = client.post('/profiles/import', json={'payload': exported}).get_json()
     assert imported['success'] is True
-    assert len(imported['imported']) == 5
+    assert len(imported['imported']) == 9
 
 
 def test_profiles_export_single_profile(env):
@@ -211,7 +211,7 @@ def test_prompt_validate_reports_unknown_variables(env):
 
 def test_providers_list_masks_secrets(env):
     client, api, _store = env
-    api.set_secret('provider__openai__api_key', 'sk-super-secret')
+    api.secrets.set('provider__openai__api_key', 'sk-super-secret')
 
     payload = client.get('/providers').get_json()
     dumped = json.dumps(payload, ensure_ascii=False)
@@ -255,8 +255,8 @@ def test_provider_secrets_404_for_unknown(env):
 
 def test_provider_test_reports_error_without_key(env):
     client, api, _store = env
-    api.set_secret('provider__openai__api_key', None)
-    api.set_secret('api_key', None)
+    api.secrets.set('provider__openai__api_key', None)
+    api.secrets.set('api_key', None)
 
     response = client.post('/providers/openai/test', json={})
     assert response.status_code == 409
@@ -266,7 +266,6 @@ def test_provider_test_reports_error_without_key(env):
 def test_provider_test_uses_injected_transport(env, monkeypatch):
     client, _api, _store = env
     probe_calls = []
-
     def fake_probe(provider, api_key, *, model='', transport=None, sleep=None):
         probe_calls.append({'provider': provider, 'model': model})
         return {'ok': True, 'latency_ms': 12, 'model': model or provider['model'],
@@ -278,6 +277,65 @@ def test_provider_test_uses_injected_transport(env, monkeypatch):
     assert payload['ok'] is True
     assert payload['latency_ms'] == 12
     assert probe_calls[0]['model'] == 'gpt-4o-mini'
+
+
+# ------------------------------------------------------------------ 模型列表
+
+
+def test_models_route_returns_list_from_injected_get(env, monkeypatch):
+    client, _api, store = env
+    captured = []
+
+    def fake_list_models(provider, api_key, *, extra_headers=None, transport=None):
+        captured.append({'provider': provider, 'api_key': api_key})
+        return {'ok': True, 'models': ['gpt-4o', 'gpt-4o-mini'],
+                'protocol': 'openai_chat', 'message': ''}
+
+    monkeypatch.setattr(routes_module.llm, 'list_models', fake_list_models)
+    payload = client.post('/providers/openai/models', json={}).get_json()
+
+    assert payload['success'] is True
+    assert payload['ok'] is True
+    assert payload['models'] == ['gpt-4o', 'gpt-4o-mini']
+    assert captured[0]['api_key'], '应解析出 provider 的密钥'
+
+
+def test_models_route_never_blocks_on_failure(env, monkeypatch):
+    """拉取失败必须返回 200 + ok=False，让 UI 退回手填模型名。"""
+    client, _api, _store = env
+    monkeypatch.setattr(
+        routes_module.llm, 'list_models',
+        lambda *a, **k: {'ok': False, 'models': [], 'protocol': 'openai_chat',
+                         'message': 'HTTP 404'},
+    )
+
+    response = client.post('/providers/openai/models', json={})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload['success'] is True
+    assert payload['ok'] is False
+    assert payload['models'] == []
+    assert payload['message'] == 'HTTP 404'
+
+
+def test_models_route_reports_missing_key_without_4xx(env):
+    client, api, _store = env
+    api.secrets.set('provider__openai__api_key', None)
+    api.secrets.set('api_key', None)
+
+    response = client.post('/providers/openai/models', json={})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload['ok'] is False
+    assert 'API Key' in payload['message']
+
+
+def test_models_route_404_for_unknown_provider(env):
+    client, _api, _store = env
+    response = client.post('/providers/nope/models', json={})
+    assert response.status_code == 404
 
 
 # ------------------------------------------------------------------ 预览
@@ -305,6 +363,32 @@ def test_preview_requires_card_id(env):
     client, _api, _store = env
     response = client.post('/prompt/preview', json={})
     assert response.status_code == 400
+
+
+def test_preview_returns_selector_summary_and_by_block(env):
+    client, _api, _store = env
+    payload = client.post('/prompt/preview', json={'card_id': 'Alice.png'}).get_json()
+
+    # 选择器摘要
+    assert 'selector' in payload
+    assert payload['selector']['spec']['worldbook']['mode'] == 'auto'
+    assert isinstance(payload['selector']['gaps'], list)
+
+    # token 明细：总账与骨架拆分
+    by_block = payload['tokens']['by_block']
+    assert by_block['total'] == payload['tokens']['total']
+    assert by_block['variables_total'] >= 0
+    assert by_block['template_overhead'] >= 0
+    # 至少 card.name 出现在明细里（默认内置档案引用了它）
+    names = [item['name'] for item in by_block['items']]
+    assert 'card.name' in names
+
+
+def test_preview_by_block_is_sorted_by_cost(env):
+    client, _api, _store = env
+    payload = client.post('/prompt/preview', json={'card_id': 'Alice.png'}).get_json()
+    costs = [item['tokens'] for item in payload['tokens']['by_block']['items']]
+    assert costs == sorted(costs, reverse=True)
 
 
 # ------------------------------------------------------------------ 作业提交
@@ -384,9 +468,12 @@ hashing = load_backend_submodule('core.hashing')
 
 
 def job_item_row(*, status='done', item_key='Alice.png', result_overrides=None, **row_overrides):
-    """构造 `plugin_job_items` 的一行。
+    """构造一条**已解析**的作业条目。
 
-    `status` / `item_key` 等是**行字段**，`result_overrides` 才是插件结果结构里的字段。
+    形状与主程序 `api.jobs.items()` 的返回一致（`job_store._row_to_item`）：
+    不是数据库原始行，`payload` / `result` 已是对象。
+
+    `status` / `item_key` 等是**条目字段**，`result_overrides` 才是插件结果结构里的字段。
     """
     result = {
         'card_id': 'Alice.png',
@@ -398,13 +485,16 @@ def job_item_row(*, status='done', item_key='Alice.png', result_overrides=None, 
     result.update(result_overrides or {})
 
     row = {
-        'item_key': item_key,
+        'run_id': 'run-1',
+        'key': item_key,
         'status': status,
         'seq': 0,
-        'payload_json': '{}',
-        'result_json': json.dumps(result, ensure_ascii=False),
+        'attempt': 1,
+        'payload': {},
+        'result': result,
         'error': '',
-        'updated_at': 0,
+        'created_at': 0.0,
+        'updated_at': 0.0,
     }
     row.update(row_overrides)
     return row
@@ -434,9 +524,10 @@ def test_apply_writes_summary_and_tags(tmp_path, monkeypatch):
 
     written = {}
     monkeypatch.setattr(routes_module.summary_bridge, 'write_summary',
-                        lambda store_obj, card_id, summary, ui_key='': written.update(
-                            {card_id: summary}) or {'ok': True, 'origin': 'ui_data',
-                                                    'ui_key': ui_key, 'message': ''})
+                        lambda api_obj, store_obj, card_id, summary, **kwargs: written.update(
+                            {card_id: summary}) or {'ok': True, 'origin': 'card_note',
+                                                    'ui_key': kwargs.get('ui_key') or card_id,
+                                                    'message': ''})
 
     payload = client.post('/jobs/run-1/apply', json={}).get_json()
 

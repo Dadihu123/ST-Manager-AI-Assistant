@@ -139,19 +139,14 @@ export function createProfiles(api, client, context) {
       user_prelude: '',
       user_suffix: '',
       assistant_prefill: '',
-      format_rules: {
-        json_only: true,
-        forbidden_wrappers: ['```json', '```'],
-        required_keys: ['summary', 'tags'],
-        strip_think: true,
-      },
-      length_rules: {
-        summary_min_chars: 0,
-        summary_max_chars: 300,
-        tags_min: 0,
-        tags_max: 8,
-        confidence_min: 0.5,
-      },
+      // 留空 → 渲染时用 outputSchemaOf() 的默认值（与后端 DEFAULT_OUTPUT_SCHEMA 对齐）
+      output_schema: null,
+      content_selector: null,
+      apply_actions: [
+        { from: 'summary', action: 'write_card_note' },
+        { from: 'tags', action: 'apply_tags', params: {} },
+        { from: 'suggested_new_tags', action: 'queue_suggestions' },
+      ],
       stop: [],
       temperature: 0.6,
       top_p: 1.0,
@@ -235,23 +230,26 @@ export function createProfiles(api, client, context) {
     );
 
     const rulesGrid = el('div', 'plugin-stm-ai-assistant-grid');
-    const formatRules = profile.format_rules || {};
-    const lengthRules = profile.length_rules || {};
+    // 输出 schema（v2：格式与长度规则已合并进来）
+    const schema = outputSchemaOf(profile);
+    const summaryProp = schema.properties.summary || {};
+    const tagsProp = schema.properties.tags || {};
 
-    fields.json_only = checkbox(formatRules.json_only !== false, '强制 JSON 输出');
-    fields.strip_think = checkbox(formatRules.strip_think !== false, '剥离思考段');
-    fields.wrappers = input((formatRules.forbidden_wrappers || []).join(','), 'text', '逗号分隔');
-    fields.required_keys = input((formatRules.required_keys || []).join(','), 'text', '逗号分隔');
-    fields.summary_min = numberInput(lengthRules.summary_min_chars, { min: 0, step: 1 });
-    fields.summary_max = numberInput(lengthRules.summary_max_chars, { min: 0, step: 1 });
-    fields.tags_min = numberInput(lengthRules.tags_min, { min: 0, step: 1 });
-    fields.tags_max = numberInput(lengthRules.tags_max, { min: 0, step: 1 });
-    fields.confidence = numberInput(lengthRules.confidence_min, { min: 0, max: 1, step: 0.05 });
+    fields.json_only = checkbox(schema.json_only !== false, '强制 JSON 输出');
+    fields.strip_think = checkbox(schema.strip_think !== false, '剥离思考段');
+    fields.wrappers = input((schema.forbidden_wrappers || []).join(','), 'text', '逗号分隔');
+    fields.required_fields = input((schema.required || []).join(','), 'text', '逗号分隔');
+    fields.summary_min = numberInput(summaryProp.min_chars || 0, { min: 0, step: 1 });
+    fields.summary_max = numberInput(summaryProp.max_chars || 0, { min: 0, step: 1 });
+    fields.tags_min = numberInput(tagsProp.min_items || 0, { min: 0, step: 1 });
+    fields.tags_max = numberInput(tagsProp.max_items || 0, { min: 0, step: 1 });
+    fields.confidence = numberInput(tagsProp.min_confidence || 0, { min: 0, max: 1, step: 0.05 });
     fields.temperature = numberInput(profile.temperature, { min: 0, max: 2, step: 0.05 });
     fields.top_p = numberInput(profile.top_p, { min: 0, max: 1, step: 0.05 });
     fields.max_tokens = numberInput(profile.max_tokens, { min: 1, step: 1 });
     fields.stop = textarea((profile.stop || []).join('\n'), 3);
     fields.extra_body = textarea(JSON.stringify(profile.extra_body || {}, null, 2), 4);
+    fields.output_schema = textarea(JSON.stringify(schema, null, 2), 14);
 
     rulesGrid.append(
       field('概览下限（字）', fields.summary_min),
@@ -275,7 +273,7 @@ export function createProfiles(api, client, context) {
     const formatGrid = el('div', 'plugin-stm-ai-assistant-grid');
     formatGrid.append(
       field('禁止的包裹', fields.wrappers, '逗号分隔，如 ```json,```'),
-      field('必需字段', fields.required_keys, '逗号分隔'),
+      field('必需字段', fields.required_fields, '逗号分隔'),
     );
 
     const stopGrid = el('div', 'plugin-stm-ai-assistant-grid');
@@ -284,20 +282,306 @@ export function createProfiles(api, client, context) {
       field('extra_body（JSON）', fields.extra_body, '合并进请求体，用于供应商特有参数'),
     );
 
+    // 高级：完整 schema 与写回动作。上面的控件改的是同一份 schema 的常用项，
+    // 这里给需要 enum / 嵌套对象 / 自定义动作的场景留出口。
+    const advanced = el('details', 'plugin-stm-ai-assistant-advanced');
+    advanced.append(el('summary', '', '高级：完整 output_schema 与写回动作'));
+    advanced.append(field(
+      'output_schema（JSON）', fields.output_schema,
+      '上面的字数/标签上限是这个对象里的摘要；手改后以这里为准',
+    ));
+    fields.apply_actions = textarea(
+      JSON.stringify(profile.apply_actions || [], null, 2), 8,
+    );
+    advanced.append(field(
+      'apply_actions（JSON）', fields.apply_actions,
+      '模型答完后按顺序执行的动作：write_card_note / apply_tags / write_card_fields / '
+      + 'write_worldbook / queue_suggestions / move_cards',
+    ));
+
+    const selectorBox = buildSelectorSection(profile);
+    const poolBox = buildTagPoolSection(profile);
+
     const actions = el('div', 'plugin-stm-ai-assistant-row');
-    const saveBtn = button('保存', 'is-primary', () => saveProfile(fields));
+    const saveBtn = button('保存', 'is-primary', () => saveProfile(fields, selectorBox, poolBox));
     const validateBtn = button('校验变量', 'is-secondary', () => validateTemplates(fields));
-    const previewBtn = button('用当前档案预览', 'is-secondary', () => previewWith(fields));
+    const previewBtn = button('用当前档案预览', 'is-secondary',
+      () => previewWith(fields, selectorBox, poolBox));
     actions.append(saveBtn, validateBtn, previewBtn);
 
     if (profile.updated_at) {
       actions.append(el('span', 'plugin-stm-ai-assistant-hint', `更新于 ${formatTime(profile.updated_at)}`));
     }
 
-    editorBox.append(basicGrid, promptGrid, toggles, formatGrid, rulesGrid, stopGrid, actions);
+    editorBox.append(
+      basicGrid, promptGrid, toggles, formatGrid, rulesGrid, stopGrid,
+      advanced, selectorBox, poolBox, actions,
+    );
   }
 
-  function collect(fields) {
+  // -------------------------------------------------------------- 内容选择器
+
+  const SELECTABLE_FIELDS = [
+    ['description', '简介'],
+    ['personality', '性格'],
+    ['scenario', '场景'],
+    ['first_mes', '开场白'],
+    ['mes_example', '对话示例'],
+    ['creator', '作者'],
+    ['creator_notes', '作者备注'],
+    ['system_prompt', '系统提示词'],
+    ['post_history_instructions', '历史后置指令'],
+    ['tags', '现有标签'],
+  ];
+
+  const EXTRA_OPTIONS = [
+    ['regex', '正则脚本（摘要）'],
+    ['st_scripts', '酒馆助手脚本（摘要）'],
+    ['local_note', '本地备注（主程序的「概览」）'],
+  ];
+
+  function selectorOf(profile) {
+    const raw = profile && profile.content_selector;
+    const spec = raw && typeof raw === 'object' ? raw : {};
+    return {
+      card_fields: Array.isArray(spec.card_fields)
+        ? spec.card_fields.slice()
+        : SELECTABLE_FIELDS.map(([name]) => name),
+      alternate_greetings: spec.alternate_greetings || { mode: 'none', indexes: [] },
+      extras: Array.isArray(spec.extras) ? spec.extras.slice() : [],
+      worldbook: spec.worldbook || { mode: 'auto', entry_uids: [], budget_tokens: 0 },
+    };
+  }
+
+  function buildSelectorSection(profile) {
+    const spec = selectorOf(profile);
+    const box = el('div', 'plugin-stm-ai-assistant-selector');
+
+    box.append(el('h4', '', '内容选择器'));
+    box.append(el('p', 'plugin-stm-ai-assistant-hint',
+      '决定哪些卡片信息真的进入提示词。未勾选的字段会渲染为空——'
+      + '如果模板引用了它，预览里会给出警告。勾了但模板没引用的也会提示，避免白花 token。'));
+
+    // ---- 正文字段 ----
+    const fieldRow = el('div', 'plugin-stm-ai-assistant-checks');
+    const fieldBoxes = {};
+    SELECTABLE_FIELDS.forEach(([name, label]) => {
+      const checked = spec.card_fields.includes(name);
+      fieldBoxes[name] = checkbox(checked, label);
+      fieldRow.append(fieldBoxes[name]);
+    });
+    box.append(el('div', 'plugin-stm-ai-assistant-label', '正文字段（名称始终发送）'), fieldRow);
+
+    // ---- 备用开场白 ----
+    const greetingsRow = el('div', 'plugin-stm-ai-assistant-row');
+    const greetingsModes = [
+      { value: 'none', label: '不发送' },
+      { value: 'all', label: '全部发送' },
+      { value: 'selected', label: '仅指定序号' },
+    ];
+    const greetingsMode = select(greetingsModes, spec.alternate_greetings.mode || 'none');
+    const greetingsIndexes = input(
+      (spec.alternate_greetings.indexes || []).map((n) => n + 1).join(','),
+      'text', '第几条，从 1 开始，逗号分隔',
+    );
+    greetingsRow.append(greetingsMode, greetingsIndexes);
+    box.append(el('div', 'plugin-stm-ai-assistant-label', '备用开场白'), greetingsRow);
+
+    // ---- 附加内容 ----
+    const extraRow = el('div', 'plugin-stm-ai-assistant-checks');
+    const extraBoxes = {};
+    EXTRA_OPTIONS.forEach(([name, label]) => {
+      extraBoxes[name] = checkbox(spec.extras.includes(name), label);
+      extraRow.append(extraBoxes[name]);
+    });
+    box.append(el('div', 'plugin-stm-ai-assistant-label', '附加内容（默认关闭，可能很长）'), extraRow);
+
+    // ---- 世界书 ----
+    const wiRow = el('div', 'plugin-stm-ai-assistant-row');
+    const wiModes = [
+      { value: 'auto', label: '按预算自动取样（推荐）' },
+      { value: 'selected', label: '仅指定条目（但仍受预算限制）' },
+      { value: 'none', label: '不发送' },
+    ];
+    const wiMode = select(wiModes, spec.worldbook.mode || 'auto');
+    const wiBudget = numberInput(spec.worldbook.budget_tokens || 0, { min: 0, step: 100 });
+    wiRow.append(wiMode, wiBudget);
+    box.append(
+      el('div', 'plugin-stm-ai-assistant-label', '世界书'),
+      wiRow,
+      el('p', 'plugin-stm-ai-assistant-hint',
+        '第二个输入框是 token 上限（0 = 用全局预算）。指定条目请到工作台的世界书列表里勾选。'),
+    );
+
+    editorControls = editorControls.concat([
+      greetingsMode, wiMode, wiBudget,
+      ...Object.values(fieldBoxes), ...Object.values(extraBoxes),
+    ]);
+
+    // 把引用挂到 box 上，供 collect 读取
+    box._selector = {
+      fieldBoxes, extraBoxes, greetingsMode, greetingsIndexes, wiMode, wiBudget,
+    };
+    return box;
+  }
+
+  // -------------------------------------------------------------- 标签池
+
+  const TAG_POOL_SOURCES = [
+    { value: 'library', label: '整个标签库（推荐）' },
+    { value: 'categories', label: '仅指定分类' },
+    { value: 'manual', label: '仅手动列表' },
+  ];
+
+  function poolOf(profile) {
+    const raw = profile && profile.tag_pool;
+    const spec = raw && typeof raw === 'object' ? raw : {};
+    return {
+      source: spec.source || 'library',
+      categories_include: spec.categories_include || [],
+      categories_exclude: spec.categories_exclude || [],
+      tags_include: spec.tags_include || [],
+      tags_exclude: spec.tags_exclude || [],
+      respect_isolated: spec.respect_isolated !== false,
+      budget_tokens: spec.budget_tokens == null ? 1200 : spec.budget_tokens,
+      allow_new_tags: spec.allow_new_tags !== false,
+      max_new_tags: spec.max_new_tags == null ? 5 : spec.max_new_tags,
+    };
+  }
+
+  function buildTagPoolSection(profile) {
+    const spec = poolOf(profile);
+    const box = el('div', 'plugin-stm-ai-assistant-selector');
+
+    box.append(el('h4', '', '标签池'));
+    box.append(el('p', 'plugin-stm-ai-assistant-hint',
+      '决定给模型看哪些标签、花多少 token。隔离分类会变成硬过滤——'
+      + '即使模型输出了这些标签也不会写进卡片。'));
+
+    const row = el('div', 'plugin-stm-ai-assistant-row');
+    const source = select(TAG_POOL_SOURCES, spec.source);
+    const budget = numberInput(spec.budget_tokens, { min: 0, step: 100 });
+    row.append(source, budget);
+    box.append(
+      el('div', 'plugin-stm-ai-assistant-label', '来源与预算（token）'),
+      row,
+      el('p', 'plugin-stm-ai-assistant-hint',
+        '预算按 token 而非条数控制；0 表示完全不注入标签库。'),
+    );
+
+    const grid = el('div', 'plugin-stm-ai-assistant-grid');
+    const categoriesInclude = input(spec.categories_include.join(','), 'text',
+      '逗号分隔；留空表示不限');
+    const categoriesExclude = input(spec.categories_exclude.join(','), 'text',
+      '逗号分隔；隔离分类会自动加入');
+    const tagsInclude = input(spec.tags_include.join(','), 'text', '逗号分隔，可追加库外标签');
+    const tagsExclude = input(spec.tags_exclude.join(','), 'text', '逗号分隔');
+    grid.append(
+      field('只取这些分类', categoriesInclude),
+      field('排除这些分类', categoriesExclude),
+      field('手动追加标签', tagsInclude),
+      field('手动排除标签', tagsExclude),
+    );
+    box.append(grid);
+
+    const toggles = el('div', 'plugin-stm-ai-assistant-row');
+    const respectIsolated = checkbox(spec.respect_isolated, '遵守主程序的隔离分类（硬过滤）');
+    const allowNew = checkbox(spec.allow_new_tags, '允许模型提议新标签');
+    const maxNew = numberInput(spec.max_new_tags, { min: 0, max: 20, step: 1 });
+    toggles.append(respectIsolated, allowNew, maxNew);
+    box.append(toggles);
+
+    editorControls = editorControls.concat([source, budget, maxNew, respectIsolated, allowNew]);
+
+    box._pool = {
+      source, budget, categoriesInclude, categoriesExclude, tagsInclude, tagsExclude,
+      respectIsolated, allowNew, maxNew,
+    };
+    return box;
+  }
+
+  function collectTagPool(box) {
+    if (!box || !box._pool) return null;
+    const refs = box._pool;
+    const splitList = (value) => String(value || '')
+      .split(/[,，\s]+/).map((item) => item.trim()).filter(Boolean);
+
+    return {
+      source: refs.source.value,
+      categories_include: splitList(refs.categoriesInclude.value),
+      categories_exclude: splitList(refs.categoriesExclude.value),
+      tags_include: splitList(refs.tagsInclude.value),
+      tags_exclude: splitList(refs.tagsExclude.value),
+      respect_isolated: refs.respectIsolated.querySelector('input').checked,
+      budget_tokens: Number(refs.budget.querySelector('input').value) || 0,
+      allow_new_tags: refs.allowNew.querySelector('input').checked,
+      max_new_tags: Number(refs.maxNew.querySelector('input').value) || 0,
+    };
+  }
+
+  function collectSelector(box) {    if (!box || !box._selector) return null;
+    const refs = box._selector;
+
+    const cardFields = SELECTABLE_FIELDS
+      .filter(([name]) => refs.fieldBoxes[name].querySelector('input').checked)
+      .map(([name]) => name);
+
+    const extras = EXTRA_OPTIONS
+      .filter(([name]) => refs.extraBoxes[name].querySelector('input').checked)
+      .map(([name]) => name);
+
+    const indexes = String(refs.greetingsIndexes.value || '')
+      .split(/[,，\s]+/)
+      .map((item) => Number(item) - 1)
+      .filter((n) => Number.isInteger(n) && n >= 0);
+
+    return {
+      card_fields: cardFields,
+      alternate_greetings: {
+        mode: refs.greetingsMode.value,
+        indexes: refs.greetingsMode.value === 'selected' ? indexes : [],
+      },
+      extras,
+      worldbook: {
+        mode: refs.wiMode.value,
+        // entry_uids 由工作台的世界书勾选同步，这里只保留已有值
+        entry_uids: ((state.current && state.current.content_selector || {})
+          .worldbook || {}).entry_uids || [],
+        budget_tokens: Number(refs.wiBudget.querySelector('input').value) || 0,
+      },
+    };
+  }
+
+  /** 取档案的 output_schema（缺省时给一份可用的默认，与后端 DEFAULT_OUTPUT_SCHEMA 对齐）。 */
+  function outputSchemaOf(profile) {
+    const raw = profile && profile.output_schema;
+    if (raw && typeof raw === 'object' && Object.keys(raw).length) {
+      return JSON.parse(JSON.stringify(raw));
+    }
+    return {
+      strip_think: true,
+      json_only: true,
+      forbidden_wrappers: ['```json', '```'],
+      required: ['summary', 'tags'],
+      properties: {
+        summary: { type: 'string', min_chars: 0, max_chars: 300 },
+        tags: {
+          type: 'array', min_items: 0, max_items: 8, min_confidence: 0.5,
+          order_by: 'confidence',
+          item: {
+            name: { type: 'string' },
+            confidence: { type: 'number', min: 0, max: 1 },
+          },
+        },
+        suggested_new_tags: {
+          type: 'array', max_items: 6,
+          item: { name: { type: 'string' }, reason: { type: 'string', max_chars: 200 } },
+        },
+      },
+    };
+  }
+
+  function collect(fields, selectorBox, poolBox) {
     const profile = Object.assign({}, state.current);
 
     profile.id = fields.id.value.trim().toLowerCase();
@@ -305,6 +589,12 @@ export function createProfiles(api, client, context) {
     profile.model_match = fields.model_match.value.trim() || '*';
     profile.priority = Number(fields.priority.querySelector('input').value) || 0;
     profile.missing_policy = fields.missing_policy.value;
+
+    const selector = collectSelector(selectorBox);
+    if (selector) profile.content_selector = selector;
+
+    const tagPool = collectTagPool(poolBox);
+    if (tagPool) profile.tag_pool = tagPool;
 
     profile.system_prelude = fields.system_prelude.value;
     profile.system = fields.system.value;
@@ -314,20 +604,48 @@ export function createProfiles(api, client, context) {
     profile.user_suffix = fields.user_suffix.value;
     profile.assistant_prefill = fields.assistant_prefill.value;
 
-    profile.format_rules = {
-      json_only: fields.json_only.querySelector('input').checked,
-      strip_think: fields.strip_think.querySelector('input').checked,
-      forbidden_wrappers: fields.wrappers.value.split(',').map((item) => item.trim()).filter(Boolean),
-      required_keys: fields.required_keys.value.split(',').map((item) => item.trim()).filter(Boolean),
-    };
+    // 输出 schema：以高级区里的完整 JSON 为基，再用常用控件覆盖其摘要项
+    let schema;
+    try {
+      schema = JSON.parse(fields.output_schema.value || '{}');
+    } catch (error) {
+      throw new Error(`output_schema 不是合法 JSON：${error.message}`);
+    }
 
-    profile.length_rules = {
-      summary_min_chars: Number(fields.summary_min.querySelector('input').value) || 0,
-      summary_max_chars: Number(fields.summary_max.querySelector('input').value) || 300,
-      tags_min: Number(fields.tags_min.querySelector('input').value) || 0,
-      tags_max: Number(fields.tags_max.querySelector('input').value) || 8,
-      confidence_min: Number(fields.confidence.querySelector('input').value) || 0,
-    };
+    schema.json_only = fields.json_only.querySelector('input').checked;
+    schema.strip_think = fields.strip_think.querySelector('input').checked;
+    schema.forbidden_wrappers = fields.wrappers.value
+      .split(',').map((item) => item.trim()).filter(Boolean);
+    schema.required = fields.required_fields.value
+      .split(',').map((item) => item.trim()).filter(Boolean);
+    schema.properties = schema.properties || {};
+
+    schema.properties.summary = Object.assign(
+      { type: 'string' },
+      schema.properties.summary || {},
+      {
+        min_chars: Number(fields.summary_min.querySelector('input').value) || 0,
+        max_chars: Number(fields.summary_max.querySelector('input').value) || 0,
+      },
+    );
+
+    schema.properties.tags = Object.assign(
+      { type: 'array', item: { name: { type: 'string' }, confidence: { type: 'number' } } },
+      schema.properties.tags || {},
+      {
+        min_items: Number(fields.tags_min.querySelector('input').value) || 0,
+        max_items: Number(fields.tags_max.querySelector('input').value) || 0,
+        min_confidence: Number(fields.confidence.querySelector('input').value) || 0,
+      },
+    );
+
+    profile.output_schema = schema;
+
+    try {
+      profile.apply_actions = JSON.parse(fields.apply_actions.value || '[]');
+    } catch (error) {
+      throw new Error(`apply_actions 不是合法 JSON：${error.message}`);
+    }
 
     profile.temperature = Number(fields.temperature.querySelector('input').value);
     profile.top_p = Number(fields.top_p.querySelector('input').value);
@@ -345,7 +663,7 @@ export function createProfiles(api, client, context) {
 
   async function validateTemplates(fields) {
     try {
-      const profile = collect(fields);
+      const profile = collect(fields, selectorBox, poolBox);
       const data = await client.validateTemplates([
         profile.system_prelude, profile.system, profile.system_suffix,
         profile.user_prelude, profile.user_template, profile.user_suffix,
@@ -372,13 +690,13 @@ export function createProfiles(api, client, context) {
     variableHint.textContent = `可用变量：${state.variables.join('、')}`;
   }
 
-  async function previewWith(fields) {
+  async function previewWith(fields, selectorBox, poolBox) {
     if (!context.selectedCardIds || !context.selectedCardIds.length) {
       api.host.toast('请先在工作台选择一张卡片', 3000, 'close');
       return;
     }
     try {
-      const profile = collect(fields);
+      const profile = collect(fields, selectorBox, poolBox);
       const data = await client.preview({
         card_id: context.selectedCardIds[0],
         profile_id: profile.id,
@@ -393,10 +711,10 @@ export function createProfiles(api, client, context) {
     }
   }
 
-  async function saveProfile(fields) {
+  async function saveProfile(fields, selectorBox, poolBox) {
     let profile;
     try {
-      profile = collect(fields);
+      profile = collect(fields, selectorBox, poolBox);
     } catch (error) {
       api.host.toast(error.message, 4000, 'close');
       return;

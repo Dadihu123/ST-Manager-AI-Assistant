@@ -23,13 +23,13 @@ def register(api):
     from . import routes as routes_module
 
     store = PluginStore(api)
-    api.log('info', 'stm-ai-assistant 开始装配')
+    api.log.info('stm-ai-assistant 开始装配')
 
     routes_module.register_routes(api, store)
     jobs_module.register_jobs(api, store)
     cli_module.register_cli(api, store)
 
-    # 首次运行初始化：写档案索引、按 secret_schema 生成默认 provider。
+    # 首次运行初始化：写档案索引、按 provider 配置生成默认条目。
     # 失败不阻断插件加载（降级为「设置页为空」，用户可手动创建）。
     try:
         store.sync_profile_index()
@@ -37,4 +37,4 @@ def register(api):
     except Exception:  # noqa: BLE001
         logger.warning('stm-ai-assistant 初始化失败', exc_info=True)
 
-    api.log('info', f'stm-ai-assistant 就绪：{len(store.list_profiles())} 个提示词档案')
+    api.log.info(f'stm-ai-assistant 就绪：{len(store.list_profiles())} 个提示词档案')

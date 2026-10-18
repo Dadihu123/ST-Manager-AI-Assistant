@@ -15,6 +15,9 @@ def test_builtin_profiles_cover_common_model_families():
     assert ids == {
         'builtin-default', 'builtin-gpt', 'builtin-claude',
         'builtin-deepseek', 'builtin-gemini',
+        # 世界书改写与自动归类是 task spec 的复用示例，也是内置任务
+        'builtin-wi-rewrite', 'builtin-classify', 'builtin-propose',
+        'builtin-agent',
     }
 
 
@@ -92,22 +95,45 @@ def test_validate_profile_requires_system_or_template():
     assert any('至少要有一个非空' in item for item in profiles.validate_profile(bad))
 
 
-def test_validate_profile_rejects_broken_length_rules():
+def test_validate_profile_rejects_broken_output_schema():
+    """schema 自身的自洽性：下限不能大于上限。"""
     bad = profiles.builtin_profile('builtin-default')
-    bad['length_rules'] = {'summary_min_chars': 500, 'summary_max_chars': 100,
-                           'tags_min': 9, 'tags_max': 3, 'confidence_min': 3}
+    bad['output_schema'] = {
+        'required': ['summary', 'nope'],
+        'properties': {
+            'summary': {'type': 'string', 'min_chars': 500, 'max_chars': 100},
+            'tags': {'type': 'array', 'min_items': 9, 'max_items': 3},
+        },
+    }
     errors = profiles.validate_profile(bad)
-    assert any('summary_min_chars' in item for item in errors)
-    assert any('tags_min' in item for item in errors)
-    assert any('confidence_min' in item for item in errors)
+    assert any('summary' in item and 'min_chars' in item for item in errors)
+    assert any('tags' in item and 'min_items' in item for item in errors)
+    assert any('nope' in item for item in errors), 'required 里的字段必须已声明'
+
+
+def test_validate_profile_rejects_unknown_apply_action():
+    bad = profiles.builtin_profile('builtin-default')
+    bad['apply_actions'] = [{'from': 'summary', 'action': 'do_something_weird'}]
+    errors = profiles.validate_profile(bad)
+    assert any('未知的应用动作' in item for item in errors)
+
+
+def test_validate_profile_rejects_action_with_undeclared_source():
+    """动作的来源字段必须已在 output_schema 里声明，否则永远取不到值。"""
+    bad = profiles.builtin_profile('builtin-default')
+    bad['apply_actions'] = [{'from': 'nonexistent_field', 'action': 'write_card_note'}]
+    errors = profiles.validate_profile(bad)
+    assert any('nonexistent_field' in item for item in errors)
 
 
 def test_normalize_profile_fills_defaults():
     data = profiles.normalize_profile({'id': 'my-profile'})
     assert data['model_match'] == '*'
     assert data['missing_policy'] == 'error'
-    assert data['format_rules']['json_only'] is True
-    assert data['length_rules']['summary_max_chars'] == 300
+    assert data['schema_version'] == 2, 'v2 一步到位，不做 v1 迁移'
+    assert data['output_schema']['json_only'] is True
+    assert data['output_schema']['properties']['summary']['max_chars'] == 300
+    assert data['apply_actions'], '默认带三个动作'
     assert data['stop'] == []
 
 

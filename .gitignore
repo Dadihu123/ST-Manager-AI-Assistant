@@ -1,5 +1,8 @@
-# 运行时私有目录（api.data_dir()）：档案、缓存、用量、导出
+# 运行时私有目录（api.private.dir()）：档案、缓存、用量、导出
 data/
+
+# 运行时落点（若插件在未初始化 data_dir 时被装配，会回退到仓库根）
+providers.json
 
 # Python
 __pycache__/

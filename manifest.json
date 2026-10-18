@@ -12,7 +12,11 @@
     "entry": "backend",
     "register": "register",
     "jobs": [
-      "ai.analyze"
+      "ai.analyze",
+      "ai.wi_rewrite",
+      "ai.classify",
+      "ai.propose",
+      "ai.agent"
     ],
     "hooks": []
   },
@@ -207,18 +211,8 @@
       "api_key": {
         "type": "string",
         "title": "默认 Provider 的 API Key",
-        "description": "也可在插件工作台的「Provider」页为每个供应商单独配置。",
+        "description": "这是「回退密钥」：仅当默认 Provider 没有自己的专属密钥时生效；在插件设置页为某个 Provider 单独填写的密钥会覆盖它。地址与模型请到插件的 Provider 页配置。",
         "secret": true
-      },
-      "base_url": {
-        "type": "string",
-        "title": "默认 Provider 的 API 地址",
-        "default": "https://api.openai.com/v1"
-      },
-      "model": {
-        "type": "string",
-        "title": "默认 Provider 的模型",
-        "default": ""
       }
     }
   }

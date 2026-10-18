@@ -14,11 +14,17 @@ import time
 from flask import jsonify, request
 
 from . import config as config_module
+from . import jobs as jobs_module
 from . import llm
 from . import preview as preview_module
 from . import summary_bridge
+from .core import agent as agent_core
+from .core import classify as classify_core
 from .core import hashing
+from .core import proposal as proposal_core
 from .core import prompt as prompt_core
+from .core import wicheck as wicheck_core
+from .core import tokens as tokens_core
 from .core.errors import (
     CODE_INVALID_PAYLOAD,
     CODE_JOB_NOT_FOUND,
@@ -27,6 +33,10 @@ from .core.errors import (
 )
 from .jobs import (
     JOB_ANALYZE,
+    JOB_AGENT,
+    JOB_CLASSIFY,
+    JOB_PROPOSE,
+    JOB_WI_REWRITE,
     MODE_BOTH,
     SECRET_REF_TEMPLATE,
     VALID_MODES,
@@ -80,51 +90,19 @@ def _body() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def _row_to_dict(row) -> dict:
-    if row is None:
-        return {}
-    if hasattr(row, 'keys'):
-        return {key: row[key] for key in row.keys()}
-    return {}
-
-
 def _load_job_items(api, run_id: str, *, limit: int = APPLY_ITEM_LIMIT) -> list:
     """读取作业的全部条目。
 
-    `PluginAPI.get_job()` 固定分页（`items_limit=200`，见 `core/plugins/jobs.py:262-285`），
-    审批写回需要完整列表，因此这里用只读 SQL 补齐（`api.db()` 为 Provisional，仅 SELECT）。
+    `api.jobs.get()` 的条目是分页的，审批写回需要完整列表，
+    因此这里走 `api.jobs.items()`（`limit=0` 即不设上限，内部仍受单作业上限保护）。
     """
-    conn = api.db()
     try:
-        rows = conn.execute(
-            '''
-            SELECT item_key, status, seq, payload_json, result_json, error, updated_at
-            FROM plugin_job_items
-            WHERE run_id = ?
-            ORDER BY seq
-            LIMIT ?
-            ''',
-            (str(run_id), int(limit)),
-        ).fetchall()
-    finally:
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
+        items = api.jobs.items(run_id, limit=limit)
+    except Exception:  # noqa: BLE001 - 作业不存在/越权时按空列表处理
+        logger.debug('读取作业条目失败: %s', run_id, exc_info=True)
+        return []
 
-    items = []
-    for row in rows:
-        entry = _row_to_dict(row)
-        try:
-            entry['payload'] = json.loads(entry.pop('payload_json', '') or '{}')
-        except (TypeError, ValueError):
-            entry['payload'] = {}
-        try:
-            entry['result'] = json.loads(entry.pop('result_json', '') or '{}')
-        except (TypeError, ValueError):
-            entry['result'] = {}
-        items.append(entry)
-    return items
+    return [item for item in (items or []) if isinstance(item, dict)]
 
 
 def _normalize_card_ids(raw) -> list:
@@ -149,7 +127,7 @@ def register_routes(api, store) -> None:
 
     # ---------------------------------------------------------- 状态与诊断
 
-    @api.route('/status', ['GET'])
+    @api.http.route('/status', ['GET'])
     @_handle_errors
     def get_status():
         config = config_module.load_config(api)
@@ -172,7 +150,7 @@ def register_routes(api, store) -> None:
             outbound_acknowledged=store.outbound_acknowledged(),
         )
 
-    @api.route('/health', ['GET'])
+    @api.http.route('/health', ['GET'])
     @_handle_errors
     def get_health():
         """自检：概览 bridge、密钥、provider 是否就绪。"""
@@ -185,7 +163,7 @@ def register_routes(api, store) -> None:
         key_ready = bool(
             default_provider and (default_provider.get('has_api_key') or default_provider.get('has_fallback_key'))
         )
-        bridge = summary_bridge.read_summary('__probe__')
+        bridge = summary_bridge.read_summary(api, '__probe__')
 
         return _ok(
             checks={
@@ -203,47 +181,48 @@ def register_routes(api, store) -> None:
             },
         )
 
-    @api.route('/cards', ['GET'])
+    @api.http.route('/cards', ['GET'])
     @_handle_errors
     def list_cards():
-        """卡片候选列表（前端未提供选中集合时的兜底）。"""
+        """卡片候选列表（前端未提供选中集合时的兜底）。
+
+        走 `api.cards.list()`（宿主索引查询），不再裸查 `card_metadata`。
+        """
         limit = max(1, min(int(request.args.get('limit', CARD_LIST_LIMIT) or CARD_LIST_LIMIT),
                            CARD_LIST_LIMIT))
-        keyword = str(request.args.get('q') or '').strip().lower()
+        keyword = str(request.args.get('q') or '').strip()
 
-        conn = api.db()
         try:
-            rows = conn.execute(
-                'SELECT id, char_name, tags FROM card_metadata ORDER BY char_name LIMIT ?',
-                (CARD_LIST_LIMIT,),
-            ).fetchall()
-        finally:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
+            result = api.cards.list(query=keyword, limit=limit)
+        except Exception:  # noqa: BLE001 - 索引未就绪时降级为空列表
+            logger.warning('读取卡片候选列表失败', exc_info=True)
+            return _ok(items=[], total=0)
 
         items = []
-        for row in rows:
-            entry = _row_to_dict(row)
-            card_id = str(entry.get('id') or '')
-            name = str(entry.get('char_name') or card_id)
-            if keyword and keyword not in name.lower() and keyword not in card_id.lower():
+        for entry in (result.get('items') or []):
+            if not isinstance(entry, dict):
                 continue
-            try:
-                tags = json.loads(entry.get('tags') or '[]')
-            except (TypeError, ValueError):
-                tags = []
-            items.append({'card_id': card_id, 'name': name,
-                          'tags': tags if isinstance(tags, list) else []})
-            if len(items) >= limit:
-                break
+            card_id = str(entry.get('id') or entry.get('card_id') or '')
+            if not card_id:
+                continue
+            name = str(entry.get('char_name') or entry.get('name') or card_id)
+            tags = entry.get('tags')
+            if isinstance(tags, str):
+                try:
+                    tags = json.loads(tags or '[]')
+                except (TypeError, ValueError):
+                    tags = []
+            items.append({
+                'card_id': card_id,
+                'name': name,
+                'tags': tags if isinstance(tags, list) else [],
+            })
 
-        return _ok(items=items, total=len(items))
+        return _ok(items=items, total=int(result.get('total') or len(items)))
 
     # ---------------------------------------------------------- 提示词档案
 
-    @api.route('/profiles', ['GET'])
+    @api.http.route('/profiles', ['GET'])
     @_handle_errors
     def list_profiles():
         profiles = store.list_profiles()
@@ -262,7 +241,7 @@ def register_routes(api, store) -> None:
             active=store.active_profile_id(),
         )
 
-    @api.route('/profiles/<profile_id>', ['GET'])
+    @api.http.route('/profiles/<profile_id>', ['GET'])
     @_handle_errors
     def get_profile(profile_id):
         profile = store.get_profile(profile_id)
@@ -270,19 +249,19 @@ def register_routes(api, store) -> None:
             return _fail('profile_not_found', f'提示词档案不存在: {profile_id}', http_status=404)
         return _ok(profile=profile)
 
-    @api.route('/profiles', ['POST'])
+    @api.http.route('/profiles', ['POST'])
     @_handle_errors
     def save_profile():
         payload = _body()
         profile = store.save_profile(payload.get('profile', payload))
         return _ok(profile=profile)
 
-    @api.route('/profiles/<profile_id>', ['DELETE'])
+    @api.http.route('/profiles/<profile_id>', ['DELETE'])
     @_handle_errors
     def delete_profile(profile_id):
         return _ok(**store.delete_profile(profile_id))
 
-    @api.route('/profiles/<profile_id>/duplicate', ['POST'])
+    @api.http.route('/profiles/<profile_id>/duplicate', ['POST'])
     @_handle_errors
     def duplicate_profile(profile_id):
         payload = _body()
@@ -292,7 +271,7 @@ def register_routes(api, store) -> None:
         )
         return _ok(profile=profile)
 
-    @api.route('/profiles/active', ['POST'])
+    @api.http.route('/profiles/active', ['POST'])
     @_handle_errors
     def set_active_profile():
         payload = _body()
@@ -302,17 +281,17 @@ def register_routes(api, store) -> None:
         store.set_active_profile(profile_id)
         return _ok(active=profile_id)
 
-    @api.route('/profiles/reset', ['POST'])
+    @api.http.route('/profiles/reset', ['POST'])
     @_handle_errors
     def reset_profiles():
         return _ok(**store.reset_profiles())
 
-    @api.route('/profiles/export', ['GET'])
+    @api.http.route('/profiles/export', ['GET'])
     @_handle_errors
     def export_profiles():
         return _ok(**store.export_profiles(str(request.args.get('profile_id') or '')))
 
-    @api.route('/profiles/import', ['POST'])
+    @api.http.route('/profiles/import', ['POST'])
     @_handle_errors
     def import_profiles():
         payload = _body()
@@ -320,29 +299,29 @@ def register_routes(api, store) -> None:
 
     # ---------------------------------------------------------- provider
 
-    @api.route('/providers', ['GET'])
+    @api.http.route('/providers', ['GET'])
     @_handle_errors
     def list_providers():
         return _ok(items=store.describe_providers())
 
-    @api.route('/providers', ['POST'])
+    @api.http.route('/providers', ['POST'])
     @_handle_errors
     def save_provider():
         payload = _body()
         provider = store.save_provider(payload.get('provider', payload))
         return _ok(provider=provider)
 
-    @api.route('/providers/<provider_id>', ['DELETE'])
+    @api.http.route('/providers/<provider_id>', ['DELETE'])
     @_handle_errors
     def delete_provider(provider_id):
         return _ok(**store.delete_provider(provider_id))
 
-    @api.route('/providers/<provider_id>/default', ['POST'])
+    @api.http.route('/providers/<provider_id>/default', ['POST'])
     @_handle_errors
     def set_default_provider(provider_id):
         return _ok(**store.set_default_provider(provider_id))
 
-    @api.route('/providers/<provider_id>/secrets', ['POST'])
+    @api.http.route('/providers/<provider_id>/secrets', ['POST'])
     @_handle_errors
     def save_provider_secrets(provider_id):
         payload = _body()
@@ -353,7 +332,7 @@ def register_routes(api, store) -> None:
         )
         return _ok(result=result)
 
-    @api.route('/providers/<provider_id>/secrets', ['DELETE'])
+    @api.http.route('/providers/<provider_id>/secrets', ['DELETE'])
     @_handle_errors
     def clear_provider_secrets(provider_id):
         if store.get_provider(provider_id) is None:
@@ -361,7 +340,7 @@ def register_routes(api, store) -> None:
         store.clear_provider_secrets(provider_id)
         return _ok(cleared=True)
 
-    @api.route('/providers/<provider_id>/test', ['POST'])
+    @api.http.route('/providers/<provider_id>/test', ['POST'])
     @_handle_errors
     def test_provider(provider_id):
         provider = store.get_provider(provider_id)
@@ -386,9 +365,43 @@ def register_routes(api, store) -> None:
 
         return _ok(**result)
 
+    @api.http.route('/providers/<provider_id>/models', ['POST'])
+    @_handle_errors
+    def list_provider_models(provider_id):
+        """拉取该 provider 的模型列表（`GET /models`）。
+
+        **永不因拉取失败而返回 4xx**：很多第三方网关不实现 `/models`，
+        拉取失败只是让 UI 退回手填，不该阻塞配置。
+        """
+        provider = store.get_provider(provider_id)
+        if provider is None:
+            return _fail('provider_not_found', f'provider 不存在: {provider_id}', http_status=404)
+
+        api_key = store.resolve_provider_key(provider['id'])
+        if not api_key:
+            return _ok(
+                ok=False, models=[], protocol=provider.get('api_style', ''),
+                message=f'provider「{provider["id"]}」未配置 API Key',
+            )
+
+        payload = _body()
+        base_url = str(payload.get('base_url') or provider.get('base_url') or '')
+        candidate = dict(provider)
+        if base_url:
+            candidate['base_url'] = base_url
+        if payload.get('api_style'):
+            candidate['api_style'] = payload['api_style']
+
+        result = llm.list_models(
+            candidate, api_key,
+            extra_headers=store.resolve_provider_headers(provider['id']),
+            transport=_injected_get(),
+        )
+        return _ok(**result)
+
     # ---------------------------------------------------------- 预览与提交
 
-    @api.route('/prompt/preview', ['POST'])
+    @api.http.route('/prompt/preview', ['POST'])
     @_handle_errors
     def preview_prompt():
         payload = _body()
@@ -403,7 +416,7 @@ def register_routes(api, store) -> None:
         )
         return _ok(**result)
 
-    @api.route('/jobs/analyze', ['POST'])
+    @api.http.route('/jobs/analyze', ['POST'])
     @_handle_errors
     def submit_analyze():
         payload = _body()
@@ -442,12 +455,12 @@ def register_routes(api, store) -> None:
         sample_cards = []
 
         for card_id in card_ids:
-            card = api.read_card(card_id)
+            card = api.cards.read(card_id)
             if not isinstance(card, dict):
                 skipped.append({'card_id': card_id, 'reason': 'card_unreadable'})
                 continue
 
-            ui_key = summary_bridge.resolve_key(card_id)
+            ui_key = summary_bridge.resolve_key(api, card_id)
             content_hash = hashing.card_content_hash(card)
             meta = store.get_card_meta(ui_key)
 
@@ -494,7 +507,7 @@ def register_routes(api, store) -> None:
         }
 
         try:
-            run_id = api.submit_job(JOB_ANALYZE, items=items, payload=job_payload)
+            run_id = api.jobs.submit(JOB_ANALYZE, items=items, payload=job_payload)
         except Exception as exc:  # noqa: BLE001 - 主程序用 job_already_running 表达并发冲突
             message = str(exc)
             if '已在运行' in message or 'already' in message.lower():
@@ -512,27 +525,419 @@ def register_routes(api, store) -> None:
             apply_mode=apply_mode,
         )
 
+    # ---------------------------------------------------------- 世界书改写
+
+    @api.http.route('/wi/entries', ['POST'])
+    @_handle_errors
+    def list_wi_entries():
+        """列出某个世界书来源的条目（供前端做条目选择）。"""
+        payload = _body()
+        card_id = str(payload.get('card_id') or '')
+        source = jobs_module.resolve_wi_source(card_id, payload.get('worldbook_source'))
+
+        book = api.worldbook.read(source)
+        if not isinstance(book, dict):
+            return _fail('worldbook_unreadable', '无法读取世界书', http_status=404)
+
+        entries = book.get('entries')
+        if isinstance(entries, dict):
+            entries = list(entries.values())
+        if not isinstance(entries, list):
+            return _fail('worldbook_unreadable', '世界书结构异常（无 entries）')
+
+        items = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            content = str(entry.get('content') or '')
+            items.append({
+                'uid': str(entry.get('uid') or entry.get('id') or ''),
+                'name': str(entry.get('comment') or entry.get('name') or ''),
+                'keys': [str(item) for item in (entry.get('keys') or [])],
+                'tokens': tokens_core.estimate(content),
+                'enabled': not bool(entry.get('disable')),
+                'constant': bool(entry.get('constant')),
+                'content_preview': content[:200],
+            })
+
+        return _ok(
+            items=items,
+            total=len(items),
+            source_revision=str(book.get('source_revision') or ''),
+        )
+
+    @api.http.route('/jobs/wi-rewrite', ['POST'])
+    @_handle_errors
+    def submit_wi_rewrite():
+        """提交世界书改写作业（一个作业项 = 一条条目）。"""
+        payload = _body()
+        config = config_module.load_config(api)
+
+        card_id = str(payload.get('card_id') or '')
+        source = jobs_module.resolve_wi_source(card_id, payload.get('worldbook_source'))
+        if not card_id and not source.get('file_path'):
+            return _fail(CODE_INVALID_PAYLOAD, '需要 card_id 或 worldbook_source')
+
+        entry_uids = payload.get('entry_uids')
+        if isinstance(entry_uids, str):
+            entry_uids = [entry_uids]
+        entry_uids = [str(item) for item in (entry_uids or []) if str(item or '').strip()]
+
+        provider = store.resolve_provider(str(payload.get('provider_id') or ''))
+        api_key = store.resolve_provider_key(provider['id'])
+        if not api_key:
+            return _fail(
+                CODE_SECRET_MISSING,
+                f'provider「{provider["id"]}」未配置 API Key，请先在插件设置里填写',
+                http_status=409,
+                detail={'provider_id': provider['id'],
+                        'secret_key': api_key_secret_name(provider['id'])},
+            )
+
+        model_name = str(payload.get('model') or provider.get('model') or '')
+        profile = store.resolve_profile(str(payload.get('profile_id') or ''), model_name)
+
+        apply_mode = str(payload.get('apply_mode') or config['apply_mode']).strip().lower()
+        if apply_mode not in ('auto', 'review'):
+            apply_mode = config['apply_mode']
+
+        # 读一次世界书，把条目名 / token 一并带上（前端与结果页要用）
+        book = api.worldbook.read(source)
+        if not isinstance(book, dict):
+            return _fail('worldbook_unreadable', '无法读取世界书', http_status=404)
+
+        entries = book.get('entries')
+        if isinstance(entries, dict):
+            entries = list(entries.values())
+        if not isinstance(entries, list):
+            return _fail('worldbook_unreadable', '世界书结构异常（无 entries）')
+
+        wanted = set(entry_uids)
+        items = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            uid = str(entry.get('uid') or entry.get('id') or '')
+            if not uid:
+                continue
+            if wanted and uid not in wanted:
+                continue
+            if entry.get('disable') is True:
+                continue
+            content = str(entry.get('content') or '')
+            if not content.strip():
+                continue
+            items.append({
+                'key': uid,
+                'card_id': card_id,
+                'entry_uid': uid,
+                'entry_name': str(entry.get('comment') or entry.get('name') or ''),
+                'tokens': tokens_core.estimate(content),
+            })
+
+        if not items:
+            return _fail(CODE_INVALID_PAYLOAD,
+                         '没有可改写的条目（未选、已停用或内容为空）', http_status=400)
+
+        job_payload = {
+            'provider_id': provider['id'],
+            'model': model_name,
+            'profile_id': str(profile.get('id') or ''),
+            'apply_mode': apply_mode,
+            'dry_run': bool(payload.get('dry_run')),
+            'force': bool(payload.get('force')),
+            'target_format': str(payload.get('target_format') or 'yaml'),
+            'worldbook_source': source,
+            'secret_ref': SECRET_REF_TEMPLATE.format(provider_id=provider['id']),
+        }
+
+        try:
+            run_id = api.jobs.submit(JOB_WI_REWRITE, items=items, payload=job_payload)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if '已在运行' in message or 'already' in message.lower():
+                return _fail('job_already_running', message, http_status=409)
+            raise
+
+        return _ok(
+            run_id=run_id,
+            total=len(items),
+            profile={'id': profile.get('id'), 'name': profile.get('name')},
+            provider={'id': provider.get('id'), 'model': model_name},
+            apply_mode=apply_mode,
+            target_format=job_payload['target_format'],
+        )
+
+    # ---------------------------------------------------------- 自动归类
+
+    @api.http.route('/categories', ['GET'])
+    @_handle_errors
+    def list_categories():
+        """列出主程序现有的分类（供归类方案做初始值）。"""
+        try:
+            items = api.cards.list_categories()
+        except Exception:  # noqa: BLE001 - 索引不可用时降级为空
+            logger.warning('读取分类列表失败', exc_info=True)
+            items = []
+        return _ok(items=[str(item) for item in (items or []) if str(item or '').strip()])
+
+    @api.http.route('/jobs/classify', ['POST'])
+    @_handle_errors
+    def submit_classify():
+        """提交自动归类作业。"""
+        payload = _body()
+        config = config_module.load_config(api)
+
+        card_ids = _normalize_card_ids(payload.get('card_ids'))
+        if not card_ids:
+            return _fail(CODE_INVALID_PAYLOAD, 'card_ids 不能为空')
+
+        scheme = classify_core.normalize_scheme(payload.get('scheme'))
+        allow_new = bool(payload.get('allow_new_category'))
+        if not scheme and not allow_new:
+            return _fail(
+                CODE_INVALID_PAYLOAD,
+                '分类方案为空；请先选择分类，或开启「允许模型新建分类」',
+            )
+
+        provider = store.resolve_provider(str(payload.get('provider_id') or ''))
+        api_key = store.resolve_provider_key(provider['id'])
+        if not api_key:
+            return _fail(
+                CODE_SECRET_MISSING,
+                f'provider「{provider["id"]}」未配置 API Key，请先在插件设置里填写',
+                http_status=409,
+                detail={'provider_id': provider['id'],
+                        'secret_key': api_key_secret_name(provider['id'])},
+            )
+
+        model_name = str(payload.get('model') or provider.get('model') or '')
+        profile = store.resolve_profile(str(payload.get('profile_id') or ''), model_name)
+
+        apply_mode = str(payload.get('apply_mode') or config['apply_mode']).strip().lower()
+        if apply_mode not in ('auto', 'review'):
+            apply_mode = config['apply_mode']
+
+        items = []
+        skipped = []
+        for card_id in card_ids:
+            card = api.cards.read(card_id)
+            if not isinstance(card, dict):
+                skipped.append({'card_id': card_id, 'reason': 'card_unreadable'})
+                continue
+            items.append({
+                'key': summary_bridge.resolve_key(api, card_id),
+                'card_id': card_id,
+                'name': str((hashing.card_data_block(card) or {}).get('name') or ''),
+                'category': str(payload.get('current_category') or ''),
+            })
+
+        if not items:
+            return _ok(run_id='', total=0, skipped=len(skipped), details=skipped,
+                       message='没有可归类的卡片')
+
+        job_payload = {
+            'provider_id': provider['id'],
+            'model': model_name,
+            'profile_id': str(profile.get('id') or ''),
+            'apply_mode': apply_mode,
+            'dry_run': bool(payload.get('dry_run')),
+            'force': bool(payload.get('force')),
+            'scheme': scheme,
+            'allow_new_category': allow_new,
+            'confidence_min': payload.get('confidence_min'),
+            'secret_ref': SECRET_REF_TEMPLATE.format(provider_id=provider['id']),
+        }
+
+        try:
+            run_id = api.jobs.submit(JOB_CLASSIFY, items=items, payload=job_payload)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if '已在运行' in message or 'already' in message.lower():
+                return _fail('job_already_running', message, http_status=409)
+            raise
+
+        return _ok(
+            run_id=run_id,
+            total=len(items),
+            skipped=len(skipped),
+            details=skipped[:50],
+            scheme_size=len(scheme),
+            profile={'id': profile.get('id'), 'name': profile.get('name')},
+            provider={'id': provider.get('id'), 'model': model_name},
+            apply_mode=apply_mode,
+        )
+
+    # ---------------------------------------------------------- 结构化提议
+
+    @api.http.route('/proposal/sample', ['POST'])
+    @_handle_errors
+    def preview_proposal_sample():
+        """预览采样结果（不调 LLM、不写任何状态）。"""
+        payload = _body()
+        options = payload.get('options') or {}
+        config = config_module.load_config(api)
+
+        profile = store.get_profile('builtin-propose')
+        if not isinstance(profile, dict):
+            return _fail(CODE_INVALID_PAYLOAD, '找不到结构提议任务规格')
+
+        bundle = jobs_module.build_proposal_messages(
+            api, store, profile, config, options=options,
+        )
+        sample = bundle['sample']
+
+        return _ok(
+            sample={
+                'sampled': sample['sampled'],
+                'total': sample['total'],
+                'scanned': bundle['scan']['scanned'],
+                'capped': bundle['scan']['capped'],
+                'tokens': sample['tokens'],
+                'budget_tokens': sample['budget_tokens'],
+                'category_coverage': sample['category_coverage'],
+            },
+            items=[
+                {
+                    'card_id': item.get('card_id'),
+                    'name': (item.get('brief') or {}).get('name'),
+                    'tags': (item.get('brief') or {}).get('tags') or [],
+                    'category': item.get('category') or '',
+                }
+                for item in sample['items']
+            ],
+            existing={
+                'categories': bundle['categories'],
+                'tag_count': len(bundle['tags']),
+            },
+            # 采样清单本身也给出来，方便用户核对 AI 到底看到了什么
+            sample_text=proposal_core.format_sample(sample['items']),
+        )
+
+    @api.http.route('/jobs/propose', ['POST'])
+    @_handle_errors
+    def submit_propose():
+        """提交结构化提议作业（一次 LLM 调用，产出分类体系与标签池）。"""
+        payload = _body()
+
+        provider = store.resolve_provider(str(payload.get('provider_id') or ''))
+        api_key = store.resolve_provider_key(provider['id'])
+        if not api_key:
+            return _fail(
+                CODE_SECRET_MISSING,
+                f'provider「{provider["id"]}」未配置 API Key，请先在插件设置里填写',
+                http_status=409,
+                detail={'provider_id': provider['id'],
+                        'secret_key': api_key_secret_name(provider['id'])},
+            )
+
+        model_name = str(payload.get('model') or provider.get('model') or '')
+        options = proposal_core.normalize_options(payload.get('options'))
+
+        job_payload = {
+            'provider_id': provider['id'],
+            'model': model_name,
+            'profile_id': str(payload.get('profile_id') or 'builtin-propose'),
+            'options': options,
+            'secret_ref': SECRET_REF_TEMPLATE.format(provider_id=provider['id']),
+        }
+
+        try:
+            run_id = api.jobs.submit(
+                JOB_PROPOSE,
+                items=[{'key': 'proposal', 'payload': {}}],
+                payload=job_payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if '已在运行' in message or 'already' in message.lower():
+                return _fail('job_already_running', message, http_status=409)
+            raise
+
+        return _ok(
+            run_id=run_id,
+            total=1,
+            provider={'id': provider.get('id'), 'model': model_name},
+            options=options,
+        )
+
+    @api.http.route('/jobs/agent', ['POST'])
+    @_handle_errors
+    def submit_agent():
+        """提交 Agent 作业（多轮：看目录 → 分批读 → 提交提议）。"""
+        payload = _body()
+
+        provider = store.resolve_provider(str(payload.get('provider_id') or ''))
+        api_key = store.resolve_provider_key(provider['id'])
+        if not api_key:
+            return _fail(
+                CODE_SECRET_MISSING,
+                f'provider「{provider["id"]}」未配置 API Key，请先在插件设置里填写',
+                http_status=409,
+                detail={'provider_id': provider['id'],
+                        'secret_key': api_key_secret_name(provider['id'])},
+            )
+
+        model_name = str(payload.get('model') or provider.get('model') or '')
+        budget = agent_core.normalize_budget(payload.get('budget'))
+
+        job_payload = {
+            'provider_id': provider['id'],
+            'model': model_name,
+            'profile_id': str(payload.get('profile_id') or 'builtin-agent'),
+            'budget': budget,
+            'secret_ref': SECRET_REF_TEMPLATE.format(provider_id=provider['id']),
+        }
+
+        try:
+            run_id = api.jobs.submit(
+                JOB_AGENT,
+                items=[{'key': 'agent', 'payload': {}}],
+                payload=job_payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            if '已在运行' in message or 'already' in message.lower():
+                return _fail('job_already_running', message, http_status=409)
+            raise
+
+        return _ok(
+            run_id=run_id,
+            total=1,
+            provider={'id': provider.get('id'), 'model': model_name},
+            budget=budget,
+        )
+
     # ---------------------------------------------------------- 审批与结果
 
-    @api.route('/jobs/<run_id>', ['GET'])
+    @api.http.route('/jobs/<run_id>', ['GET'])
     @_handle_errors
     def get_job(run_id):
-        job = api.get_job(run_id)
+        job = api.jobs.get(run_id)
         if job is None:
             return _fail(CODE_JOB_NOT_FOUND, f'作业不存在: {run_id}', http_status=404)
 
         items = _load_job_items(api, run_id)
         return _ok(job=_job_summary(job), items=items, items_total=len(items))
 
-    @api.route('/jobs/<run_id>/apply', ['POST'])
+    @api.http.route('/jobs/<run_id>/apply', ['POST'])
     @_handle_errors
     def apply_job(run_id):
-        """把已审批（`status=done`）的条目写回卡片。"""
-        job = api.get_job(run_id)
+        """把已审批（`status=done`）的条目写回。"""
+        job = api.jobs.get(run_id)
         if job is None:
             return _fail(CODE_JOB_NOT_FOUND, f'作业不存在: {run_id}', http_status=404)
 
         job_type = str(job.get('job_type') or '')
+        if job_type == JOB_WI_REWRITE:
+            return _apply_wi_rewrite(api, store, run_id, job, _body())
+        if job_type == JOB_CLASSIFY:
+            return _apply_classify(api, store, run_id, job, _body())
+        if job_type == JOB_PROPOSE:
+            return _apply_propose(api, store, run_id, job, _body())
+        if job_type == JOB_AGENT:
+            # Agent 的产出与 propose 完全同构 → 复用同一套落地逻辑
+            return _apply_propose(api, store, run_id, job, _body())
         if job_type != JOB_ANALYZE:
             return _fail(CODE_INVALID_PAYLOAD, f'该作业类型不支持应用: {job_type}')
 
@@ -563,7 +968,7 @@ def register_routes(api, store) -> None:
                 skipped += 1
                 continue
 
-            card = api.read_card(card_id)
+            card = api.cards.read(card_id)
             if not isinstance(card, dict):
                 failed += 1
                 details.append({'card_id': card_id, 'error': 'card_unreadable'})
@@ -582,16 +987,16 @@ def register_routes(api, store) -> None:
 
             if summary_text:
                 bridge_result = summary_bridge.write_summary(
-                    store, card_id, summary_text, ui_key=ui_key)
+                    api, store, card_id, summary_text, ui_key=ui_key)
                 if not bridge_result.get('ok'):
                     details.append({'card_id': card_id,
                                     'warning': f'概览降级写入: {bridge_result.get("message", "")}'})
 
             if tags and apply_tags_enabled:
                 tag_library = read_tag_library(api)
-                accepted, _suggested = split_tags(tags, known_tag_set(tag_library))
+                accepted, _suggested, _blocked = split_tags(tags, known_tag_set(tag_library))
                 if accepted:
-                    tag_result = api.apply_tags([card_id], add=accepted, replace=False)
+                    tag_result = api.cards.apply_tags([card_id], add=accepted, replace=False)
                     if tag_result.get('failed'):
                         failed += 1
                         details.append({'card_id': card_id, 'error': 'write_failed'})
@@ -613,25 +1018,25 @@ def register_routes(api, store) -> None:
         return _ok(applied=applied, skipped=skipped, stale=stale, failed=failed,
                    details=details[:50], total=len(items))
 
-    @api.route('/jobs/<run_id>/cancel', ['POST'])
+    @api.http.route('/jobs/<run_id>/cancel', ['POST'])
     @_handle_errors
     def cancel_job(run_id):
-        if api.get_job(run_id) is None:
+        if api.jobs.get(run_id) is None:
             return _fail(CODE_JOB_NOT_FOUND, f'作业不存在: {run_id}', http_status=404)
-        return _ok(cancelled=bool(api.cancel_job(run_id)))
+        return _ok(cancelled=bool(api.jobs.cancel(run_id)))
 
-    @api.route('/jobs/<run_id>/retry', ['POST'])
+    @api.http.route('/jobs/<run_id>/retry', ['POST'])
     @_handle_errors
     def retry_job(run_id):
-        if api.get_job(run_id) is None:
+        if api.jobs.get(run_id) is None:
             return _fail(CODE_JOB_NOT_FOUND, f'作业不存在: {run_id}', http_status=404)
         payload = _body()
-        new_run = api.retry_job(run_id, only_failed=bool(payload.get('only_failed', True)))
+        new_run = api.jobs.retry(run_id, only_failed=bool(payload.get('only_failed', True)))
         return _ok(run_id=new_run)
 
     # ---------------------------------------------------------- 建议队列与用量
 
-    @api.route('/suggestions', ['GET'])
+    @api.http.route('/suggestions', ['GET'])
     @_handle_errors
     def list_suggestions():
         queue = store.list_tag_suggestions()
@@ -648,14 +1053,14 @@ def register_routes(api, store) -> None:
         items.sort(key=lambda item: (-item['count'], item['name']))
         return _ok(items=items, total=len(items))
 
-    @api.route('/suggestions/clear', ['POST'])
+    @api.http.route('/suggestions/clear', ['POST'])
     @_handle_errors
     def clear_suggestions():
         payload = _body()
         names = payload.get('names')
         return _ok(**store.clear_tag_suggestions(names if isinstance(names, list) else None))
 
-    @api.route('/usage', ['GET'])
+    @api.http.route('/usage', ['GET'])
     @_handle_errors
     def get_usage():
         return _ok(
@@ -663,13 +1068,13 @@ def register_routes(api, store) -> None:
             recent=store.recent_usage(RECENT_USAGE_LIMIT),
         )
 
-    @api.route('/outbound/ack', ['POST'])
+    @api.http.route('/outbound/ack', ['POST'])
     @_handle_errors
     def ack_outbound():
         store.acknowledge_outbound()
         return _ok(acknowledged=True)
 
-    @api.route('/prompt/validate', ['POST'])
+    @api.http.route('/prompt/validate', ['POST'])
     @_handle_errors
     def validate_template():
         """校验模板片段（保存档案前的即时反馈）。"""
@@ -691,9 +1096,275 @@ def register_routes(api, store) -> None:
                    known=sorted(prompt_core.KNOWN_VARIABLES))
 
 
+def _apply_wi_rewrite(api, store, run_id: str, job, payload) -> dict:
+    """写回世界书改写作业中已审批的条目。
+
+    与打标作业的差别：世界书是**整本写**，所以要把所有通过的条目
+    合并进同一份 `book`，只写一次（`write` 有乐观锁，重复写会撞版本）。
+    """
+    items = _load_job_items(api, run_id)
+
+    applied = 0
+    skipped = 0
+    failed = 0
+    details = []
+
+    # 按来源聚合：同一世界书只写一次
+    buckets = {}
+
+    for item in items:
+        if str(item.get('status') or '') != 'done':
+            continue
+
+        result = item.get('result') if isinstance(item.get('result'), dict) else {}
+        entry_uid = str(result.get('entry_uid') or item.get('key') or '')
+        candidate = str(result.get('candidate') or '')
+        if not entry_uid or not candidate:
+            skipped += 1
+            continue
+
+        if result.get('applied') is True and not payload.get('force'):
+            # 作业已在 auto 模式下写过 → 幂等跳过
+            skipped += 1
+            continue
+
+        job_payload = job.get('payload') if isinstance(job.get('payload'), dict) else {}
+        source = jobs_module.resolve_wi_source(
+            str(result.get('card_id') or item.get('key') or ''),
+            job_payload.get('worldbook_source'),
+        )
+        key = f"{source.get('source_type')}|{source.get('card_id')}|{source.get('file_path')}"
+        buckets.setdefault(key, {'source': source, 'entries': []})['entries'].append(
+            (entry_uid, candidate),
+        )
+
+    for bucket in buckets.values():
+        source = bucket['source']
+        book = api.worldbook.read(source)
+        if not isinstance(book, dict):
+            failed += len(bucket['entries'])
+            details.append({'error': 'worldbook_unreadable'})
+            continue
+
+        entries = book.get('entries')
+        if isinstance(entries, dict):
+            entries = list(entries.values())
+        if not isinstance(entries, list):
+            failed += len(bucket['entries'])
+            details.append({'error': 'worldbook_structure'})
+            continue
+
+        wanted = dict(bucket['entries'])
+        updated_entries = []
+        hit = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                updated_entries.append(entry)
+                continue
+            uid = str(entry.get('uid') or entry.get('id') or '')
+            if uid in wanted:
+                patched = dict(entry)
+                patched['content'] = wanted[uid]
+                updated_entries.append(patched)
+                hit += 1
+            else:
+                updated_entries.append(entry)
+
+        if source.get('source_type') == 'embedded' and source.get('card_id'):
+            try:
+                api.backups.snapshot_card(source['card_id'], remark='ai-wi-rewrite-apply')
+            except Exception:  # noqa: BLE001
+                logger.warning('世界书应用前快照失败', exc_info=True)
+
+        updated = dict(book)
+        updated['entries'] = updated_entries
+
+        outcome = api.worldbook.write(
+            source, updated,
+            expected_revision=str(book.get('source_revision') or ''),
+        )
+        if outcome.get('success'):
+            applied += hit
+            failed += len(wanted) - hit
+            if len(wanted) > hit:
+                details.append({'error': 'entry_missing', 'count': len(wanted) - hit})
+        else:
+            failed += len(wanted)
+            details.append({
+                'error': str(outcome.get('error') or 'write_failed'),
+                'message': str(outcome.get('msg') or ''),
+            })
+
+    if applied:
+        try:
+            store.clear_pending_review(run_id)
+        except Exception:  # noqa: BLE001
+            logger.debug('清理待审批登记失败', exc_info=True)
+
+    return _ok(applied=applied, skipped=skipped, failed=failed, details=details)
+
+
+def _apply_classify(api, store, run_id: str, job, payload) -> dict:
+    """把已审批的归类结果落地为实际的目录移动。
+
+    按目标分类**批量**移动（主程序 `move` 支持批量，比逐卡快得多）。
+    """
+    items = _load_job_items(api, run_id)
+    force = bool(payload.get('force'))
+
+    # 目标分类 → 卡片 id 列表
+    plan = {}
+    skipped = 0
+    details = []
+
+    for item in items:
+        if str(item.get('status') or '') != 'done':
+            continue
+
+        result = item.get('result') if isinstance(item.get('result'), dict) else {}
+        card_id = str(result.get('card_id') or item.get('key') or '')
+        category = str(result.get('category') or '')
+
+        if not card_id:
+            skipped += 1
+            continue
+
+        if result.get('applied') is True and not force:
+            # auto 模式已经移动过 → 幂等跳过
+            skipped += 1
+            continue
+
+        if result.get('issues'):
+            skipped += 1
+            details.append({'card_id': card_id, 'error': 'invalid_category',
+                            'issues': result['issues']})
+            continue
+
+        plan.setdefault(category, []).append(card_id)
+
+    applied = 0
+    failed = 0
+
+    for category, card_ids in plan.items():
+        # 目标分类要存在；根目录（空串）不需要创建
+        if category:
+            try:
+                api.cards.create_category(category)
+            except Exception:  # noqa: BLE001 - 已存在会返回 False，不算错误
+                logger.debug('创建分类失败（可能已存在）: %s', category, exc_info=True)
+
+        try:
+            outcome = api.cards.move(card_ids, category)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception('移动卡片失败: %s', category)
+            failed += len(card_ids)
+            details.append({'category': category, 'error': 'move_failed',
+                            'message': str(exc)})
+            continue
+
+        applied += int(outcome.get('count') or 0)
+        for failure in (outcome.get('failed') or []):
+            failed += 1
+            details.append({
+                'card_id': str(failure.get('old_id') or ''),
+                'error': 'move_failed',
+                'message': str(failure.get('msg') or ''),
+            })
+
+    if applied:
+        try:
+            store.clear_pending_review(run_id)
+        except Exception:  # noqa: BLE001
+            logger.debug('清理待审批登记失败', exc_info=True)
+
+    return _ok(applied=applied, skipped=skipped, failed=failed,
+               categories=len(plan), details=details)
+
+
+def _apply_propose(api, store, run_id: str, job, payload) -> dict:
+    """落地结构化提议：**只创建结构**（目录 + 标签），不动任何卡片。
+
+    刻意不执行 `tag_merges`：它要改卡片标签（破坏性），必须由用户单独确认。
+    这里只把它原样回传给前端展示。
+    """
+    items = _load_job_items(api, run_id)
+    if not items:
+        return _fail(CODE_JOB_NOT_FOUND, f'作业没有结果: {run_id}', http_status=404)
+
+    result = items[0].get('result') if isinstance(items[0].get('result'), dict) else {}
+    plan = result.get('plan') if isinstance(result.get('plan'), dict) else {}
+
+    create_categories = [
+        str(item) for item in (plan.get('create_categories') or []) if str(item or '').strip()
+    ]
+    create_tags = [
+        str(item) for item in (plan.get('create_tags') or []) if str(item or '').strip()
+    ]
+
+    # 用户可以在审批时裁剪（只创建其中一部分）
+    selected_categories = payload.get('categories')
+    if isinstance(selected_categories, list):
+        wanted = {str(item) for item in selected_categories}
+        create_categories = [item for item in create_categories if item in wanted]
+
+    selected_tags = payload.get('tags')
+    if isinstance(selected_tags, list):
+        wanted = {str(item) for item in selected_tags}
+        create_tags = [item for item in create_tags if item in wanted]
+
+    created_categories = []
+    failed_categories = []
+    for name in create_categories:
+        try:
+            # 主程序内部已做白名单校验；这里再判一次返回值
+            ok = bool(api.cards.create_category(name))
+        except Exception:  # noqa: BLE001
+            logger.warning('创建分类失败: %s', name, exc_info=True)
+            ok = False
+        (created_categories if ok else failed_categories).append(name)
+
+    created_tags = []
+    existing_tags = []
+    failed_tags = []
+    if create_tags:
+        try:
+            outcome = api.tags.create(create_tags)
+            created_tags = [str(item) for item in (outcome.get('created') or [])]
+            existing_tags = [str(item) for item in (outcome.get('existing') or [])]
+            failed_tags = [str(item) for item in (outcome.get('failed') or [])]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('创建标签失败', exc_info=True)
+            failed_tags = list(create_tags)
+            detail = str(exc)
+        else:
+            detail = ''
+
+    if created_categories or created_tags:
+        try:
+            store.clear_pending_review(run_id)
+        except Exception:  # noqa: BLE001
+            logger.debug('清理待审批登记失败', exc_info=True)
+
+    return _ok(
+        created_categories=created_categories,
+        failed_categories=failed_categories,
+        created_tags=created_tags,
+        existing_tags=existing_tags,
+        failed_tags=failed_tags,
+        # 合并建议只回传、不执行 —— 它会改卡片标签
+        tag_merges=plan.get('tag_merges') or [],
+        requires_manual_review=bool(plan.get('tag_merges')),
+    )
+
+
 def _injected_transport():
     """测试注入点：通过模块属性替换。"""
     return getattr(llm, '_TEST_TRANSPORT', None)
+
+
+def _injected_get():
+    """`GET /models` 的测试注入点（与 `_injected_transport` 分开）。"""
+    return getattr(llm, '_TEST_GET', None)
 
 
 def _injected_sleep():
