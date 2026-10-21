@@ -368,13 +368,6 @@ def test_plugin_brand_icon_is_a_plugin_owned_asset():
         plugin_source = handle.read()
     assert "icon: 'frontend/assets/icon.svg'" in plugin_source
 
-    # ③ CSS 不再需要自己画品牌图标（图标归宿主标题行）
-    source = _strip_comments(_read_css())
-    assert '/static/icons/' not in source, '插件 CSS 不得引用宿主 sprite'
-    assert 'plugin-stm-ai-assistant-glyph' not in source, (
-        '品牌图标已归宿主标题行（`surface.icon`），插件 CSS 不该再自绘 glyph'
-    )
-
     findings = scan_css_declarations(CSS_PATH, PLUGIN_ID)
     assert findings.get('hardcoded_sprite') is None, (
         f'插件自有资源 URL 不应被 F15 判为硬编码宿主 sprite: {findings.get("hardcoded_sprite")}'
@@ -389,42 +382,48 @@ def test_status_pills_live_in_the_host_header_row():
 
     旧实现：宿主标题行（标题 + ×）+ 插件自绘状态行（品牌图标 + 胶囊）→ 顶部两行。
     新实现：图标归宿主标题行左侧，胶囊走 `spec.headerExtra` 注入的附加槽，
-    与标题、关闭按钮**同一行**；插件只保留页签 + 主体。
+    与标题、关闭按钮**同一行**。胶囊逻辑集中在 `frontend/headerStatus.js`，
+    由 `plugin.js` 挂在 hub surface 上（其余任务面板不需要再重复一份状态）。
+    """
+    with open(os.path.join(ROOT, 'frontend', 'headerStatus.js'), 'r', encoding='utf-8') as handle:
+        status_source = handle.read()
+
+    # 胶囊槽存在，且渲染时只清它
+    assert 'plugin-stm-ai-assistant-status-badges' in status_source, '必须有状态胶囊槽'
+    assert 'clear(slot)' in status_source
+
+    # 自绘状态行已删除（胶囊是唯一的状态展示）
+    assert 'plugin-stm-ai-assistant-status-row' not in status_source, (
+        '状态行已合并进宿主标题行，不该再自绘'
+    )
+    assert 'plugin-stm-ai-assistant-glyph' not in status_source, (
+        '品牌图标归宿主标题行（`surface.icon`），插件不该再自绘'
+    )
+
+    # 胶囊通过 headerExtra 注入宿主标题行的附加槽
+    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
+        plugin_source = handle.read()
+    assert 'headerExtra(container)' in plugin_source
+    assert 'headerStatus.mount(container)' in plugin_source
+
+
+def test_panel_does_not_draw_its_own_title_row():
+    """插件根节点只画内容——标题行与状态胶囊都归宿主容器。
+
+    重构后 `panel.js` 退化为 surface 注册表 + 挂载器，不再有「页签条」这种
+    一次性容器；每个 surface 的视图自带内容根节点。
     """
     with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
         source = handle.read()
 
-    # 胶囊槽仍存在，且 `refreshStatus` 只清它
-    assert 'plugin-stm-ai-assistant-status-badges' in source, '必须有状态胶囊槽'
-    assert 'clear(badgeSlot)' in source
-
-    # 自绘状态行已删除
-    assert 'plugin-stm-ai-assistant-status-row' not in source, (
-        '状态行已合并进宿主标题行，不该再自绘'
-    )
-    assert 'plugin-stm-ai-assistant-glyph' not in source, (
-        '品牌图标归宿主标题行（`surface.icon`），插件不该再自绘'
-    )
-
-    # 胶囊通过 mountHeaderExtra 注入宿主标题行的附加槽
-    assert 'mountHeaderExtra' in source
-    assert 'container.append(badgeSlot)' in source
+    assert 'tabBar' not in source, '页签条已随四页签架构一起删除'
+    assert 'root.append(statusRow' not in source
+    assert 'mountView' in source, 'panel.js 应提供统一的挂载器'
 
     with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
         plugin_source = handle.read()
     assert 'headerExtra(container) {' in plugin_source
-    assert 'panel.mountHeaderExtra(container)' in plugin_source
-
-
-def test_panel_root_only_has_tabs_and_body():
-    """插件根节点只含「页签 + 主体」——标题行与状态胶囊都归宿主容器。"""
-    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
-        source = handle.read()
-
-    assert 'root.append(tabBar, body)' in source, (
-        '根节点只应 append 页签与主体'
-    )
-    assert 'root.append(statusRow' not in source
+    assert 'headerStatus.mount(container)' in plugin_source
 
 
 def test_css_important_only_on_scoped_selectors():
@@ -474,34 +473,32 @@ def _rule_body(source: str, selector: str) -> str:
     return match.group(1)
 
 
-def test_active_tab_matches_detail_page_contract():
-    """回归：选中页签必须与角色卡详情页一致——无边框、无位移、2px 内阴影底条。
+def test_task_panel_lays_out_as_a_single_column_flow():
+    """任务面板是容器内的普通流式单列（不自绘定位、不用 fixed）。
 
-    旧实现是「向下突出的胶囊」（999px 圆角 + translateY + 负 margin），与详情页不符。
+    重构删掉了「页签」这一层，因此这里锚定新的结构：
+    `view-shell` 是列向流式容器，`scope-bar` 是横向的横幅。
     """
     source = _read_css()
 
-    active = _rule_body(source, '.plugin-stm-ai-assistant-tab.is-active')
-    assert 'transform: none' in active, '选中页签不得有位移'
-    assert 'border-color: transparent' in active, '选中页签必须无可见边框'
-    assert 'inset 0 -2px 0' in active, '选中页签必须有 2px 内阴影底条'
+    shell = _rule_body(source, '.plugin-stm-ai-assistant-view-shell')
+    assert 'position' not in shell, '面板外壳不得自行定位'
+    assert 'flex-direction: column' in shell, '面板外壳必须是列向流式'
 
-    tab = _rule_body(source, '.plugin-stm-ai-assistant-tab')
-    assert 'border-radius: 0.55rem' in tab, '页签圆角必须是详情页的 0.55rem'
-    assert '999px' not in tab, '页签不得使用胶囊圆角'
+    scope_bar = _rule_body(source, '.plugin-stm-ai-assistant-scope-bar')
+    assert 'position' not in scope_bar, '作用域横幅不得自行定位'
 
 
 def test_panel_and_pills_are_in_flow_not_floating():
     """面板与胶囊槽都是容器内的普通流式区块（不再 `position: fixed` / 右对齐浮标）。"""
     source = _read_css()
 
-    panel = _rule_body(source, '.plugin-stm-ai-assistant-panel')
-    assert 'position' not in panel, '面板不得自行定位'
-    assert 'flex' in panel
-
     pills = _rule_body(source, '.plugin-stm-ai-assistant-status-badges')
     assert 'position' not in pills, '胶囊槽不得自行定位'
     assert 'inline-flex' in pills
+
+    shell = _rule_body(source, '.plugin-stm-ai-assistant-view-shell')
+    assert 'position' not in shell, '面板外壳不得自行定位'
 
 
 def test_plugin_does_not_style_host_surface_dom():

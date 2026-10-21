@@ -1,37 +1,4 @@
-/*
- * stm-ai-assistant 插件样式。
- *
- * 硬约束 F11：所有选择器必须以 `.plugin-stm-ai-assistant` 或
- * `[data-plugin="stm-ai-assistant"]` 开头，否则安装时的作用域检查会拒绝加载
- * （`core/plugins/installer.py:595-640`）。颜色只使用主程序已有的 CSS 变量。
- *
- * ── 层级 / 定位 / 遮罩都归宿主（本次重写的核心）────────────────────────
- * 插件现在只提供 **surface 内容**：入口由 `manifest.frontend.entries` 声明，
- * 坞、命令面板、快捷键与设置页由宿主渲染；面板容器（定位、尺寸、滚动、焦点
- * 陷阱、ESC 关闭、`role="dialog"`、遮罩合成）由 `pluginSurfaceHost.js` 提供。
- * 因此本文件里**没有** `position: fixed`、没有自绘 overlay、没有 z-index
- * 硬编码，也没有 `body:has(...)` 兜底规则——那些都是宿主职责。
- */
 
-/* ------------------------------------------------------------ 面板内容
- * 宿主的标题行（图标 + 标题 + 状态胶囊 + 关闭按钮）由宿主渲染，插件不重复画。
- * 插件只在容器内填两段：横向页签 + 可滚动主体。
- *
- * 布局：宿主的 `.plugin-surface__body` 自己有 `overflow: auto` + `padding: 1rem`。
- * 若直接用那个滚动条，页签会随内容滚走。因此插件根节点撑满容器并自建**内部**
- * 滚动区（`flex` 列 + 主体 `overflow-y: auto`），使页签常驻顶部。
- *
- * 弹层尺寸由宿主的 `size` 档位决定（本插件用 `lg` = 1080×760 固定尺寸），
- * 插件不再自己算宽高——切换页签时容器不跳动。
- */
-
-.plugin-stm-ai-assistant-panel {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-  min-height: 0;
-  min-width: 0;
-}
 
 /* 状态胶囊槽：挂在**宿主标题行**的 `.plugin-surface__header-extra` 里，
  * 与图标、标题、关闭按钮同一行（不再自绘第二条状态栏）。 */
@@ -42,117 +9,6 @@
   flex-wrap: nowrap;
   min-width: 0;
   overflow: hidden;
-}
-
-/* ------------------------------------------------------------ 页签导航
- * 逐条对齐主程序角色卡详情页 workbench 生效样式
- * （detail-card-workbench.css:1986-2022 + ui-refresh.css:622-644）。
- * 以下数值全部取自浏览器实测的计算样式，不是凭感觉写的：
- *   nav  : surface-container-raised / 下边框 border-divider / row / gap .2rem /
- *          min-height 3.2rem / padding .42rem .85rem .35rem / 可横向滚动
- *   tab  : 透明底 + 透明描边 / 圆角 0.55rem（详情页是硬编码，**不是** --ui-radius-sm
- *          的 0.65rem）/ min-height 2.35rem / padding .45rem .7rem / 字号 .78rem / 字重 800
- *   hover: state-hover-surface + content-primary
- *   active: action-surface 填充 + 透明描边 + inset 0 -2px 0 accent-action 底条
- * 关键点：选中项**无边框、无位移**，只靠填充色与 2px 内阴影底条区分——
- * 旧版那套「向下突出的胶囊」（border-radius 999px + translateY + 负 margin）
- * 与详情页完全不符，已删除。 */
-
-.plugin-stm-ai-assistant-tabs {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 0.2rem;
-  flex: 0 0 auto;
-  min-height: 3.2rem;
-  max-width: 100%;
-  padding: 0.42rem 0 0.35rem;
-  border-bottom: 1px solid var(--border-divider);
-  background: transparent;
-  overflow-x: auto;
-  overflow-y: hidden;
-  scrollbar-width: thin;
-}
-
-.plugin-stm-ai-assistant-tab {
-  position: relative;
-  z-index: auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.55rem;
-  flex: 0 0 auto;
-  min-width: max-content;
-  min-height: 2.35rem;
-  margin: 0;
-  padding: 0.45rem 0.7rem;
-  border: 1px solid transparent;
-  border-radius: 0.55rem;
-  background: transparent;
-  color: var(--content-secondary);
-  font-size: 0.78rem;
-  font-weight: 800;
-  line-height: 1.2;
-  text-align: left;
-  cursor: pointer;
-  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease;
-}
-
-.plugin-stm-ai-assistant-tab:hover {
-  background: var(--state-hover-surface, var(--bg-hover));
-  color: var(--content-primary);
-}
-
-.plugin-stm-ai-assistant-tab:focus-visible {
-  outline: 2px solid var(--state-focus-ring, var(--action-border));
-  outline-offset: 2px;
-}
-
-/* 选中态：无边框 + 无位移，填充 action-surface 并压一条 2px 强调底条。 */
-.plugin-stm-ai-assistant-tab.is-active {
-  z-index: auto;
-  margin-bottom: 0;
-  padding-bottom: 0.45rem;
-  background: var(--action-surface);
-  border-color: transparent;
-  color: var(--action-text);
-  transform: none;
-  box-shadow: inset 0 -2px 0 var(--accent-action, var(--action-border));
-}
-
-/* 图标槽位：对齐详情页 tab-icon */
-.plugin-stm-ai-assistant-tab-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  width: 1rem;
-  height: 1rem;
-  line-height: 1;
-}
-
-/* 文字标签 */
-.plugin-stm-ai-assistant-tab-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* 页签不再自绘数字角标：待审批数走 `api.entries.setBadge('workbench', n)`，
- * 由宿主渲染在坞入口与命令面板上（`entries[].badge`）。 */
-
-/* 主体：插件自建的内部滚动区（宿主的 `.plugin-surface__body` 是外层滚动，
- * 这里再套一层是为了让状态条与页签常驻顶部）。 */
-.plugin-stm-ai-assistant-body {
-  flex: 1 1 auto;
-  min-width: 0;
-  min-height: 0;
-  padding-top: 0.9rem;
-  overflow-x: hidden;
-  overflow-y: auto;
-  scrollbar-color: var(--scrollbar-thumb, var(--border-main)) transparent;
-  scrollbar-width: thin;
 }
 
 .plugin-stm-ai-assistant-view {
@@ -252,40 +108,6 @@
   display: flex;
   flex-wrap: wrap;
   gap: 6px 14px;
-}
-
-/* 选择器提示列表 */
-.plugin-stm-ai-assistant-gaps {
-  margin: 2px 0 0;
-  padding-left: 18px;
-  font-size: 0.74rem;
-  line-height: 1.55;
-}
-
-/* token 明细（等宽，方便纵向对比数值） */
-.plugin-stm-ai-assistant-budget {
-  margin: 8px 0 0;
-  padding: 8px 10px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.72rem;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-word;
-  background: var(--surface-sunken, rgba(0, 0, 0, 0.04));
-  border-radius: 6px;
-}
-
-/* 世界书改写：条目勾选行 */
-.plugin-stm-ai-assistant-wi-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.76rem;
-  line-height: 1.5;
-}
-
-.plugin-stm-ai-assistant-wi-item.is-disabled {
-  opacity: 0.55;
 }
 
 /* 高级设置折叠区（完整 schema / 写回动作） */
@@ -618,38 +440,8 @@
   background: transparent;
 }
 
-/* ------------------------------------------------------------ 选卡 */
-
-.plugin-stm-ai-assistant-selection {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
 .plugin-stm-ai-assistant-picker.is-hidden {
   display: none;
-}
-
-.plugin-stm-ai-assistant-card-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 4px;
-  max-height: 220px;
-  margin-top: 8px;
-  padding: 8px;
-  border: 1px solid var(--border-light);
-  border-radius: 8px;
-  overflow-y: auto;
-}
-
-.plugin-stm-ai-assistant-card-item {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 0.76rem;
-  color: var(--content-secondary);
-  cursor: pointer;
 }
 
 /* ------------------------------------------------------------ 预览与进度 */
@@ -693,31 +485,6 @@
 
 .plugin-stm-ai-assistant-progress {
   margin-top: 6px;
-}
-
-/* 日志区做成控制台质感：深色底 + 圆角 + 内边距 */
-.plugin-stm-ai-assistant-logs {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  max-height: 160px;
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-light);
-  border-radius: 10px;
-  background: var(--bg-code);
-  overflow-y: auto;
-}
-
-.plugin-stm-ai-assistant-log {
-  font-size: 0.72rem;
-  line-height: 1.5;
-  color: var(--content-secondary);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-.plugin-stm-ai-assistant-log.is-error {
-  color: var(--content-primary);
 }
 
 /* ------------------------------------------------------------ 结果与审批 */
@@ -898,48 +665,809 @@
   font-size: 0.74rem;
   color: var(--content-secondary);
 }
-
-/* ------------------------------------------------------------ 滚动条（面板内） */
-
-.plugin-stm-ai-assistant-body::-webkit-scrollbar,
-.plugin-stm-ai-assistant-logs::-webkit-scrollbar,
-.plugin-stm-ai-assistant-message-body::-webkit-scrollbar,
-.plugin-stm-ai-assistant-card-list::-webkit-scrollbar {
+.plugin-stm-ai-assistant-message-body::-webkit-scrollbar{
   width: 6px;
   height: 6px;
 }
-
-.plugin-stm-ai-assistant-body::-webkit-scrollbar-thumb,
-.plugin-stm-ai-assistant-logs::-webkit-scrollbar-thumb,
-.plugin-stm-ai-assistant-message-body::-webkit-scrollbar-thumb,
-.plugin-stm-ai-assistant-card-list::-webkit-scrollbar-thumb {
+.plugin-stm-ai-assistant-message-body::-webkit-scrollbar-thumb{
   background: var(--border-main);
   border-radius: 8px;
 }
-
-.plugin-stm-ai-assistant-body::-webkit-scrollbar-thumb:hover,
-.plugin-stm-ai-assistant-logs::-webkit-scrollbar-thumb:hover,
-.plugin-stm-ai-assistant-message-body::-webkit-scrollbar-thumb:hover,
-.plugin-stm-ai-assistant-card-list::-webkit-scrollbar-thumb:hover {
+.plugin-stm-ai-assistant-message-body::-webkit-scrollbar-thumb:hover{
   background: var(--border-light);
 }
 
 /* 窄屏：面板宽度/高度由宿主的 `.plugin-surface--panel` 负责（≤900px 退化全屏），
  * 插件只收自己的内边距与栅格列数。 */
 @media (max-width: 720px) {
-  .plugin-stm-ai-assistant-tabs {
-    padding-inline: 0.55rem;
+  .plugin-stm-ai-assistant-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ================================================================
+ * 任务化重构新增的结构（见 docs/2026-10-19-task-centric-redesign.md）
+ *
+ * 这些类只服务于新架构：作用域横幅、参数块、内联进度、任务卡、diff、迁移行。
+ * 旧的页签/工作台分段样式仍在文件上半部分（视图已删，样式待下次清理，
+ * 保留它们不会影响渲染）。
+ *
+ * 约定：只用 `var(--token, fallback)`，保证主题切换与令牌改名都不会静默失效。
+ * ================================================================ */
+
+.plugin-stm-ai-assistant-view-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  min-height: 0;
+}
+
+.plugin-stm-ai-assistant-alert-host:empty,
+.plugin-stm-ai-assistant-hub-summary:empty,
+.plugin-stm-ai-assistant-review-detail:empty {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- 提示条 */
+
+.plugin-stm-ai-assistant-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.75rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+  color: var(--content-primary);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.plugin-stm-ai-assistant-banner.is-warn {
+  border-color: var(--border-warn);
+  background: var(--bg-sub);
+}
+
+.plugin-stm-ai-assistant-banner.is-error {
+  border-color: var(--border-warn);
+  background: var(--bg-sub);
+}
+
+.plugin-stm-ai-assistant-banner.is-ok {
+  border-color: var(--border-light);
+  background: var(--bg-sub);
+}
+
+.plugin-stm-ai-assistant-banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.plugin-stm-ai-assistant-banner-actions {
+  display: flex;
+  gap: 0.4rem;
+  flex: 0 0 auto;
+}
+
+/* ---------------------------------------------------------------- 作用域横幅 */
+
+.plugin-stm-ai-assistant-scope-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.7rem 0.85rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-sub);
+}
+
+.plugin-stm-ai-assistant-scope-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.plugin-stm-ai-assistant-scope-title {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--content-primary);
+}
+
+.plugin-stm-ai-assistant-scope-title.is-error .plugin-stm-ai-assistant-scope-text {
+  color: var(--status-danger-text);
+}
+
+.plugin-stm-ai-assistant-scope-title.is-warn .plugin-stm-ai-assistant-scope-text {
+  color: var(--status-warning-text);
+}
+
+.plugin-stm-ai-assistant-scope-title.is-loading .plugin-stm-ai-assistant-scope-text {
+  color: var(--content-muted);
+  font-weight: 500;
+}
+
+.plugin-stm-ai-assistant-scope-icon {
+  width: 0.5rem;
+  height: 0.5rem;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: currentColor;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-scope-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.plugin-stm-ai-assistant-scope-hint {
+  font-size: 0.78rem;
+  color: var(--content-muted);
+  line-height: 1.5;
+}
+
+.plugin-stm-ai-assistant-scope-change {
+  flex: 0 0 auto;
+  padding: 0.3rem 0.7rem;
+  border-radius: 0.45rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+  color: var(--content-primary);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.plugin-stm-ai-assistant-scope-change:hover {
+  background: var(--bg-hover);
+}
+
+/* ---------------------------------------------------------------- 参数块 */
+
+.plugin-stm-ai-assistant-option-block {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+}
+
+.plugin-stm-ai-assistant-option-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--content-secondary);
+}
+
+.plugin-stm-ai-assistant-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+/* ---------------------------------------------------------------- 进度 */
+
+.plugin-stm-ai-assistant-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.plugin-stm-ai-assistant-progress-track {
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bg-sub);
+  overflow: hidden;
+}
+
+.plugin-stm-ai-assistant-progress-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: var(--accent-main);
+  transition: width 0.25s ease;
+}
+
+.plugin-stm-ai-assistant-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  font-size: 0.78rem;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-progress-cancel {
+  padding: 0.2rem 0.55rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border-warn);
+  background: transparent;
+  color: var(--status-danger-text);
+  font-size: 0.76rem;
+  cursor: pointer;
+}
+
+.plugin-stm-ai-assistant-progress-cancel:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---------------------------------------------------------------- 结果提示 */
+
+.plugin-stm-ai-assistant-result-hint {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5rem;
+  border: 1px dashed var(--border-default);
+  font-size: 0.8rem;
+  color: var(--content-secondary);
+}
+
+/* ---------------------------------------------------------------- 空态 / 骨架 */
+
+.plugin-stm-ai-assistant-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 1rem;
+  border-radius: 0.55rem;
+  border: 1px dashed var(--border-default);
+  background: var(--bg-panel);
+}
+
+.plugin-stm-ai-assistant-empty-text {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-skeleton {
+  padding: 0.7rem 0.85rem;
+  border-radius: 0.5rem;
+  background: var(--bg-panel);
+  color: var(--content-muted);
+  font-size: 0.8rem;
+  animation: plugin-stm-ai-assistant-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes plugin-stm-ai-assistant-pulse {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
+}
+
+/* ---------------------------------------------------------------- 摘要网格 */
+
+.plugin-stm-ai-assistant-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.5rem;
+}
+
+.plugin-stm-ai-assistant-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  padding: 0.5rem 0.65rem;
+  border-radius: 0.5rem;
+  background: var(--bg-panel);
+}
+
+.plugin-stm-ai-assistant-stat-label {
+  font-size: 0.72rem;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-stat-value {
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--content-primary);
+}
+
+.plugin-stm-ai-assistant-note {
+  margin: 0;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-subtitle {
+  margin-top: 0.3rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--content-secondary);
+}
+
+/* ---------------------------------------------------------------- 任务中心 */
+
+.plugin-stm-ai-assistant-hub-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--content-secondary);
+}
+
+.plugin-stm-ai-assistant-task-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.6rem;
+}
+
+.plugin-stm-ai-assistant-task-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.35rem;
+  padding: 0.8rem 0.85rem;
+  border-radius: 0.65rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.plugin-stm-ai-assistant-task-card:hover {
+  border-color: var(--accent-main);
+  transform: translateY(-1px);
+}
+
+.plugin-stm-ai-assistant-task-card:focus-visible {
+  outline: 2px solid var(--accent-main);
+  outline-offset: 2px;
+}
+
+.plugin-stm-ai-assistant-task-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.plugin-stm-ai-assistant-task-card-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--content-primary);
+}
+
+.plugin-stm-ai-assistant-task-card-summary {
+  margin: 0;
+  font-size: 0.79rem;
+  line-height: 1.55;
+  color: var(--content-secondary);
+}
+
+.plugin-stm-ai-assistant-task-card-detail {
+  margin: 0;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-task-card-foot {
+  margin-top: 0.2rem;
+}
+
+.plugin-stm-ai-assistant-task-card-verb {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent-main);
+}
+
+.plugin-stm-ai-assistant-hub-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.45rem;
+  padding: 0.8rem 0.85rem;
+  border-radius: 0.65rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+}
+
+.plugin-stm-ai-assistant-hub-card-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.plugin-stm-ai-assistant-hub-card-title {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--content-primary);
+}
+
+.plugin-stm-ai-assistant-hub-card-text {
+  margin: 0;
+  font-size: 0.79rem;
+  line-height: 1.55;
+  color: var(--content-muted);
+}
+
+/* ---------------------------------------------------------------- 最近作业 */
+
+.plugin-stm-ai-assistant-run-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.plugin-stm-ai-assistant-run-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 0.6rem;
+  border-radius: 0.45rem;
+  border: 1px solid transparent;
+  background: var(--bg-panel);
+  text-align: left;
+  cursor: pointer;
+  font-size: 0.78rem;
+}
+
+.plugin-stm-ai-assistant-run-row:hover {
+  border-color: var(--border-default);
+}
+
+.plugin-stm-ai-assistant-run-task {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  color: var(--content-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-stm-ai-assistant-run-status {
+  flex: 0 0 auto;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: var(--bg-sub);
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-run-status.is-completed,
+.plugin-stm-ai-assistant-run-status.is-applied {
+  color: var(--status-success-text);
+}
+
+.plugin-stm-ai-assistant-run-status.is-failed {
+  color: var(--status-danger-text);
+}
+
+.plugin-stm-ai-assistant-run-status.is-running,
+.plugin-stm-ai-assistant-run-status.is-queued {
+  color: var(--accent-main);
+}
+
+.plugin-stm-ai-assistant-run-counts,
+.plugin-stm-ai-assistant-run-time {
+  flex: 0 0 auto;
+  color: var(--content-muted);
+}
+
+/* ---------------------------------------------------------------- 审批面板 */
+
+.plugin-stm-ai-assistant-run-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.plugin-stm-ai-assistant-run-bar-label {
+  font-size: 0.78rem;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-run-bar-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.45rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+  color: var(--content-primary);
+  font-size: 0.8rem;
+}
+
+.plugin-stm-ai-assistant-review-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.plugin-stm-ai-assistant-review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.plugin-stm-ai-assistant-review-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding-top: 0.45rem;
+}
+
+.plugin-stm-ai-assistant-tag-chip {
+  display: inline-block;
+  margin: 0 0.25rem 0.25rem 0;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  background: var(--bg-sub);
+  color: var(--content-secondary);
+  font-size: 0.74rem;
+}
+
+/* diff：原文 / 改写后并排 */
+
+.plugin-stm-ai-assistant-diff {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+
+.plugin-stm-ai-assistant-diff-side {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 0;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border-default);
+  padding: 0.5rem 0.6rem;
+  background: var(--bg-panel);
+}
+
+.plugin-stm-ai-assistant-diff-side.is-after {
+  border-color: var(--border-light);
+}
+
+.plugin-stm-ai-assistant-diff-title {
+  font-size: 0.73rem;
+  font-weight: 600;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-diff-body {
+  margin: 0;
+  max-height: 14rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.76rem;
+  line-height: 1.55;
+  color: var(--content-primary);
+}
+
+/* 归类：现分类 → 目标分类 */
+
+.plugin-stm-ai-assistant-move {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+}
+
+.plugin-stm-ai-assistant-move-from {
+  color: var(--content-muted);
+  text-decoration: line-through;
+}
+
+.plugin-stm-ai-assistant-move-arrow {
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-move-to {
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.35rem;
+  background: var(--bg-sub);
+  font-weight: 600;
+  color: var(--content-primary);
+}
+
+.plugin-stm-ai-assistant-move-confidence {
+  font-size: 0.74rem;
+  color: var(--status-success-text);
+}
+
+.plugin-stm-ai-assistant-move-confidence.is-low {
+  color: var(--status-warning-text);
+}
+
+/* ---------------------------------------------------------------- 作用域选择器 */
+
+.plugin-stm-ai-assistant-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.75rem 0.85rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+}
+
+.plugin-stm-ai-assistant-picker-tabs {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.plugin-stm-ai-assistant-picker-tab {
+  padding: 0.28rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--border-default);
+  background: transparent;
+  color: var(--content-secondary);
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.plugin-stm-ai-assistant-picker-tab.is-active {
+  border-color: var(--accent-main);
+  color: var(--accent-main);
+  font-weight: 600;
+}
+
+.plugin-stm-ai-assistant-picker-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.plugin-stm-ai-assistant-picker-note {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+
+.plugin-stm-ai-assistant-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.3rem 0.45rem;
+  border-radius: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--content-primary);
+  cursor: pointer;
+}
+
+.plugin-stm-ai-assistant-picker-item:hover {
+  background: var(--bg-hover);
+}
+
+.plugin-stm-ai-assistant-chip {
+  align-self: flex-start;
+  padding: 0.25rem 0.65rem;
+  border-radius: 0.4rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+  color: var(--content-primary);
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.plugin-stm-ai-assistant-chip:hover {
+  background: var(--bg-hover);
+}
+
+/* 面板里的纵向容器：host 后缀的节点只负责占位，不参与布局 */
+.plugin-stm-ai-assistant-scope-host,
+.plugin-stm-ai-assistant-options,
+.plugin-stm-ai-assistant-preview-host,
+.plugin-stm-ai-assistant-actions-host,
+.plugin-stm-ai-assistant-result-host,
+.plugin-stm-ai-assistant-run-bar-host,
+.plugin-stm-ai-assistant-picker-host,
+.plugin-stm-ai-assistant-hub-review,
+.plugin-stm-ai-assistant-hub-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.plugin-stm-ai-assistant-scope-host:empty,
+.plugin-stm-ai-assistant-preview-host:empty,
+.plugin-stm-ai-assistant-result-host:empty,
+.plugin-stm-ai-assistant-picker-host:empty {
+  display: none;
+}
+
+.plugin-stm-ai-assistant-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.plugin-stm-ai-assistant-progress-counts {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* 「本任务相关」的次级信息组（设置页用法、提示词档案建议词等） */
+.plugin-stm-ai-assistant-suggestions,
+.plugin-stm-ai-assistant-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+/* 组件用 flex/grid 布局时会覆盖 `[hidden]` 自带的 `display:none`，
+ * 于是「准备中…」的进度条在提交前就占着一块空白。统一兜一层。 */
+.plugin-stm-ai-assistant-view-shell [hidden] {
+  display: none !important;
+}
+
+.plugin-stm-ai-assistant-preview-hint {
+  padding: 0.9rem 0.95rem;
+  border-radius: 0.55rem;
+  border: 1px dashed var(--border-default);
+  color: var(--content-muted);
+  font-size: 0.82rem;
+}
+
+/* 世界书精简：按书分组的条目清单 */
+.plugin-stm-ai-assistant-book-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border-default);
+  background: var(--bg-panel);
+}
+
+.plugin-stm-ai-assistant-subtitle.is-error {
+  color: var(--status-danger-text);
+}
+
+@media (max-width: 720px) {
+  .plugin-stm-ai-assistant-diff {
+    grid-template-columns: 1fr;
   }
 
-  .plugin-stm-ai-assistant-tab {
-    padding-inline: 0.58rem;
+  .plugin-stm-ai-assistant-task-grid {
+    grid-template-columns: 1fr;
   }
 
-  .plugin-stm-ai-assistant-body {
-    padding: 0.85rem;
+  .plugin-stm-ai-assistant-stats {
+    grid-template-columns: repeat(2, 1fr);
   }
+}
+
+@media (max-width: 720px) {
+
+
 
   .plugin-stm-ai-assistant-grid {
     grid-template-columns: 1fr;
   }
+}
+
+/* 模型字段跨满栅格行（settings.js 一直在加这个修饰类，但此前没有对应规则） */
+.plugin-stm-ai-assistant-field--wide {
+  grid-column: 1 / -1;
+}
+
+/* 空间不足时朝上展开：贴住触发器上沿（定位仍归 absolute，宿主管 fixed/层级） */
+.plugin-stm-ai-assistant-select.is-dropup .plugin-stm-ai-assistant-select-menu {
+  top: auto;
+  bottom: calc(100% + 0.35rem);
 }

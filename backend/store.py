@@ -886,6 +886,85 @@ class PluginStore:
         self._mutate(mutator)
         return {'removed': removed}
 
+    # ------------------------------------------------------------ 作业台账
+    #
+    # 插件不持有作业列表接口（宿主 `api.jobs` 只有 get/items/cancel/…，没有 list），
+    # 但「关掉面板后还能找回上次作业」是硬需求。因此插件自己记一份**轻量台账**：
+    # 只存 run_id / task / job_type / 条目数 / 时间，实时状态仍以宿主的
+    # `api.jobs.get(run_id)` 为准（台账里的状态只是最后一次已知值）。
+
+    def list_runs(self) -> list:
+        runs = self.read_ui().get('runs')
+        if not isinstance(runs, dict):
+            return []
+        items = [value for value in runs.values() if isinstance(value, dict)]
+        items.sort(key=lambda item: int(item.get('created_at') or 0), reverse=True)
+        return items
+
+    def record_run(self, record) -> dict:
+        payload = dict(record or {})
+        run_id = str(payload.get('run_id') or '').strip()
+        if not run_id:
+            return {}
+
+        payload['run_id'] = run_id
+        payload.setdefault('created_at', int(time.time()))
+
+        def mutator(entry):
+            runs = entry.get('runs')
+            if not isinstance(runs, dict):
+                runs = {}
+            existing = runs.get(run_id) if isinstance(runs.get(run_id), dict) else {}
+            merged = dict(existing)
+            merged.update(payload)
+            runs[run_id] = merged
+            # 台账只保留最近 50 条，避免 ui_data 无限增长
+            if len(runs) > 50:
+                ordered = sorted(
+                    runs.items(),
+                    key=lambda pair: int((pair[1] or {}).get('created_at') or 0),
+                    reverse=True,
+                )[:50]
+                runs = dict(ordered)
+            entry['runs'] = runs
+
+        self._mutate(mutator)
+        return payload
+
+    def update_run(self, run_id: str, patch) -> bool:
+        identifier = str(run_id or '').strip()
+        if not identifier:
+            return False
+        changes = dict(patch or {})
+
+        # `_mutate` 只保证「写成功」，不表示「命中了某条台账」，所以先确认存在，
+        # 否则调用方无法区分「更新了」与「没这条」。
+        existing = self.read_ui().get('runs')
+        if not isinstance(existing, dict) or identifier not in existing:
+            return False
+
+        def mutator(entry):
+            runs = entry.get('runs')
+            if not isinstance(runs, dict) or identifier not in runs:
+                return
+            current = runs.get(identifier) if isinstance(runs.get(identifier), dict) else {}
+            current.update(changes)
+            runs[identifier] = current
+            entry['runs'] = runs
+
+        return self._mutate(mutator)
+
+    def forget_run(self, run_id: str) -> bool:
+        identifier = str(run_id or '').strip()
+
+        def mutator(entry):
+            runs = entry.get('runs')
+            if isinstance(runs, dict):
+                runs.pop(identifier, None)
+                entry['runs'] = runs
+
+        return self._mutate(mutator)
+
     # ------------------------------------------------------------ 用量台账
 
     def record_usage(self, record) -> None:

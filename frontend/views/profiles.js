@@ -15,6 +15,7 @@ import {
   input,
   textarea,
 } from '../dom.js';
+import { readHostSelection } from '../scope.js';
 
 const MISSING_POLICIES = [
   { value: 'error', label: '缺失必需变量时报错' },
@@ -691,14 +692,27 @@ export function createProfiles(api, client, context) {
   }
 
   async function previewWith(fields, selectorBox, poolBox) {
-    if (!context.selectedCardIds || !context.selectedCardIds.length) {
-      api.host.toast('请先在工作台选择一张卡片', 3000, 'close');
+    // 作用域不再存在全局 context 里（那正是 F16 的来源）。档案页预览只需要
+    // **一张**示例卡片：优先用宿主当前选中项，没有就拉一张最新的。
+    const selection = readHostSelection(api);
+    let cardId = selection.ids.length ? String(selection.ids[0]) : '';
+    if (!cardId) {
+      try {
+        const data = await client.cards('');
+        const items = data.items || data.cards || [];
+        cardId = items.length ? String(items[0].id || '') : '';
+      } catch (error) {
+        cardId = '';
+      }
+    }
+    if (!cardId) {
+      api.host.toast('卡片库里没有可用的示例卡片', 3000, 'close');
       return;
     }
     try {
       const profile = collect(fields, selectorBox, poolBox);
       const data = await client.preview({
-        card_id: context.selectedCardIds[0],
+        card_id: cardId,
         profile_id: profile.id,
       });
       api.host.toast(`预览：${data.tokens.total} token（${data.profile.id}）`, 3600, 'settings-help-entry');

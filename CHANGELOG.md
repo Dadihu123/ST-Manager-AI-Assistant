@@ -1,5 +1,183 @@
 # CHANGELOG
 
+## 未发布（2026-10-21，入口收进二级菜单）
+
+宿主新增 `entries[].group` 后，右键菜单 / 批量菜单里的 7 条 context/batch 入口
+全部声明 `"group": "AI 助手"`，不再各占一行。
+
+### 变更
+
+- **入口声明 `group`**：7 条 `kind: context` / `kind: batch` 入口统一加
+  `"group": "AI 助手"`。宿主据此把它们折叠成一个父项，点开是二级浮层；
+  菜单里不再出现「AI 打标此分类全部卡片」「AI 归类…」「AI 精简…」三条并列。
+- `tests/test_manifest_contract.py` 复刻的 `KNOWN_ENTRY_KEYS` 同步加入 `group`
+  （宿主 `core/plugins/entries.py` 是严格白名单，漏了会拒绝加载整个插件）。
+
+## 未发布（2026-10-20，对齐宿主新契约）
+
+宿主 6 条补丁全部合入后，插件侧同步验收并修掉实测暴露的问题。
+
+### 变更
+
+- **`ctx.target` 成为唯一形状**：删掉 `scope.js` 里对 `targetKind` / `targetPath` /
+  `targetIds` 的兼容垫片。宿主已在 `buildOpenContext()` 主动丢弃这些字段，留着
+  读取路径只会让契约重新分叉。
+- **入口进度**：`plugin.js` 新增 `context.setTaskProgress(taskId, {done,total})`，
+  把「正在跑 3/12」同时写到该任务的**全部入口**（批量菜单 / 右键菜单都会画进度条）。
+  审批面板改为只认 `ctx.runId`（`ctx.targetId` 已被宿主删除）。
+- 新增 `open-profiles` 入口（命令面板），此前 `profiles` surface 没有任何入口，
+  用户永远打不开。
+- 世界书精简支持**多本世界书**：`/wi/entries` 接受来源数组并按书分组返回，
+  作业项自带 `worldbook_source`，落地按条目来源分组（旧版只处理第一本，且会串书）。
+- 卡片分类作用域改走插件 HTTP `/cards`（`category` / `limit=0` / `ids`），
+  不再调用并不存在的 `api.cards.*` 前端命名空间。
+
+### 修复
+
+- **`/cards` 与前端作用域解析完全不通**：`scope.js` 读 `api.cards.list`，而前端
+  API 门面没有 `cards` 命名空间 → 「分析此分类」必然报
+  `Cannot read properties of undefined`。实测右键分类才暴露。
+- **提示词档案下拉全是「undefined · 通用」**：`/profiles` 返回的是
+  `{index:{id,name}, system_preview}`，代码按扁平字段读，选项 value 全为空。
+- **`jobs.py` 缺 `CODE_INVALID_PAYLOAD` 导入**：世界书校验失败时抛 `NameError`
+  而不是可读错误。
+- **世界书变量校验过严**：通用档案（builtin-default）里的 `card.name` /
+  `limits.*` 被算成「缺失」，导致「按任务自动匹配」在精简任务上直接失败。
+  现在只校验本任务负责注入的 `wi.*`。
+- **`[hidden]` 被组件布局覆盖**：进度条在提交前就占一块空白（`display:flex`
+  覆盖了 `display:none`）。加作用域内的 `[hidden] { display:none !important }`。
+- 作用域横幅的占位字符 `◎` 换成 CSS 圆点（字体缺字时显示成方框）。
+- 任务面板补一句预览占位说明，避免固定高度面板下半屏全空。
+
+## 未发布（2026-10-19，任务化重构）
+
+按 [任务化重构方案](docs/2026-10-19-task-centric-redesign.md) 落地：把「4 个能力塞在 1 个
+7 段长表单里」改成「一个能力 = 一个任务 = 一个面板」。入口从 4 条扩到 12 条，
+全部覆盖用户会说的词（打标 / 精简 / 归类 / 提议）。
+
+### 新增
+
+- **任务注册表**（`frontend/tasks.js`）：四个任务各自声明 `scopes` / `surface` /
+  `jobTypes` / `writes`，面板与入口从它派生。主按钮文案、面板标题、任务卡都读同一份。
+- **任务中心 hub**（`frontend/views/hub.js`）：坞入口首屏。四个任务卡 + 待审批卡 +
+  最近作业（可点回审批面板）。
+- **通用任务面板**（`frontend/views/task.js`）：作用域横幅 → 参数（≤4 项）→ 预览 →
+  主按钮 → **同面板内联进度** → 结果入口。四个任务共用，行为一致。
+- **作用域解析层**（`frontend/scope.js`）：`ctx.target` → 具体条目。分类不存在、
+  选中集无法识别等情况**抛错**，面板显示红条 + 重试，不再是「0 张」。
+- **作业台账**（`backend/store.py` `record_run`/`update_run`/`list_runs`）与
+  `GET /jobs`：关掉面板后还能找回上次作业（F10）。
+- **审批面板按 `job_type` 渲染**（`frontend/views/review.js` 重写）：
+  世界书并排 diff、归类「现分类 → 目标分类 + 置信度」、提议可勾选方案树，
+  打标才有「写什么」开关。
+- **落地前确认**：列出「将写 N 条概览 / M 个标签 / 移动 K 张 / 创建 X 目录」，
+  取消即不写（此前 `api.ui.confirm` 的 Promise 没 await，取消也会写）。
+- 前端冒烟测试（`tests_frontend/smoke.mjs` + `tests/test_frontend_smoke.py`）：
+  最小 DOM 桩 + 假插件 API，真实执行 `activate()` 与各面板首屏。
+
+### 变更
+
+- `manifest.json`：12 条入口；坞入口指向 `hub`；`label` 全部用用户词；
+  `description` 覆盖四个能力。
+- **面板不再有页签**：`hub` / `analyze` / `polish` / `classify` / `propose` /
+  `review` / `profiles` / `settings` 各是一个 surface，入口直接定位。
+- 状态胶囊从「面板自绘」改为 `frontend/headerStatus.js`，只挂在任务中心标题行
+  （其余面板不再重复拉 `/status`）。
+- 打标去掉「分析目标（概览/标签/两者）」提交参数：提交时永远生成概览 + 标签候选，
+  写什么在**落地时**用 `write: {note, tags}` 决定 —— 消除 review 模式下无效的假控件。
+- 世界书改写结果回传 `original`，审批页因此能做并排 diff。
+- 提示词档案页的「预览」不再依赖全局选中集：优先宿主当前选中项，没有就取最新一张。
+
+### 修复
+
+- **世界书精简只处理第一本书**：作用域是「一个分类下的 N 本世界书」时，旧实现取
+  `books[0]`，只改第一本，且回写会把候选写进第一个来源（串书）。现在：
+  `/wi/entries` 接受来源数组并按书分组返回（读不到的书单独标记，不让整个分类失败）；
+  每个作业项自带 `worldbook_source`；落地按条目自带来源分组。
+
+- **`_apply_propose` 缺审批门禁**：提议跑完就能直接创建目录/标签，与其余三类作业
+  （都要求 `status == done`）不一致。现在未审批返回 409 并说明先去审批。
+- **世界书改写不检查提示词变量缺失**：档案引用了 `wi_rewrite` 任务不提供的变量时，
+  旧版带着空值调用模型（浪费一次调用且产出无法校验）。现在提前失败并列出缺什么。
+- **作用域跨入口残留**（F16）：删掉全局 `context.selectedCardIds` / `openTarget`，
+  作用域只活在当前任务面板里；坞打开时必定是空作用域。
+- **角标只写第一个入口**：`entryIds.some(...)` 会在第一个成功处短路，
+  `open-review` 永远拿不到待审批数。改为逐个写入。
+- **进度永远 0%**：SSE `snapshot` 的计数在顶层（`total`/`completed`），旧代码读
+  `job.counts`。新增 `normalizeProgress()` 兜住两种形状。
+
+### 删除
+
+- `frontend/views/workbench.js`（7 段长表单，拆进 4 个任务面板）
+- `frontend/selection.js`（全局选中集耦合，改用 `api.host.selection()` + `scope.js`）
+- `panel.js` 的 `TABS` / `createPanelBody` / `createPanelBody` 页签体系
+
+### 宿主侧（需主程序配合，见 [补丁清单](docs/2026-10-19-host-patch.md)）
+
+插件已按目标契约实现并保留降级路径，以下补丁可独立应用：
+
+1. `ctx.target` 语义化（宿主不再在右键瞬间拉 10 万张卡片）
+2. `api.host.selection()`
+3. `api.worldbook.sources()`
+4. 批量菜单移动端渲染 + 角标/进度渲染
+5. 命令面板过滤 `context` 类入口、`batch` 传选中集、`kindLabel` 补 `batch`
+6. `api.jobs.review()` / `reviewBatch()`
+
+---
+
+## 未发布（2026-10-19，用户验收反馈）
+
+用户报了 3 个问题：两个 UI 缺陷（下拉框外观不统一、选中态被容器边界裁掉）和一个功能
+问题（拉取模型列表必须先保存 provider）。三个都在插件侧修复，**不改宿主代码**。
+
+### 修复
+
+- **模型候选下拉已与其它下拉框统一**：此前它写成
+  `<select class="plugin-stm-ai-assistant-select">` —— 这个类名其实是自定义下拉
+  `div` wrapper 的类名，原生 `select` 套上它只拿到「透明底 + 无边框」，拿不到 trigger
+  那套外观，和同一张表单里的「接口协议」并排时明显不是一套控件。现在改用
+  `createUi().select()`（`dom.js:styledSelect`），拉取结果用 `setOptions()` 填充，
+  字段加 `--wide` 跨满栅格行（模型名长 + 右侧并排放「拉取模型列表」按钮）。
+
+- **下拉菜单不再被面板滚动区裁掉**：菜单是 `position: absolute`，会被最近的可滚动
+  祖先在裁切边切掉——设置页下半部分的下拉一打开只剩两三行可见（实测菜单 16rem、
+  滚动区只剩 165px）。`styledSelect.open()` 现在按滚动区可用空间决定朝下/朝上
+  （`.is-dropup`）并把高度钳到可用空间内部滚动，朝上时 7 个候选一次看全；
+  仍用 `absolute`（层级/定位归宿主，不做 `position: fixed`）。
+
+- **选中态不再被弹层内容区边界裁掉**：插件自建的内部滚动区
+  `.plugin-stm-ai-assistant-body` 原先 inline padding 为 0，而它的
+  `overflow-x: hidden` 会在 padding box 处裁切。宿主给输入框的焦点态是
+  `box-shadow: 0 0 0 3px`（外扩 3px）与 `outline: 2px + offset 2px`（外扩 4px），
+  且**不产生可滚动溢出**——因此贴边的输入框（设置页 id / 读取超时 / API Key /
+  默认模型、提示词档案优先级、工作台采样张数等）左右各被吃掉 3~4px。
+  现在主体行内 padding = 0.5rem（8px ≥ 4px 最大外扩），页签条同步 0.5rem 保持左右对齐；
+  纵向也补了底部 padding（滚到底时最后一个控件的焦点环同样会被裁）。
+  窄屏 `padding: 0.85rem`（13.6px）绝对值更大，修复不会被覆盖失效。
+
+- **拉取模型列表不再要求先保存 provider**：`POST /providers/<id>/models` 只认已落盘
+  的密钥，且 provider 不存在直接 404 —— 新 provider 必须先保存、再重新打开才能拉。
+  现在新增草稿型 `POST /models`：请求体带表单当前的 `base_url` / `api_key` /
+  `extra_headers` 即可，provider 未保存也能拉。Key 优先级「表单刚输入的 → 已保存的」，
+  明文 Key 只在这一个请求里用（不落盘、不回显）。旧路径保留并共享同一实现，
+  provider 不存在时不再 404 而是走草稿逻辑。
+
+### 测试
+
+- 新增 `tests/test_settings_view_contract.py`（5 用例）：锁定「模型候选必须是
+  styledSelect」「字段跨行」「拉取请求带 provider_id / base_url / api_key」
+  「客户端指向草稿型 `/models`」「下拉菜单按滚动区可用空间翻向/钳高」——
+  这些问题只在浏览器里显形，用静态契约钉住。
+- `tests/test_routes.py`（+9 用例）：草稿型拉取、表单 Key 覆盖已保存 Key、未带 Key 时
+  回退已保存、`extra_headers` 覆盖/回退、缺 Key / 缺 base_url / 非法 base_url 一律
+  200 + `ok=false`（不阻塞配置）、响应不含明文 Key。
+- 全量：`python -m pytest -q` → **713 passed**。
+- 真实宿主验证（127.0.0.1:5000，重启后台以加载新路由）：`POST /models` 用已保存
+  密钥拉到 6 个 deepseek 模型；未保存 provider + 表单 Key 也发出了请求（401 来自
+  上游，说明请求确实到达）；缺 Key / 缺 base_url 都是 200 + `ok=false`。
+  浏览器侧：设置页模型候选已是 styledSelect 并列出 6 个模型、朝上完整展开；
+  四个页签的输入框左右各留 8px（无横向滚动），提示词档案「优先级」焦点环完整可见。
+
 ## 0.2.0（未发布）
 
 **破坏性变更：`api_version` 1 → 2。** 需要主程序 `PLUGIN_API_VERSION >= 2`

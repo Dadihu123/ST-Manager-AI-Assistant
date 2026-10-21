@@ -51,8 +51,8 @@ export function createClient(api) {
       call(`/providers/${encodeURIComponent(id)}/secrets`, { method: 'DELETE' }),
     testProvider: (id, model = '') =>
       call(`/providers/${encodeURIComponent(id)}/test`, { method: 'POST', body: { model } }),
-    listModels: (id, overrides = {}) =>
-      call(`/providers/${encodeURIComponent(id)}/models`, { method: 'POST', body: overrides }),
+    // 草稿型模型列表：provider 未保存时也能拉（带 base_url + 表单里的明文 api_key）
+    listModels: (payload) => call('/models', { method: 'POST', body: payload || {} }),
 
     preview: (payload) => call('/prompt/preview', { method: 'POST', body: payload }),
     validateTemplates: (templates) =>
@@ -82,6 +82,14 @@ export function createClient(api) {
       call('/jobs/agent', { method: 'POST', body: payload }),
 
     job: (runId) => call(`/jobs/${encodeURIComponent(runId)}`),
+    /** 最近作业（插件台账 + 宿主实时状态）。 */
+    jobs: (limit = 20, status = '') => {
+      const query = new URLSearchParams();
+      if (limit) query.set('limit', String(limit));
+      if (status) query.set('status', status);
+      const suffix = query.toString();
+      return call(`/jobs${suffix ? `?${suffix}` : ''}`);
+    },
     applyJob: (runId, payload = {}) =>
       call(`/jobs/${encodeURIComponent(runId)}/apply`, { method: 'POST', body: payload }),
     cancelJob: (runId) => call(`/jobs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
@@ -93,6 +101,18 @@ export function createClient(api) {
         method: 'POST',
         body: { status },
       }),
+
+    /** 批量审批：并发提交，逐条失败不影响其余。 */
+    async reviewItems(runId, updates) {
+      const list = Array.isArray(updates) ? updates : [];
+      const results = await Promise.allSettled(
+        list.map((entry) => this.reviewItem(runId, entry.key, entry.status)),
+      );
+      const failed = results
+        .map((result, index) => (result.status === 'rejected' ? list[index] : null))
+        .filter(Boolean);
+      return { total: list.length, failed };
+    },
 
     suggestions: () => call('/suggestions'),
     clearSuggestions: (names) => call('/suggestions/clear', { method: 'POST', body: { names } }),

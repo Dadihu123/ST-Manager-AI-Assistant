@@ -40,6 +40,8 @@ KNOWN_ENTRY_KEYS = frozenset({
     'id', 'kind', 'label', 'description', 'icon', 'contexts',
     'requires_selection', 'surface', 'priority', 'badge', 'shortcut',
     'when', 'disabledHint',
+    # 菜单分组：同一插件的 context/batch 入口折叠成一个父项（如「AI 助手」）
+    'group',
 })
 KNOWN_WHEN_KEYS = frozenset({
     'mode', 'selection', 'indexState', 'config', 'hostVersion', 'feature', 'target',
@@ -87,6 +89,13 @@ def manifest():
 @pytest.fixture(scope='module')
 def entries(manifest):
     return manifest['frontend'].get('entries') or []
+
+
+@pytest.fixture(scope='module')
+def tasks_source():
+    """`frontend/tasks.js` 源码：任务注册表是入口文案与主按钮的单一来源。"""
+    with open(os.path.join(ROOT, 'frontend', 'tasks.js'), 'r', encoding='utf-8') as handle:
+        return handle.read()
 
 
 def test_manifest_id_and_version(manifest):
@@ -190,15 +199,81 @@ def test_entry_kinds_are_valid_and_within_community_subset(entries):
 
 
 def test_entries_land_on_distinct_host_locations(entries):
-    """入口必须落在**互不相同**的宿主位置。
+    """入口必须覆盖宿主真实存在的落点，且每条入口都有自己的落点。
 
-    旧版 4 个入口全部指向同一个 `surface: workbench`，导致「入口总览里看起来
-    有很多入口，实际点开都是同一个面板」。收敛后每个 kind 各有一个真实消费者：
-    `dock` → 入口坞、`context` → 右键菜单、`batch` → 批量操作菜单、`settings` → 设置页。
+    重构后（任务化）不再「一个 kind 只准出现一次」——一个任务需要同时从右键、
+    批量菜单进入。真正要守的是：
+    - 每个 kind 都在宿主的可渲染集合里（不会被静默丢弃）；
+    - 同 kind 的入口靠 `surface` 区分，指向不同任务面板；
+    - 入口数不超过宿主上限（`MAX_ENTRIES_PER_PLUGIN = 16`）。
     """
     kinds = [entry.get('kind') for entry in entries]
-    assert len(kinds) == len(set(kinds)), f'存在落点重复的 kind: {kinds}'
-    assert set(kinds) == {'dock', 'context', 'batch', 'settings'}, kinds
+    assert set(kinds) == {'dock', 'context', 'batch', 'command', 'settings'}, kinds
+    assert len(entries) <= 16, f'入口数 {len(entries)} 超过宿主上限 16'
+
+    # 同一 kind 下不应有两条入口在**同样的上下文**里打开同一个 surface
+    seen = {}
+    for entry in entries:
+        kind = entry.get('kind')
+        surface = (entry.get('surface') or {}).get('id')
+        if not surface:
+            continue
+        when = entry.get('when') or {}
+        pair = (kind, surface, when.get('mode') and tuple(when['mode']), when.get('target'))
+        assert pair not in seen, (
+            f'入口 {entry.get("id")} 与 {seen.get(pair)} 在同样上下文里都打开 {surface}，属于重复入口'
+        )
+        seen[pair] = entry.get('id')
+
+    # 单插件坞槽位上限 2
+    dock_entries = [entry for entry in entries if entry.get('kind') == 'dock']
+    assert len(dock_entries) <= 2, f'坞入口 {len(dock_entries)} 超过单插件上限 2'
+
+
+def test_every_task_has_at_least_one_entry(entries):
+    """每个任务都必须至少有一个入口，否则「功能存在但进不去」。
+
+    任务的唯一声明处是 `frontend/tasks.js`；这里解析它的 `surface:` 取值，
+    再做双向核对：任务 → 入口、入口 → 已注册 surface。
+    """
+    with open(os.path.join(ROOT, 'frontend', 'tasks.js'), 'r', encoding='utf-8') as handle:
+        source = handle.read()
+
+    task_surfaces = re.findall(r"surface:\s*'([a-z-]+)'", source)
+    assert task_surfaces, '未能从 tasks.js 解析出任务 surface'
+    assert len(task_surfaces) == len(set(task_surfaces)), '两个任务指向了同一个 surface'
+
+    entry_surfaces = {
+        (entry.get('surface') or {}).get('id')
+        for entry in entries
+    }
+    for surface in task_surfaces:
+        assert any(
+            (entry.get('surface') or {}).get('id') == surface or entry.get('id') == surface
+            for entry in entries
+        ), f'任务面板 {surface} 没有任何入口'
+
+    # 反向：每个入口的 surface 必须在 panel.js 的 SURFACES 里注册过
+    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
+        panel_source = handle.read()
+    registered = set(re.findall(r"^\s{2}([a-z-]+):\s*\{ title:", panel_source, re.M))
+    assert registered, '未能从 panel.js 解析出 SURFACES'
+    for entry in entries:
+        surface = (entry.get('surface') or {}).get('id')
+        if surface:
+            assert surface in registered, f'入口 {entry.get("id")} 指向未注册的 surface: {surface}'
+
+
+def test_entry_labels_use_user_vocabulary(tasks_source):
+    """入口文案必须用用户词（打标 / 精简 / 归类 / 提议），而不是内部术语。
+
+    这是 F2/F3 的回归护栏：三个功能此前完全没有入口，命令面板也搜不到。
+    `label` 决定命令面板能否被搜到，`verb` 决定主按钮文案——
+    两者必须说同一套词。
+    """
+    labels = tasks_source
+    for word in ('打标', '精简', '归类', '提议'):
+        assert word in labels, f'任务注册表里缺少用户词「{word}」'
 
 
 def test_folder_context_entry_declares_folder_target(entries):
@@ -228,50 +303,55 @@ def test_selected_batch_entry_requires_selection_with_hint(entries):
     assert str(entry.get('disabledHint') or '').strip()
 
 
-def test_obsolete_open_review_entry_is_gone(entries):
-    """`open-review` 与 `workbench` 落点重复（都开同一个面板的同一批内容），已删除。
+def test_obsolete_single_surface_entries_are_gone(entries):
+    """四个入口全部指向同一个 `workbench` surface 的旧结构必须消失。
 
-    它的唯一独特价值是「直接跳到审批页签」，而页签切换由 `assistant-settings`
-    之外的入口上下文决定——保留它只会让入口总览里多一条重复快捷键。
+    旧版 `analyze-selected` / `analyze-folder` / `assistant-settings` 都开同一个
+    四页签面板，于是「入口很多、点开都一样」。现在每条入口都有自己的 surface。
     """
-    ids = [entry.get('id') for entry in entries]
-    assert 'open-review' not in ids, 'open-review 应已删除（与 workbench 重复）'
+    by_id = {entry.get('id'): entry for entry in entries}
+    workbench_targets = [
+        entry for entry in entries
+        if (entry.get('surface') or {}).get('id') == 'workbench'
+    ]
+    assert workbench_targets == [], '不应再有入口直接指向 workbench surface'
+    assert by_id['analyze-selected']['surface']['id'] == 'analyze'
+    assert by_id['assistant-settings']['surface']['id'] == 'settings'
 
 
 def test_pending_badge_targets_the_workbench_entry():
     """待审批角标必须挂在仍然存在的入口上。
 
-    旧版挂在 `open-review` 上，删掉该入口后角标会静默丢失（`setBadge` 查不到
-    条目直接返回 false），用户再也看不到「有几条待审批」。
+    `setBadge` 查不到条目会静默返回 false，角标就丢了。重构后角标同时写
+    `workbench`（坞）与 `open-review`（命令面板），两处都要存在。
     """
     with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
         source = _strip_js_comments(handle.read())
-    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
-        panel_source = _strip_js_comments(handle.read())
 
-    for name, text in (('plugin.js', source), ('panel.js', panel_source)):
-        assert "setBadge('open-review'" not in text, f'{name} 仍在给已删除的入口写角标'
-        assert "setBadge('workbench'" in text, f'{name} 必须把角标写到 workbench'
+    assert 'setBadge' in source, 'plugin.js 不再写入口角标'
+    assert "'workbench'" in source, '角标必须覆盖 workbench 入口'
+    assert 'open-review' in source, '角标必须覆盖 open-review 入口'
 
 
-def test_workbench_surface_is_a_modal(entries, manifest):
-    """`workbench` 从 `panel` 改为 `modal`（主工作台需要遮罩 + 焦点陷阱）。
+def test_workbench_surface_routes_to_the_hub(entries):
+    """坞入口必须落在「任务中心」而不是某个具体任务面板。
 
-    manifest 与 `frontend/plugin.js` 的注册必须**同时**改，否则宿主按 manifest
-    的类型建容器、插件按自己的类型理解尺寸，长表单会被挤在窄抽屉里。
+    任务化之后坞是统一出发页；若它指向 `analyze`，用户点「AI 助手」会直接进
+    打标面板，其余三个任务不可达。
     """
     by_id = {entry.get('id'): entry for entry in entries}
-    assert by_id['workbench']['surface']['type'] == 'modal'
+    dock = by_id['workbench']
+    assert dock['kind'] == 'dock'
+    assert dock['surface']['id'] == 'hub'
+    assert dock['surface']['type'] == 'modal'
+    assert str(dock.get('shortcut') or '').strip(), '坞入口必须保留快捷键'
 
     with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
         source = handle.read()
-    match = re.search(
-        r"api\.surfaces\.register\(\s*'workbench'\s*,\s*\{(.*?)\n  \}\)",
-        source,
-        re.S,
+    assert "api.surfaces.register(surfaceId" in source, (
+        'plugin.js 应按 SURFACES 表批量注册，而不是手写四条 register'
     )
-    assert match, '未能解析 workbench 的 surfaces.register 调用'
-    assert "type: 'modal'" in match.group(1), 'plugin.js 里 workbench 仍不是 modal'
+    assert "'modal'" in source, 'surface 类型必须是 modal'
 
 
 def test_entry_labels_present(entries):
@@ -438,8 +518,8 @@ def test_frontend_ui_icons_exist_in_host():
     assert missing == [], f'引用了不存在的宿主图标: {missing}'
 
 
-def test_panel_tab_icons_are_host_icons():
-    """`panel.js` 的 TABS 图标名必须存在（它们是页签上的图标，不走 entries）。"""
+def test_panel_surface_icons_are_host_icons():
+    """`panel.js` 的 SURFACES 图标名必须存在（它们是面板标题行的图标）。"""
     if not os.path.isdir(MAIN_APP_DIR):
         pytest.skip('主程序仓库不可用')
 
@@ -454,10 +534,10 @@ def test_panel_tab_icons_are_host_icons():
     with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
         source = handle.read()
 
-    names = re.findall(r"\{ id: '[a-z-]+', label: '[^']+', icon: '([a-z0-9-]+)' \}", source)
-    assert names, '未能从 panel.js 解析出页签图标名'
+    names = re.findall(r"\{ title: '[^']+', icon: '([a-z0-9-]+)'", source)
+    assert names, '未能从 panel.js 解析出 surface 图标名'
     missing = sorted(name for name in names if not sprite_for_icon(name))
-    assert missing == [], f'页签引用了不存在的宿主图标: {missing}'
+    assert missing == [], f'surface 引用了不存在的宿主图标: {missing}'
 
 
 # --------------------------------------------------------------- schema 子集
@@ -664,22 +744,18 @@ def test_entry_status_writes_are_replayed_after_registry_ready():
     assert 'reporter.setStatus(' in outside, 'activate() 里应通过 reporter 写状态'
 
 
-def test_panel_pending_badge_goes_through_injected_writer():
-    """待审批角标同理：面板优先走注入的写入器。
+def test_pending_badge_goes_through_injected_writer():
+    """待审批角标必须走注入的写入器（带「注册表就绪重放」）。
 
-    `panel.js` 保留了「未注入时直接调」的降级分支（便于单独构造/单测），
-    但**正常路径**必须先走 `context.setPendingBadge`。
+    宿主先 `activate()` 再建入口表，激活期间直接 `api.entries.setBadge()` 会静默
+    失败。因此 `plugin.js` 里的回报器要记住期望值、在 `entries:changed` 时重放。
     """
-    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
+    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
         source = _strip_js_comments(handle.read())
 
-    assert 'context.setPendingBadge' in source, (
-        'panel.js 应通过注入的写入器设置角标（带注册表就绪重放）'
-    )
-    # 注入路径必须出现在直接调用之前（先尝试注入的写入器）
-    injected = source.index('context.setPendingBadge')
-    direct = source.index('api.entries.setBadge(')
-    assert injected < direct, '必须先走注入的写入器，直接调用只能作为降级分支'
+    assert 'setPendingBadge' in source, 'plugin.js 应暴露待审批角标的写入器'
+    assert 'entries:changed' in source, '必须订阅 entries:changed 做重放'
+    assert 'api.entries.setBadge(' in source, '最终仍要写到宿主入口角标上'
 
 
 # --------------------------------------------------------------- 真实校验器
@@ -704,7 +780,7 @@ def test_manifest_passes_main_app_validator():
         'ai.analyze', 'ai.wi_rewrite', 'ai.classify', 'ai.propose', 'ai.agent',
     ]
     assert parsed.has_backend and parsed.has_frontend
-    assert len(parsed.frontend_entries) == 4
+    assert len(parsed.frontend_entries) == 12
     # 「新契约零警告」是最强断言：图标名、entries 子键、权限、hook 全部干净
     assert parsed.warnings == [], parsed.warnings
 
@@ -727,7 +803,14 @@ def test_entries_pass_tier_filter_for_both_tiers():
         sys.path.remove(MAIN_APP_DIR)
 
     parsed = PluginManifest.load(ROOT, check_dir_name=False)
-    expected = {'workbench', 'analyze-folder', 'analyze-selected', 'assistant-settings'}
+    expected = {
+        'workbench',
+        'analyze-folder', 'analyze-selected',
+        'classify-folder', 'classify-selected',
+        'polish-embedded', 'polish-selector', 'polish-folder',
+        'open-review', 'propose-library', 'open-profiles',
+        'assistant-settings',
+    }
 
     for tier in ('official', 'community'):
         kept, warnings = apply_tier(parsed.plugin_id, parsed.frontend_entries, tier=tier)
@@ -789,15 +872,23 @@ def test_plugin_is_registered_as_official_in_main_app_catalog():
 
 @pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
 def test_surface_ids_match_frontend_registrations():
-    """坑 2：manifest 的 `surface.id` 必须在 `frontend/plugin.js` 里真实注册过。
+    """坑 2：manifest 的 `surface.id` 必须在插件侧真实注册过。
 
     坞与命令面板都按 `<pluginId>:<surface.id ?? entry.id>` 查表；写错会导致
     「点击无反应且不报错」——所以这里做静态对齐检查。
+
+    重构后 surface 由 `panel.js` 的 `SURFACES` 表批量注册（`plugin.js` 遍历它），
+    因此核对对象是那张表 + `prompt-preview` 这条手工注册的次级 surface。
     """
     with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
         source = handle.read()
-    registered = set(re.findall(r"api\.surfaces\.register\(\s*'([a-z0-9-]+)'", source))
-    assert registered, '未能从 plugin.js 解析出 surfaces.register 调用'
+    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
+        panel_source = handle.read()
+
+    registered = set(re.findall(r"^\s{2}([a-z0-9-]+):\s*\{ title:", panel_source, re.M))
+    registered.update(re.findall(r"api\.surfaces\.register\(\s*'([a-z0-9-]+)'", source))
+    assert registered, '未能解析出已注册的 surface'
+    assert 'surfaceIds' in source, 'plugin.js 应遍历 SURFACES 批量注册'
 
     with open(MANIFEST_PATH, 'r', encoding='utf-8') as handle:
         manifest = json.load(handle)
@@ -805,7 +896,6 @@ def test_surface_ids_match_frontend_registrations():
     for entry in manifest['frontend'].get('entries') or []:
         surface = entry.get('surface') or {}
         surface_id = surface.get('id') or entry.get('id')
-        if entry.get('kind') in ('command', 'settings', 'context', 'dock'):
-            assert surface_id in registered, (
-                f'入口 {entry.get("id")} 的 surface "{surface_id}" 未在 plugin.js 注册'
-            )
+        assert surface_id in registered, (
+            f'入口 {entry.get("id")} 的 surface "{surface_id}" 未注册'
+        )

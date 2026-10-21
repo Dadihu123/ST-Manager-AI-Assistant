@@ -24,3 +24,9 @@ design/
 # 临时产物（截图 / JSON 报告）
 tmp_crops/
 tmp_*.png
+.ledger-*/
+.pytest_local/
+.pytest_tmp/
+
+# 测试用临时数据目录（mkdtemp 落在仓库根，形如 tmpc23wv1zz/）
+/tmp*/

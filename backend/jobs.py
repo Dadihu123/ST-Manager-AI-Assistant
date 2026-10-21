@@ -29,6 +29,7 @@ from .core import trimming
 from .core import wicheck as wicheck_core
 from .core.errors import (
     CODE_CARD_UNREADABLE,
+    CODE_INVALID_PAYLOAD,
     CODE_LLM_AUTH_FAILED,
     CODE_MISSING_VARIABLE,
     CODE_PARSE_FAILED,
@@ -950,6 +951,24 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
 
     rendered = _render_rewrite_prompt(profile, entry, target_format)
 
+    # 提示词变量缺失时不要带着空值去调模型：模板里 `{{wi.entry_content}}`
+    # 这类必填变量若没被渲染，浪费一次调用还产出无法校验的结果。
+    #
+    # **只校验本任务负责注入的 `wi.*`**：通用档案（builtin-default）同时被
+    # 打标等任务复用，里面必然有 `card.name` / `limits.*` 这些精简任务本来
+    # 就不提供的变量——把它们也算成「缺失」，会让「按任务自动匹配」在精简
+    # 任务上直接报错（实测就是这么坏的）。
+    missing = [
+        str(item) for item in (rendered.get('missing_required') or [])
+        if str(item).startswith('wi.')
+    ]
+    if missing:
+        raise AiAssistantError(
+            CODE_INVALID_PAYLOAD,
+            f'提示词模板缺少世界书变量：{", ".join(missing)}；'
+            '请换用精简任务可用的档案，或在「提示词档案」里补齐这些变量',
+        )
+
     result = llm.chat(
         rendered['messages'],
         provider=provider, api_key=api_key, extra_headers=extra_headers,
@@ -978,6 +997,12 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
     result_payload = {
         'entry_uid': entry_uid,
         'entry_name': str(entry.get('comment') or entry.get('name') or ''),
+        # 条目属于哪本世界书：多书作业回写时必须按它分组，否则会把 B 书的候选
+        # 写进 A 书（同一作业可以横跨「一个分类下的 N 本书」）。
+        'worldbook_source': dict(source),
+        # 审批页要做并排 diff：把原文一并回传（旧版只回传 candidate，
+        # 前端因此只能显示「压缩比」，看不到改了什么）。
+        'original': original_content,
         'original_tokens': checked['metrics']['original_tokens'],
         'candidate_tokens': checked['metrics']['candidate_tokens'],
         'token_ratio': checked['metrics']['token_ratio'],

@@ -83,7 +83,16 @@ def test_cards_lists_from_database(tmp_path):
     client, _api, _store = build_app(db_rows=rows, tmp_path=tmp_path)
 
     payload = client.get('/cards').get_json()
-    assert payload['items'] == [{'card_id': 'Alice.png', 'name': 'Alice', 'tags': ['奇幻']}]
+    # `id` / `category` / `token_count` 是给**前端作用域解析**用的：
+    # `scope.js` 用它们判断「这个分类下有几张卡」，不再自己猜字段名。
+    assert payload['items'] == [{
+        'card_id': 'Alice.png',
+        'id': 'Alice.png',
+        'name': 'Alice',
+        'category': '',
+        'token_count': 0,
+        'tags': ['奇幻'],
+    }]
 
 
 def test_cards_filters_by_keyword(tmp_path):
@@ -332,10 +341,164 @@ def test_models_route_reports_missing_key_without_4xx(env):
     assert 'API Key' in payload['message']
 
 
-def test_models_route_404_for_unknown_provider(env):
+def test_models_route_unknown_provider_falls_back_to_draft(env, monkeypatch):
+    """未保存的 provider 不再 404：请求体带全地址 + Key 时照样能拉。"""
     client, _api, _store = env
-    response = client.post('/providers/nope/models', json={})
-    assert response.status_code == 404
+    captured = []
+
+    def fake_list_models(provider, api_key, *, extra_headers=None, transport=None):
+        captured.append({'provider': provider, 'api_key': api_key})
+        return {'ok': True, 'models': ['m-1'], 'protocol': 'openai_chat', 'message': ''}
+
+    monkeypatch.setattr(routes_module.llm, 'list_models', fake_list_models)
+    response = client.post('/providers/nope/models', json={
+        'base_url': 'https://api.example.com/v1', 'api_key': 'sk-draft',
+    })
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload['success'] is True
+    assert payload['ok'] is True
+    assert captured[0]['api_key'] == 'sk-draft'
+    assert captured[0]['provider']['base_url'] == 'https://api.example.com/v1'
+
+
+def test_models_route_unknown_provider_missing_key_is_not_404(tmp_path):
+    """旧路径对未保存 provider 缺 Key 时也只是 ok=False，不再是 404。"""
+    client, _api, _store = build_app(secrets={}, tmp_path=tmp_path)
+    response = client.post('/providers/nope/models', json={
+        'base_url': 'https://api.example.com/v1',
+    })
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload['success'] is True
+    assert payload['ok'] is False
+    assert 'API Key' in payload['message']
+
+
+def test_models_draft_route_uses_form_key_and_base_url(env, monkeypatch):
+    """`POST /models`：未保存 provider + 表单里的地址/Key 即可拉取。"""
+    client, _api, _store = env
+    captured = []
+
+    def fake_list_models(provider, api_key, *, extra_headers=None, transport=None):
+        captured.append({'provider': provider, 'api_key': api_key,
+                         'extra_headers': extra_headers})
+        return {'ok': True, 'models': ['deepseek-chat'], 'protocol': 'openai_chat',
+                'message': ''}
+
+    monkeypatch.setattr(routes_module.llm, 'list_models', fake_list_models)
+    payload = client.post('/models', json={
+        'api_key': 'sk-form-secret',
+        'base_url': 'https://api.deepseek.com/v1',
+        'api_style': 'openai_chat',
+        'allow_local': False,
+        'connect_timeout': 3,
+        'request_timeout': 30,
+    }).get_json()
+
+    assert payload['success'] is True
+    assert payload['ok'] is True
+    assert payload['models'] == ['deepseek-chat']
+    provider = captured[0]['provider']
+    assert provider['base_url'] == 'https://api.deepseek.com/v1'
+    assert provider['connect_timeout'] == 3
+    assert provider['request_timeout'] == 30
+    assert captured[0]['api_key'] == 'sk-form-secret'
+    # 密钥纪律：响应里绝不回显明文 Key
+    assert 'sk-form-secret' not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_models_draft_route_overrides_saved_key(env, monkeypatch):
+    """已保存 provider + 请求体带新 Key → 新 Key 覆盖已保存密钥。"""
+    client, api, _store = env
+    api.secrets.set('provider__openai__api_key', 'sk-saved')
+    captured = []
+
+    def fake_list_models(provider, api_key, *, extra_headers=None, transport=None):
+        captured.append({'provider': provider, 'api_key': api_key})
+        return {'ok': True, 'models': ['gpt-4o'], 'protocol': 'openai_chat', 'message': ''}
+
+    monkeypatch.setattr(routes_module.llm, 'list_models', fake_list_models)
+    payload = client.post('/models', json={
+        'provider_id': 'openai', 'api_key': 'sk-from-form',
+    }).get_json()
+
+    assert payload['ok'] is True
+    assert captured[0]['api_key'] == 'sk-from-form'
+    # 未传 base_url 时沿用已保存 provider 的地址
+    assert captured[0]['provider']['base_url'] == 'https://api.openai.com/v1'
+
+
+def test_models_draft_route_falls_back_to_saved_key(env, monkeypatch):
+    """回归：请求体不带 api_key 时仍用已保存的密钥。"""
+    client, api, _store = env
+    api.secrets.set('provider__openai__api_key', 'sk-saved')
+    captured = []
+
+    def fake_list_models(provider, api_key, *, extra_headers=None, transport=None):
+        captured.append({'api_key': api_key})
+        return {'ok': True, 'models': ['gpt-4o'], 'protocol': 'openai_chat', 'message': ''}
+
+    monkeypatch.setattr(routes_module.llm, 'list_models', fake_list_models)
+    payload = client.post('/models', json={'provider_id': 'openai'}).get_json()
+
+    assert payload['ok'] is True
+    assert captured[0]['api_key'] == 'sk-saved'
+
+
+def test_models_draft_route_overrides_saved_headers(env, monkeypatch):
+    """表单里的 extra_headers 覆盖已保存请求头；不传时回退已保存值。"""
+    client, api, _store = env
+    api.secrets.set('provider__openai__extra_headers', '{"X-Old": "old"}')
+    captured = []
+
+    def fake_list_models(provider, api_key, *, extra_headers=None, transport=None):
+        captured.append({'extra_headers': extra_headers})
+        return {'ok': True, 'models': ['gpt-4o'], 'protocol': 'openai_chat', 'message': ''}
+
+    monkeypatch.setattr(routes_module.llm, 'list_models', fake_list_models)
+
+    client.post('/models', json={'provider_id': 'openai',
+                                 'extra_headers': '{"X-Title": "ST-Manager"}'})
+    assert captured[-1]['extra_headers'] == {'X-Title': 'ST-Manager'}
+
+    client.post('/models', json={'provider_id': 'openai'})
+    assert captured[-1]['extra_headers'] == {'X-Old': 'old'}
+
+
+def test_models_draft_route_requires_api_key(tmp_path):
+    """未保存 provider 且不带 Key → 200 + ok=False（不阻塞配置）。"""
+    client, _api, _store = build_app(secrets={}, tmp_path=tmp_path)
+    response = client.post('/models', json={'base_url': 'https://api.example.com/v1'})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload['success'] is True
+    assert payload['ok'] is False
+    assert payload['models'] == []
+    assert 'API Key' in payload['message']
+
+
+def test_models_draft_route_requires_base_url(env):
+    client, _api, _store = env
+    response = client.post('/models', json={'api_key': 'sk-x'})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload['ok'] is False
+    assert 'base_url' in payload['message']
+
+
+def test_models_draft_route_rejects_bad_base_url(env):
+    client, _api, _store = env
+    payload = client.post('/models', json={
+        'base_url': 'file:///etc/passwd', 'api_key': 'sk-x',
+    }).get_json()
+
+    assert payload['ok'] is False
+    assert payload['models'] == []
 
 
 # ------------------------------------------------------------------ 预览

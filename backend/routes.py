@@ -44,11 +44,14 @@ from .jobs import (
     read_tag_library,
     split_tags,
 )
-from .store import api_key_secret_name
+from .store import api_key_secret_name, normalize_provider
 
 logger = logging.getLogger(__name__)
 
 CARD_LIST_LIMIT = 500
+
+# 世界书条目预览一次最多读几本（逐本读文件，太多会卡住面板）
+PREVIEW_MAX_BOOKS = 50
 APPLY_ITEM_LIMIT = 20000
 RECENT_USAGE_LIMIT = 20
 APPLIED_RUNS_KEEP = 20
@@ -90,6 +93,27 @@ def _body() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _record_run(store, run_id: str, *, task: str, job_type: str, total: int,
+                apply_mode: str = '', extra=None) -> None:
+    """把作业写进插件自己的轻量台账（供「最近作业 / 找回」使用）。"""
+    if not str(run_id or '').strip():
+        return
+    record = {
+        'run_id': str(run_id),
+        'task': str(task or ''),
+        'job_type': str(job_type or ''),
+        'total': int(total or 0),
+        'apply_mode': str(apply_mode or ''),
+        'status': 'queued',
+    }
+    if isinstance(extra, dict):
+        record.update({key: value for key, value in extra.items() if value is not None})
+    try:
+        store.record_run(record)
+    except Exception:  # noqa: BLE001 - 台账失败不能影响作业提交
+        logger.warning('记录作业台账失败: %s', run_id, exc_info=True)
+
+
 def _load_job_items(api, run_id: str, *, limit: int = APPLY_ITEM_LIMIT) -> list:
     """读取作业的全部条目。
 
@@ -120,6 +144,95 @@ def _normalize_card_ids(raw) -> list:
         seen.add(text)
         result.append(text)
     return result
+
+
+#: 草稿型模型列表允许请求体覆盖的 provider 字段（其余字段沿用已保存值/默认值）。
+_DRAFT_PROVIDER_FIELDS = (
+    'base_url', 'api_style', 'allow_local', 'connect_timeout', 'request_timeout',
+)
+
+
+def _has_form_value(value) -> bool:
+    """请求体字段是否算「表单显式给了值」。
+
+    布尔 `False` 也算显式值（关掉「允许本地地址」时必须能覆盖已保存的 True），
+    只有 `None`、空白字符串与空容器才视为「没填」。
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, (list, tuple, dict)):
+        return bool(value)
+    return True
+
+
+def _resolve_pull_headers(store, saved, payload) -> tuple:
+    """解析拉取模型列表用的自定义请求头，返回 `(headers, error_message)`。
+
+    表单里显式给了 `extra_headers` 就整体覆盖已保存值（`{}`/空串表示清除），
+    没给才回退到已保存的请求头；非法 JSON 不抛异常，转为可展示的失败消息。
+    """
+    raw = payload.get('extra_headers')
+    if raw is None:
+        if saved is None:
+            return {}, ''
+        return store.resolve_provider_headers(saved['id']), ''
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}, ''
+        try:
+            raw = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            return {}, f'extra_headers 不是合法 JSON: {exc}'
+
+    if not isinstance(raw, dict):
+        return {}, 'extra_headers 必须是 JSON 对象'
+    return {str(key): str(value) for key, value in raw.items() if str(key).strip()}, ''
+
+
+def _pull_models(store, provider_id, payload) -> dict:
+    """拉取模型列表的公共实现（`POST /models` 与 `POST /providers/<id>/models` 共用）。
+
+    允许 provider **尚未保存**：设置页里刚填好的地址/Key/请求头还没落盘，
+    但它们足以完成一次 `GET /models`；要求「先保存、再重开 provider」才能拉取并不合理。
+    因此这里用「已保存 provider（若存在）→ 请求体非空字段覆盖 → `normalize_provider`
+    补齐并钳位默认值」构造草稿，默认值只在 `store` 里维护一份，不在这里手写。
+
+    Key 优先级：请求体里的 `api_key`（表单里刚输入、尚未保存的明文）→ 已保存密钥。
+    缺 Key / 缺 base_url / 地址非法一律交给 `llm.list_models` 以 `ok=False` 返回，
+    绝不 4xx：拉取模型失败不该阻塞配置（很多网关不实现 `/models`）。
+
+    返回 `{'ok', 'models', 'protocol', 'message'}`；**不含** api_key / extra_headers 明文。
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    identifier = str(provider_id or payload.get('provider_id') or '').strip().lower()
+    saved = store.get_provider(identifier) if identifier else None
+
+    merged = dict(saved or {})
+    if identifier:
+        merged['id'] = identifier
+    for field in _DRAFT_PROVIDER_FIELDS:
+        if _has_form_value(payload.get(field)):
+            merged[field] = payload[field]
+    draft = normalize_provider(merged)
+
+    api_key = str(payload.get('api_key') or '').strip()
+    if not api_key and saved is not None:
+        api_key = store.resolve_provider_key(saved['id'])
+
+    headers, headers_error = _resolve_pull_headers(store, saved, payload)
+    if headers_error:
+        return {'ok': False, 'models': [], 'protocol': draft['api_style'],
+                'message': headers_error}
+
+    return llm.list_models(draft, api_key, extra_headers=headers, transport=_injected_get())
 
 
 def register_routes(api, store) -> None:
@@ -188,12 +301,49 @@ def register_routes(api, store) -> None:
 
         走 `api.cards.list()`（宿主索引查询），不再裸查 `card_metadata`。
         """
-        limit = max(1, min(int(request.args.get('limit', CARD_LIST_LIMIT) or CARD_LIST_LIMIT),
-                           CARD_LIST_LIMIT))
+        # `limit=0` 表示「该分类下全部」：右键一个分类要知道到底有多少张，
+        # 截断会让「分析此分类」静默漏卡。上限仍兜住极端情况（10 万张）。
+        raw_limit = request.args.get('limit', CARD_LIST_LIMIT)
+        try:
+            limit = int(raw_limit if raw_limit not in (None, '') else CARD_LIST_LIMIT)
+        except (TypeError, ValueError):
+            limit = CARD_LIST_LIMIT
+        limit = 0 if limit <= 0 else min(limit, CARD_LIST_LIMIT)
         keyword = str(request.args.get('q') or '').strip()
+        category = str(request.args.get('category') or '').strip()
+        raw_ids = str(request.args.get('ids') or '').strip()
+        ids = [item for item in (part.strip() for part in raw_ids.split(',')) if item]
+
+        # 按 id 取（作用域是「宿主给的选中集」时用）：`read_many` 一次读完，
+        # 不走索引查询，因此不受「列表只加载当前页」影响。
+        if ids:
+            items = []
+            try:
+                cards = api.cards.read_many(ids)
+            except Exception:  # noqa: BLE001 - 读取失败按空处理，由面板报错
+                logger.warning('按 id 读取卡片失败', exc_info=True)
+                cards = {}
+            for card_id in ids:
+                card = cards.get(card_id) if isinstance(cards, dict) else None
+                if not isinstance(card, dict):
+                    continue
+                data = card.get('data') if isinstance(card.get('data'), dict) else {}
+                items.append({
+                    'card_id': card_id,
+                    'id': card_id,
+                    'name': str(data.get('name') or card.get('name') or card_id),
+                    'category': str(card.get('category') or ''),
+                    'token_count': 0,
+                    'tags': card.get('tags') if isinstance(card.get('tags'), list) else [],
+                })
+            return _ok(items=items, total=len(items))
 
         try:
-            result = api.cards.list(query=keyword, limit=limit)
+            result = api.cards.list(
+                query=keyword,
+                category=category,
+                limit=limit or CARD_LIST_LIMIT,
+            )
         except Exception:  # noqa: BLE001 - 索引未就绪时降级为空列表
             logger.warning('读取卡片候选列表失败', exc_info=True)
             return _ok(items=[], total=0)
@@ -214,7 +364,12 @@ def register_routes(api, store) -> None:
                     tags = []
             items.append({
                 'card_id': card_id,
+                # 前端作用域解析按 `id` / `name` / `category` 读，这里一并给出，
+                # 免得再靠 `card_id` / `char_name` 两套字段名互相猜。
+                'id': card_id,
                 'name': name,
+                'category': str(entry.get('category') or entry.get('display_category') or ''),
+                'token_count': int(entry.get('token_count') or entry.get('tokens') or 0),
                 'tags': tags if isinstance(tags, list) else [],
             })
 
@@ -365,39 +520,29 @@ def register_routes(api, store) -> None:
 
         return _ok(**result)
 
+    @api.http.route('/models', ['POST'])
+    @_handle_errors
+    def list_models_draft():
+        """草稿型模型列表：provider 未保存也能拉（协议见 `_pull_models`）。
+
+        设置页「拉取模型列表」按钮走这里：地址与 Key 直接取自表单，
+        不必先把 provider 保存下来。
+        """
+        payload = _body()
+        return _ok(**_pull_models(store, str(payload.get('provider_id') or ''), payload))
+
     @api.http.route('/providers/<provider_id>/models', ['POST'])
     @_handle_errors
     def list_provider_models(provider_id):
-        """拉取该 provider 的模型列表（`GET /models`）。
+        """按 provider 拉取模型列表（`GET /models`），保留给旧调用方。
+
+        与 `POST /models` 共用 `_pull_models`：provider 不存在时不再 404，
+        而是按请求体里的字段构造草稿（带全 base_url + api_key 时照样能拉取）。
 
         **永不因拉取失败而返回 4xx**：很多第三方网关不实现 `/models`，
         拉取失败只是让 UI 退回手填，不该阻塞配置。
         """
-        provider = store.get_provider(provider_id)
-        if provider is None:
-            return _fail('provider_not_found', f'provider 不存在: {provider_id}', http_status=404)
-
-        api_key = store.resolve_provider_key(provider['id'])
-        if not api_key:
-            return _ok(
-                ok=False, models=[], protocol=provider.get('api_style', ''),
-                message=f'provider「{provider["id"]}」未配置 API Key',
-            )
-
-        payload = _body()
-        base_url = str(payload.get('base_url') or provider.get('base_url') or '')
-        candidate = dict(provider)
-        if base_url:
-            candidate['base_url'] = base_url
-        if payload.get('api_style'):
-            candidate['api_style'] = payload['api_style']
-
-        result = llm.list_models(
-            candidate, api_key,
-            extra_headers=store.resolve_provider_headers(provider['id']),
-            transport=_injected_get(),
-        )
-        return _ok(**result)
+        return _ok(**_pull_models(store, provider_id, _body()))
 
     # ---------------------------------------------------------- 预览与提交
 
@@ -514,6 +659,12 @@ def register_routes(api, store) -> None:
                 return _fail('job_already_running', message, http_status=409)
             raise
 
+        _record_run(
+            store, run_id, task='analyze', job_type=JOB_ANALYZE,
+            total=len(items), apply_mode=apply_mode,
+            extra={'provider_id': provider['id'], 'model': model_name},
+        )
+
         return _ok(
             run_id=run_id,
             total=len(items),
@@ -530,40 +681,94 @@ def register_routes(api, store) -> None:
     @api.http.route('/wi/entries', ['POST'])
     @_handle_errors
     def list_wi_entries():
-        """列出某个世界书来源的条目（供前端做条目选择）。"""
+        """列出世界书来源的条目（供前端做条目选择）。
+
+        作用域可能是一本书，也可能是「一个分类下的 N 本书」，因此
+        `worldbook_source` 支持单个对象或数组；返回体里每本书各自带 `source`，
+        前端按书分组勾选（回写时也必须按书分组，见 `/jobs/wi-rewrite`）。
+        """
         payload = _body()
         card_id = str(payload.get('card_id') or '')
-        source = jobs_module.resolve_wi_source(card_id, payload.get('worldbook_source'))
+        raw_sources = payload.get('worldbook_source')
+        if raw_sources is None:
+            sources = [jobs_module.resolve_wi_source(card_id, None)]
+        elif isinstance(raw_sources, dict):
+            sources = [jobs_module.resolve_wi_source(card_id, raw_sources)]
+        else:
+            sources = [
+                jobs_module.resolve_wi_source('', item)
+                for item in (raw_sources or [])
+                if isinstance(item, dict)
+            ]
+        if not sources:
+            return _fail(CODE_INVALID_PAYLOAD, '需要 card_id 或 worldbook_source')
 
-        book = api.worldbook.read(source)
-        if not isinstance(book, dict):
-            return _fail('worldbook_unreadable', '无法读取世界书', http_status=404)
+        books = []
+        # 预览要逐本读文件，分类上千本时会卡住：只读前 PREVIEW_MAX_BOOKS 本，
+        # 并把「一共多少本 / 只读了多少本」如实回传，面板据此提示用户。
+        books_total = len(sources)
+        sources = sources[:PREVIEW_MAX_BOOKS]
 
-        entries = book.get('entries')
-        if isinstance(entries, dict):
-            entries = list(entries.values())
-        if not isinstance(entries, list):
-            return _fail('worldbook_unreadable', '世界书结构异常（无 entries）')
-
-        items = []
-        for entry in entries:
-            if not isinstance(entry, dict):
+        for source in sources:
+            book = api.worldbook.read(source)
+            if not isinstance(book, dict):
+                # 单本读不到不该让整个分类失败：标记后继续
+                books.append({
+                    'source': source,
+                    'readable': False,
+                    'items': [],
+                    'total': 0,
+                    'source_revision': '',
+                    'message': (
+                        '该卡片没有内嵌世界书'
+                        if str(source.get('source_type') or '') == 'embedded'
+                        else '无法读取这本书（文件缺失或结构异常）'
+                    ),
+                })
                 continue
-            content = str(entry.get('content') or '')
-            items.append({
-                'uid': str(entry.get('uid') or entry.get('id') or ''),
-                'name': str(entry.get('comment') or entry.get('name') or ''),
-                'keys': [str(item) for item in (entry.get('keys') or [])],
-                'tokens': tokens_core.estimate(content),
-                'enabled': not bool(entry.get('disable')),
-                'constant': bool(entry.get('constant')),
-                'content_preview': content[:200],
+
+            entries = book.get('entries')
+            if isinstance(entries, dict):
+                entries = list(entries.values())
+            if not isinstance(entries, list):
+                books.append({
+                    'source': source, 'readable': False, 'items': [],
+                    'total': 0, 'source_revision': '',
+                    'message': '世界书结构异常（无 entries）',
+                })
+                continue
+
+            items = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                content = str(entry.get('content') or '')
+                items.append({
+                    'uid': str(entry.get('uid') or entry.get('id') or ''),
+                    'name': str(entry.get('comment') or entry.get('name') or ''),
+                    'keys': [str(item) for item in (entry.get('keys') or [])],
+                    'tokens': tokens_core.estimate(content),
+                    'enabled': not bool(entry.get('disable')),
+                    'constant': bool(entry.get('constant')),
+                    'content_preview': content[:200],
+                })
+            books.append({
+                'source': source,
+                'readable': True,
+                'items': items,
+                'total': len(items),
+                'source_revision': str(book.get('source_revision') or ''),
             })
 
+        flat = [item for book in books for item in book['items']]
         return _ok(
-            items=items,
-            total=len(items),
-            source_revision=str(book.get('source_revision') or ''),
+            books=books,
+            items=flat,
+            total=len(flat),
+            sources=len(books),
+            books_total=books_total,
+            books_truncated=books_total > len(books),
+            source_revision=str((books[0] or {}).get('source_revision') or '') if len(books) == 1 else '',
         )
 
     @api.http.route('/jobs/wi-rewrite', ['POST'])
@@ -574,8 +779,15 @@ def register_routes(api, store) -> None:
         config = config_module.load_config(api)
 
         card_id = str(payload.get('card_id') or '')
-        source = jobs_module.resolve_wi_source(card_id, payload.get('worldbook_source'))
-        if not card_id and not source.get('file_path'):
+        raw_source = payload.get('worldbook_source')
+        # 作用域可能是「一个分类下的 N 本书」，因此支持数组；每个作业项带上自己那本
+        if isinstance(raw_source, list):
+            sources = [jobs_module.resolve_wi_source('', item)
+                       for item in raw_source if isinstance(item, dict)]
+        else:
+            sources = [jobs_module.resolve_wi_source(card_id, raw_source)]
+        sources = [source for source in sources if source.get('file_path') or source.get('card_id')]
+        if not sources:
             return _fail(CODE_INVALID_PAYLOAD, '需要 card_id 或 worldbook_source')
 
         entry_uids = payload.get('entry_uids')
@@ -601,43 +813,51 @@ def register_routes(api, store) -> None:
         if apply_mode not in ('auto', 'review'):
             apply_mode = config['apply_mode']
 
-        # 读一次世界书，把条目名 / token 一并带上（前端与结果页要用）
-        book = api.worldbook.read(source)
-        if not isinstance(book, dict):
-            return _fail('worldbook_unreadable', '无法读取世界书', http_status=404)
-
-        entries = book.get('entries')
-        if isinstance(entries, dict):
-            entries = list(entries.values())
-        if not isinstance(entries, list):
-            return _fail('worldbook_unreadable', '世界书结构异常（无 entries）')
-
         wanted = set(entry_uids)
         items = []
-        for entry in entries:
-            if not isinstance(entry, dict):
+        unreadable = []
+        for source in sources:
+            book = api.worldbook.read(source)
+            if not isinstance(book, dict):
+                unreadable.append(source)
                 continue
-            uid = str(entry.get('uid') or entry.get('id') or '')
-            if not uid:
+
+            entries = book.get('entries')
+            if isinstance(entries, dict):
+                entries = list(entries.values())
+            if not isinstance(entries, list):
+                unreadable.append(source)
                 continue
-            if wanted and uid not in wanted:
-                continue
-            if entry.get('disable') is True:
-                continue
-            content = str(entry.get('content') or '')
-            if not content.strip():
-                continue
-            items.append({
-                'key': uid,
-                'card_id': card_id,
-                'entry_uid': uid,
-                'entry_name': str(entry.get('comment') or entry.get('name') or ''),
-                'tokens': tokens_core.estimate(content),
-            })
+
+            source_card_id = str(source.get('card_id') or '')
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                uid = str(entry.get('uid') or entry.get('id') or '')
+                if not uid:
+                    continue
+                if wanted and uid not in wanted:
+                    continue
+                if entry.get('disable') is True:
+                    continue
+                content = str(entry.get('content') or '')
+                if not content.strip():
+                    continue
+                items.append({
+                    'key': uid,
+                    'card_id': source_card_id,
+                    'entry_uid': uid,
+                    'entry_name': str(entry.get('comment') or entry.get('name') or ''),
+                    'tokens': tokens_core.estimate(content),
+                    # 每条记住自己属于哪本书：回写时按它分组，否则会把 B 书的候选写进 A 书
+                    'worldbook_source': source,
+                })
 
         if not items:
+            detail = {'unreadable': len(unreadable)} if unreadable else None
             return _fail(CODE_INVALID_PAYLOAD,
-                         '没有可改写的条目（未选、已停用或内容为空）', http_status=400)
+                         '没有可改写的条目（未选、已停用或内容为空）',
+                         http_status=400, detail=detail)
 
         job_payload = {
             'provider_id': provider['id'],
@@ -647,7 +867,8 @@ def register_routes(api, store) -> None:
             'dry_run': bool(payload.get('dry_run')),
             'force': bool(payload.get('force')),
             'target_format': str(payload.get('target_format') or 'yaml'),
-            'worldbook_source': source,
+            # 单本时沿用旧字段（回写链路按它聚合）；多本时每项自带 worldbook_source
+            'worldbook_source': sources[0] if len(sources) == 1 else None,
             'secret_ref': SECRET_REF_TEMPLATE.format(provider_id=provider['id']),
         }
 
@@ -658,6 +879,12 @@ def register_routes(api, store) -> None:
             if '已在运行' in message or 'already' in message.lower():
                 return _fail('job_already_running', message, http_status=409)
             raise
+
+        _record_run(
+            store, run_id, task='polish', job_type=JOB_WI_REWRITE,
+            total=len(items), apply_mode=apply_mode,
+            extra={'provider_id': provider['id'], 'model': model_name},
+        )
 
         return _ok(
             run_id=run_id,
@@ -757,6 +984,12 @@ def register_routes(api, store) -> None:
                 return _fail('job_already_running', message, http_status=409)
             raise
 
+        _record_run(
+            store, run_id, task='classify', job_type=JOB_CLASSIFY,
+            total=len(items), apply_mode=apply_mode,
+            extra={'provider_id': provider['id'], 'model': model_name},
+        )
+
         return _ok(
             run_id=run_id,
             total=len(items),
@@ -854,6 +1087,11 @@ def register_routes(api, store) -> None:
                 return _fail('job_already_running', message, http_status=409)
             raise
 
+        _record_run(
+            store, run_id, task='propose', job_type=JOB_PROPOSE,
+            total=1, extra={'provider_id': provider['id'], 'model': model_name},
+        )
+
         return _ok(
             run_id=run_id,
             total=1,
@@ -901,6 +1139,11 @@ def register_routes(api, store) -> None:
                 return _fail('job_already_running', message, http_status=409)
             raise
 
+        _record_run(
+            store, run_id, task='propose', job_type=JOB_AGENT,
+            total=1, extra={'provider_id': provider['id'], 'model': model_name},
+        )
+
         return _ok(
             run_id=run_id,
             total=1,
@@ -909,6 +1152,47 @@ def register_routes(api, store) -> None:
         )
 
     # ---------------------------------------------------------- 审批与结果
+
+    @api.http.route('/jobs', ['GET'])
+    @_handle_errors
+    def list_jobs():
+        """最近作业（插件台账 + 宿主实时状态）。
+
+        宿主 `api.jobs` 没有 list 能力，所以列表来自插件自己的台账；
+        每条再用 `api.jobs.get()` 补一次实时状态（失败则沿用台账里的旧值）。
+        """
+        limit = max(1, min(int(request.args.get('limit', 20) or 20), 50))
+        statuses = {item for item in (request.args.get('status') or '').split(',') if item}
+
+        records = store.list_runs()
+        jobs = []
+        for record in records[:limit * 2]:
+            run_id = str(record.get('run_id') or '')
+            detail = None
+            try:
+                detail = api.jobs.get(run_id) if run_id else None
+            except Exception:  # noqa: BLE001 - 作业可能已被清理
+                detail = None
+            entry = dict(record)
+            if isinstance(detail, dict):
+                entry['status'] = str(detail.get('status') or entry.get('status') or '')
+                counts = detail.get('counts') if isinstance(detail.get('counts'), dict) else {}
+                if counts:
+                    entry['counts'] = counts
+                entry['message'] = str(detail.get('message') or '')
+                entry['job_type'] = str(detail.get('job_type') or entry.get('job_type') or '')
+            if statuses and str(entry.get('status') or '') not in statuses:
+                continue
+            jobs.append(entry)
+            if len(jobs) >= limit:
+                break
+
+        pending = store.list_pending_reviews()
+        return _ok(
+            jobs=jobs,
+            total=len(jobs),
+            pending_total=len([item for item in pending.values() if isinstance(item, dict)]),
+        )
 
     @api.http.route('/jobs/<run_id>', ['GET'])
     @_handle_errors
@@ -943,7 +1227,19 @@ def register_routes(api, store) -> None:
 
         payload = _body()
         force = bool(payload.get('force'))
-        apply_tags_enabled = bool(payload.get('apply_tags', True))
+        # 「写什么」在**落地时**决定（提交时不再有「分析目标」这个假控件）：
+        #   write.note / write.tags / write.suggestions，省略时按旧字段 apply_tags 兜底。
+        write_spec = payload.get('write') if isinstance(payload.get('write'), dict) else {}
+        if 'tags' in write_spec:
+            apply_tags_enabled = bool(write_spec.get('tags'))
+        else:
+            apply_tags_enabled = bool(payload.get('apply_tags', True))
+        write_note_enabled = bool(write_spec.get('note', True))
+        # 只落地被勾选的条目（省略 = 全部 done）
+        only_keys = set()
+        raw_items = payload.get('items')
+        if isinstance(raw_items, (list, tuple)):
+            only_keys = {str(item).strip() for item in raw_items if str(item or '').strip()}
 
         items = _load_job_items(api, run_id)
         applied = 0
@@ -960,6 +1256,10 @@ def register_routes(api, store) -> None:
             ui_key = str(result.get('ui_key') or item.get('item_key') or '')
             card_id = str(result.get('card_id') or item.get('item_key') or '')
             if not card_id:
+                continue
+
+            if only_keys and card_id not in only_keys and ui_key not in only_keys:
+                skipped += 1
                 continue
 
             meta = store.get_card_meta(ui_key)
@@ -985,7 +1285,7 @@ def register_routes(api, store) -> None:
             summary_text = str(result.get('summary') or '').strip()
             tags = result.get('tags') if isinstance(result.get('tags'), list) else []
 
-            if summary_text:
+            if summary_text and write_note_enabled:
                 bridge_result = summary_bridge.write_summary(
                     api, store, card_id, summary_text, ui_key=ui_key)
                 if not bridge_result.get('ok'):
@@ -1014,9 +1314,15 @@ def register_routes(api, store) -> None:
 
         if applied:
             store.clear_pending_review(run_id)
+        if run_id:
+            try:
+                store.update_run(run_id, {'status': 'applied', 'applied_at': int(time.time())})
+            except Exception:  # noqa: BLE001 - 台账失败不影响落地结果
+                logger.debug('更新作业台账失败: %s', run_id, exc_info=True)
 
         return _ok(applied=applied, skipped=skipped, stale=stale, failed=failed,
-                   details=details[:50], total=len(items))
+                   details=details[:50], total=len(items),
+                   write={'note': write_note_enabled, 'tags': apply_tags_enabled})
 
     @api.http.route('/jobs/<run_id>/cancel', ['POST'])
     @_handle_errors
@@ -1129,9 +1435,13 @@ def _apply_wi_rewrite(api, store, run_id: str, job, payload) -> dict:
             continue
 
         job_payload = job.get('payload') if isinstance(job.get('payload'), dict) else {}
+        # 来源优先级：条目自带（多书作业）→ 作业级（单书作业）→ 按卡片内嵌书兜底。
+        # 少了第一级，多书作业会把 B 书的候选写进 A 书。
         source = jobs_module.resolve_wi_source(
-            str(result.get('card_id') or item.get('key') or ''),
-            job_payload.get('worldbook_source'),
+            str(result.get('card_id') or ''),
+            result.get('worldbook_source')
+            or item.get('worldbook_source')
+            or job_payload.get('worldbook_source'),
         )
         key = f"{source.get('source_type')}|{source.get('card_id')}|{source.get('file_path')}"
         buckets.setdefault(key, {'source': source, 'entries': []})['entries'].append(
@@ -1290,6 +1600,12 @@ def _apply_propose(api, store, run_id: str, job, payload) -> dict:
     items = _load_job_items(api, run_id)
     if not items:
         return _fail(CODE_JOB_NOT_FOUND, f'作业没有结果: {run_id}', http_status=404)
+
+    # 门禁：未经审批的条目不能落地。propose/agent 只有一条条目，此前这里
+    # 不看状态，等于「作业跑完就能直接创建结构」，与其余三类作业不一致。
+    if str(items[0].get('status') or '') != 'done':
+        return _fail(CODE_INVALID_PAYLOAD,
+                     '提议尚未审批，无法落地：请先在「结果与审批」里确认方案', http_status=409)
 
     result = items[0].get('result') if isinstance(items[0].get('result'), dict) else {}
     plan = result.get('plan') if isinstance(result.get('plan'), dict) else {}

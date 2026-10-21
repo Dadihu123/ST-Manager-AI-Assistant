@@ -101,6 +101,24 @@ export function closeSelectMenus(root) {
   });
 }
 
+/**
+ * 最近的可滚动祖先（用于计算下拉菜单的可用空间）。
+ *
+ * 判据只看 `overflow-y`：**滚动容器即使当前不溢出也会在 padding box 处裁切**
+ * （`overflow-y: auto` 依然是 clip 容器），所以不能要求 `scrollHeight > clientHeight`，
+ * 否则内容刚好不滚动时会误判到 `body`，算出的空间被宿主弹层边框打回。
+ * 找不到时返回 `document.body`，调用方用视口尺寸兜底。
+ */
+function scrollParent(node) {
+  let current = node && node.parentElement;
+  while (current && current !== document.body) {
+    const style = window.getComputedStyle(current);
+    if (/(auto|scroll|overlay)/.test(style.overflowY)) return current;
+    current = current.parentElement;
+  }
+  return document.body;
+}
+
 /** 销毁指定节点树中的自定义下拉控件，移除 document 级监听器。 */
 export function destroySelects(root) {
   selectNodes(root).forEach((node) => {
@@ -287,6 +305,7 @@ export function createUi(api) {
 
     function open() {
       if (destroyed || trigger.disabled) return;
+      fitMenu();
       menu.hidden = false;
       trigger.setAttribute('aria-expanded', 'true');
       wrapper.classList.add('is-open');
@@ -295,11 +314,52 @@ export function createUi(api) {
       if (selected) selected.focus();
     }
 
+    /**
+     * 菜单是 `position: absolute`，会被**最近的滚动祖先**在裁切边处切掉
+     * （弹层里面板自建了 `overflow-y: auto` 的滚动区，设置页下半部分的下拉
+     * 一打开就只剩两三行可见）。
+     *
+     * 这里在打开时按「触发器在滚动区内的可用空间」决定朝下还是朝上，
+     * 并把菜单高度钳到可用空间内：空间不足时菜单内部自己滚动，而不是被裁掉。
+     * 不用 `position: fixed`（层级/定位归宿主，测试也会拦），纯 absolute 即可。
+     */
+    function fitMenu() {
+      wrapper.classList.remove('is-dropup');
+      menu.style.maxHeight = '';
+
+      const host = scrollParent(wrapper);
+      const hostRect = host ? host.getBoundingClientRect() : null;
+      const triggerRect = trigger.getBoundingClientRect();
+      const gap = 6; // 与 `top: calc(100% + 0.35rem)` 的间距保持一致（0.35rem ≈ 5.6px）
+      const limit = 16 * 16; // 设计上限 16rem，与 CSS 的 max-height 一致
+
+      const below = hostRect
+        ? hostRect.bottom - triggerRect.bottom - gap - 8
+        : window.innerHeight - triggerRect.bottom - gap - 8;
+      const above = hostRect
+        ? triggerRect.top - hostRect.top - gap - 8
+        : triggerRect.top - gap - 8;
+
+      // 下方连「舒适高度」都放不下、且上方更宽裕 → 朝上开。
+      // 舒适高度取 240px（约 6 行）：只露出两三行还要用户滚动，不如下方空间让给
+      // 上方那一大片空白——设置在表单中部的下拉尤其明显。
+      const minComfortable = Math.min(limit, 240);
+      if (below < minComfortable && above > below) {
+        wrapper.classList.add('is-dropup');
+        menu.style.maxHeight = `${Math.max(96, Math.min(limit, above))}px`;
+      } else {
+        menu.style.maxHeight = `${Math.max(96, Math.min(limit, below))}px`;
+      }
+    }
+
     function close(focusTrigger = false) {
       if (menu.hidden) return;
       menu.hidden = true;
       trigger.setAttribute('aria-expanded', 'false');
       wrapper.classList.remove('is-open');
+      // 复位内联高度，避免窗口尺寸变化后沿用上一次的钳位结果
+      wrapper.classList.remove('is-dropup');
+      menu.style.maxHeight = '';
       if (focusTrigger) trigger.focus();
     }
 

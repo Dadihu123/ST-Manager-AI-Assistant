@@ -160,11 +160,16 @@ export function createSettings(api, client, context) {
       styleHint.textContent = API_STYLE_HINTS[fields.api_style.value] || '';
     });
 
-    // 模型列表：拉取失败必须能退回手填（很多网关不实现 /models）
+    // 模型列表：拉取失败必须能退回手填（很多网关不实现 /models）。
+    //
+    // 用插件自己的 `styledSelect` 而不是原生 `<select>`：原生 select 只能靠
+    // `plugin-stm-ai-assistant-select` 这个 wrapper 类拿到透明底/无边框，
+    // 拿不到 trigger 那套外观，和「接口协议」等下拉框放在一起明显不是一套控件。
+    // 候选列表在拉取完成后用 `setOptions()` 填充，因此这里先给一个占位项。
     const modelRow = el('div', 'plugin-stm-ai-assistant-row');
-    const modelSelect = el('select', 'plugin-stm-ai-assistant-select');
-    modelSelect.append(el('option', '', '（尚未拉取）'));
-    modelSelect.value = '';
+    const modelSelect = select([{ value: '', label: '（尚未拉取）' }], '');
+    // 下拉控件自己有 document 级监听器，随编辑器重建一起销毁（editorControls 契约）
+    editorControls.push(modelSelect);
     modelSelect.addEventListener('change', () => {
       if (modelSelect.value) fields.model.value = modelSelect.value;
     });
@@ -173,12 +178,18 @@ export function createSettings(api, client, context) {
       button('拉取模型列表', 'is-secondary', () => fetchModels(fields, modelSelect)),
     );
 
+    // 模型候选行需要横向空间（模型名很长，还要并排放拉取按钮），让它跨两列。
+    const modelField = field(
+      '模型候选', modelRow, '点「拉取模型列表」从 /models 读取；失败时直接手填上方',
+    );
+    modelField.classList.add('plugin-stm-ai-assistant-field--wide');
+
     grid.append(
       field('id', fields.id),
       field('名称', fields.name),
       field('API 地址', fields.base_url),
       field('默认模型', fields.model),
-      field('模型候选', modelRow, '点「拉取模型列表」从 /models 读取；失败时直接手填上方'),
+      modelField,
       field('接口协议', fields.api_style),
       styleHint,
       field('连接超时（秒）', fields.connect_timeout),
@@ -222,36 +233,61 @@ export function createSettings(api, client, context) {
   // ---------------------------------------------------------------- 操作
 
   async function fetchModels(fields, modelSelect) {
-    const id = fields.id.value.trim().toLowerCase();
-    if (!id) {
-      api.host.toast('先填 provider id（保存前也可以拉取）', 3200, 'close');
+    // 未保存的 provider 也能拉：地址 + 表单里刚输入的 Key 就够，不必先保存。
+    // 后端 `/models` 是「草稿型」端点（不存在 provider 也能用），未填的字段留空即可。
+    const baseUrl = fields.base_url.value.trim();
+    if (!baseUrl) {
+      api.host.toast('先填 API 地址', 3200, 'close');
       return;
     }
 
+    const apiKey = fields.api_key.value.trim();
+    const headers = fields.extra_headers.value.trim();
+    const hasSavedKey = Boolean(state.editing.has_api_key || state.editing.has_fallback_key);
+    if (!apiKey && !hasSavedKey) {
+      // 没有已保存的 Key、也没有新输入的 Key：本地先拦，省一次注定失败的请求
+      api.host.toast('先填 API Key（保存前也可以拉取）', 3600, 'close');
+      return;
+    }
+
+    const label = modelSelect.querySelector('.plugin-stm-ai-assistant-select-label');
+    if (label) label.textContent = '拉取中…';
+    modelSelect.disabled = true;
+
     try {
-      const data = await client.listModels(id, {
-        base_url: fields.base_url.value.trim(),
+      const data = await client.listModels({
+        provider_id: fields.id.value.trim().toLowerCase(),
+        base_url: baseUrl,
         api_style: fields.api_style.value,
+        allow_local: fields.allow_local.querySelector('input').checked,
+        connect_timeout: Number(fields.connect_timeout.querySelector('input').value) || undefined,
+        request_timeout: Number(fields.request_timeout.querySelector('input').value) || undefined,
+        // 明文 Key 只在本次请求里用，不进任何日志/响应；留空表示沿用已保存的密钥
+        api_key: apiKey || undefined,
+        extra_headers: headers || undefined,
       });
 
-      clear(modelSelect);
       if (!data.ok) {
-        modelSelect.append(el('option', '', '（拉取失败：请手填模型名）'));
+        modelSelect.setOptions([{ value: '', label: '（拉取失败：请手填模型名）' }]);
         modelSelect.value = '';
         api.host.toast(`拉取模型失败：${data.message || '未知原因'}`, 5200, 'close');
         return;
       }
 
-      modelSelect.append(el('option', '', `（${data.models.length} 个模型）`));
-      data.models.forEach((name) => {
-        const option = el('option', '', name);
-        option.value = name;
-        modelSelect.append(option);
-      });
-      modelSelect.value = '';
+      const options = [{ value: '', label: `（${data.models.length} 个模型）` }]
+        .concat(data.models.map((name) => ({ value: name, label: name })));
+      modelSelect.setOptions(options);
+      modelSelect.value = data.models.includes(fields.model.value.trim())
+        ? fields.model.value.trim()
+        : '';
       api.host.toast(`已拉取 ${data.models.length} 个模型`, 2600, 'check');
     } catch (error) {
+      // 异常路径也要把下拉从「拉取中…」恢复到可手填状态，否则它会一直停在提示文案上
+      modelSelect.setOptions([{ value: '', label: '（拉取失败：请手填模型名）' }]);
+      modelSelect.value = '';
       api.host.toast(`拉取模型失败：${error.message}`, 4200, 'close');
+    } finally {
+      modelSelect.disabled = false;
     }
   }
 
