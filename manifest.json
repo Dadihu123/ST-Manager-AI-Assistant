@@ -1,9 +1,9 @@
 {
   "id": "stm-ai-assistant",
   "name": "AI 角色卡分析助手",
-  "version": "0.2.0",
-  "api_version": 2,
-  "manifest_version": 2,
+  "version": "0.3.0",
+  "api_version": 3,
+  "manifest_version": 3,
   "author": "ST-Manager",
   "description": "角色卡的 AI 工作台：打标（概览与标签）、世界书精简、自动归类、分类体系提议；批量作业、逐条审批与成本记账。",
   "license": "MIT",
@@ -25,214 +25,265 @@
     "styles": [
       "frontend/plugin.css"
     ],
-    "entries": [
-      {
-        "id": "workbench",
-        "kind": "dock",
-        "label": "AI 助手",
-        "description": "任务中心：打标、世界书精简、自动归类、分类体系提议。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "hub",
-          "type": "modal"
+    "render_mode": "declarative",
+    "contributions": {
+      "menus": [
+        {
+          "id": "workbench",
+          "placement": "dock",
+          "type": "item",
+          "label": "AI 助手",
+          "description": "任务中心：打标、世界书精简、自动归类、分类体系提议。",
+          "icon": "frontend/assets/icon.svg",
+          "order": 40,
+          "action": {
+            "type": "command",
+            "id": "open-workbench"
+          }
         },
-        "shortcut": "Ctrl+Shift+A",
-        "priority": 40
-      },
-      {
-        "id": "analyze-folder",
-        "kind": "context",
-        "label": "AI 打标此分类全部卡片",
-        "group": "AI 助手",
-        "description": "为该分类（含子分类）下的卡片生成概览与标签建议。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "analyze",
-          "type": "modal"
+        {
+          "id": "ai-helper-context",
+          "placement": "context.folder",
+          "type": "submenu",
+          "label": "AI 助手",
+          "description": "右键分类可用的 AI 任务",
+          "icon": "frontend/assets/icon.svg",
+          "order": 55,
+          "children": [
+            {
+              "id": "analyze-folder",
+              "type": "item",
+              "label": "AI 打标此分类全部卡片",
+              "description": "为该分类（含子分类）下的卡片生成概览与标签建议。",
+              "icon": "frontend/assets/icon.svg",
+              "order": 10,
+              "when": {
+                "mode": [
+                  "cards"
+                ]
+              },
+              "disabledHint": "仅支持右键分类；请在角色卡视图里右键一个分类",
+              "action": {
+                "type": "surface",
+                "id": "analyze"
+              }
+            },
+            {
+              "id": "classify-folder",
+              "type": "item",
+              "label": "AI 归类此分类全部卡片",
+              "description": "判断该分类下的卡片应放在哪个分类，并移动目录。",
+              "icon": "frontend/assets/icon.svg",
+              "order": 20,
+              "when": {
+                "mode": [
+                  "cards"
+                ]
+              },
+              "disabledHint": "仅支持右键分类；请在角色卡视图里右键一个分类",
+              "action": {
+                "type": "surface",
+                "id": "classify"
+              }
+            },
+            {
+              "id": "polish-embedded",
+              "type": "item",
+              "label": "AI 精简这些卡片的嵌入世界书",
+              "description": "对卡片内嵌世界书的条目做压缩改写，逐条确认后写回。",
+              "icon": "frontend/assets/icon.svg",
+              "order": 30,
+              "when": {
+                "mode": [
+                  "cards"
+                ]
+              },
+              "disabledHint": "仅支持右键分类；请在角色卡视图里右键一个分类",
+              "action": {
+                "type": "surface",
+                "id": "polish"
+              }
+            },
+            {
+              "id": "polish-folder",
+              "type": "item",
+              "label": "AI 精简此分类世界书",
+              "description": "对该分类下的世界书条目做压缩改写，逐条确认后写回。",
+              "icon": "frontend/assets/icon.svg",
+              "order": 40,
+              "when": {
+                "mode": [
+                  "worldinfo"
+                ]
+              },
+              "disabledHint": "仅支持右键分类；请在世界书视图里右键一个分类",
+              "action": {
+                "type": "surface",
+                "id": "polish"
+              }
+            }
+          ]
         },
-        "when": {
-          "mode": [
-            "cards"
-          ],
-          "target": "folder"
+        {
+          "id": "ai-helper-batch",
+          "placement": "batch.actions",
+          "type": "submenu",
+          "label": "AI 助手",
+          "description": "对批量选中的卡片 / 世界书执行 AI 任务",
+          "icon": "frontend/assets/icon.svg",
+          "order": 60,
+          "children": [
+            {
+              "id": "analyze-selected",
+              "type": "item",
+              "label": "AI 打标选中卡片",
+              "description": "为批量操作里选中的卡片生成概览与标签建议。",
+              "icon": "frontend/assets/icon.svg",
+              "order": 10,
+              "when": {
+                "mode": [
+                  "cards"
+                ],
+                "selection": "any"
+              },
+              "disabledHint": "请先在角色卡视图里选中至少一张卡片",
+              "action": {
+                "type": "surface",
+                "id": "analyze"
+              }
+            },
+            {
+              "id": "classify-selected",
+              "type": "item",
+              "label": "AI 归类选中卡片",
+              "description": "判断选中卡片应放在哪个分类，并移动目录。",
+              "icon": "frontend/assets/icon.svg",
+              "order": 20,
+              "when": {
+                "mode": [
+                  "cards"
+                ],
+                "selection": "any"
+              },
+              "disabledHint": "请先在角色卡视图里选中至少一张卡片",
+              "action": {
+                "type": "surface",
+                "id": "classify"
+              }
+            },
+            {
+              "id": "polish-selector",
+              "type": "item",
+              "label": "AI 精简选中世界书",
+              "description": "对选中的世界书条目做压缩改写，逐条确认后写回。",
+              "icon": "frontend/assets/icon.svg",
+              "order": 30,
+              "when": {
+                "mode": [
+                  "worldinfo"
+                ],
+                "selection": "any"
+              },
+              "disabledHint": "请先在世界书视图里选中至少一本世界书",
+              "action": {
+                "type": "surface",
+                "id": "polish"
+              }
+            }
+          ]
         },
-        "disabledHint": "仅支持右键分类；请在角色卡视图里右键一个分类",
-        "priority": 55
-      },
-      {
-        "id": "analyze-selected",
-        "kind": "batch",
-        "label": "AI 打标选中卡片",
-        "group": "AI 助手",
-        "description": "为批量操作里选中的卡片生成概览与标签建议。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "analyze",
-          "type": "modal"
+        {
+          "id": "open-review",
+          "placement": "commandPalette",
+          "type": "item",
+          "label": "AI 结果与审批",
+          "description": "查看 AI 作业结果，逐条确认后写入卡片或世界书。",
+          "icon": "frontend/assets/icon.svg",
+          "order": 45,
+          "action": {
+            "type": "command",
+            "id": "open-review"
+          }
         },
-        "requires_selection": true,
-        "when": {
-          "mode": [
-            "cards"
-          ],
-          "selection": "any"
+        {
+          "id": "propose-library",
+          "placement": "commandPalette",
+          "type": "item",
+          "label": "AI 设计分类体系",
+          "description": "分析整个卡片库，提出分类方案与标签池；只创建结构，不动卡片。",
+          "icon": "frontend/assets/icon.svg",
+          "order": 46,
+          "action": {
+            "type": "command",
+            "id": "propose-library"
+          }
         },
-        "disabledHint": "请先在角色卡视图里选中至少一张卡片",
-        "priority": 60
-      },
-      {
-        "id": "classify-folder",
-        "kind": "context",
-        "label": "AI 归类此分类全部卡片",
-        "group": "AI 助手",
-        "description": "判断该分类下的卡片应放在哪个分类，并移动目录。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "classify",
-          "type": "modal"
+        {
+          "id": "open-profiles",
+          "placement": "commandPalette",
+          "type": "item",
+          "label": "AI 提示词档案",
+          "description": "按任务分组管理提示词档案：模板、破限段、格式与字数规则。",
+          "icon": "frontend/assets/icon.svg",
+          "order": 47,
+          "action": {
+            "type": "command",
+            "id": "open-profiles"
+          }
         },
-        "when": {
-          "mode": [
-            "cards"
-          ],
-          "target": "folder"
+        {
+          "id": "assistant-settings",
+          "placement": "settings.nav",
+          "type": "item",
+          "label": "AI 助手设置",
+          "description": "Provider、密钥、用量与新标签建议。",
+          "icon": "frontend/assets/icon.svg",
+          "order": 80,
+          "action": {
+            "type": "surface",
+            "id": "settings"
+          }
+        }
+      ],
+      "slots": [],
+      "commands": [
+        {
+          "id": "open-workbench",
+          "title": "AI 助手：打开任务中心",
+          "description": "打开 AI 助手任务中心（hub）。",
+          "icon": "frontend/assets/icon.svg",
+          "shortcut": "Ctrl+Shift+A",
+          "module": "frontend/commands.js",
+          "export": "openWorkbench"
         },
-        "disabledHint": "仅支持右键分类；请在角色卡视图里右键一个分类",
-        "priority": 56
-      },
-      {
-        "id": "classify-selected",
-        "kind": "batch",
-        "label": "AI 归类选中卡片",
-        "group": "AI 助手",
-        "description": "判断选中卡片应放在哪个分类，并移动目录。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "classify",
-          "type": "modal"
+        {
+          "id": "open-review",
+          "title": "AI 结果与审批",
+          "description": "查看 AI 作业结果，逐条确认后写入卡片或世界书。",
+          "icon": "frontend/assets/icon.svg",
+          "module": "frontend/commands.js",
+          "export": "openReview"
         },
-        "requires_selection": true,
-        "when": {
-          "mode": [
-            "cards"
-          ],
-          "selection": "any"
+        {
+          "id": "propose-library",
+          "title": "AI 设计分类体系",
+          "description": "分析整个卡片库，提出分类方案与标签池；只创建结构，不动卡片。",
+          "icon": "frontend/assets/icon.svg",
+          "module": "frontend/commands.js",
+          "export": "proposeLibrary"
         },
-        "disabledHint": "请先在角色卡视图里选中至少一张卡片",
-        "priority": 61
-      },
-      {
-        "id": "polish-embedded",
-        "kind": "context",
-        "label": "AI 精简这些卡片的嵌入世界书",
-        "group": "AI 助手",
-        "description": "对卡片内嵌世界书的条目做压缩改写，逐条确认后写回。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "polish",
-          "type": "modal"
-        },
-        "when": {
-          "mode": [
-            "cards"
-          ],
-          "target": "folder"
-        },
-        "disabledHint": "仅支持右键分类；请在角色卡视图里右键一个分类",
-        "priority": 57
-      },
-      {
-        "id": "polish-selector",
-        "kind": "batch",
-        "label": "AI 精简选中世界书",
-        "group": "AI 助手",
-        "description": "对选中的世界书条目做压缩改写，逐条确认后写回。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "polish",
-          "type": "modal"
-        },
-        "requires_selection": true,
-        "when": {
-          "mode": [
-            "worldinfo"
-          ],
-          "selection": "any"
-        },
-        "disabledHint": "请先在世界书视图里选中至少一本世界书",
-        "priority": 62
-      },
-      {
-        "id": "polish-folder",
-        "kind": "context",
-        "label": "AI 精简此分类世界书",
-        "group": "AI 助手",
-        "description": "对该分类下的世界书条目做压缩改写，逐条确认后写回。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "polish",
-          "type": "modal"
-        },
-        "when": {
-          "mode": [
-            "worldinfo"
-          ],
-          "target": "folder"
-        },
-        "disabledHint": "仅支持右键分类；请在世界书视图里右键一个分类",
-        "priority": 58
-      },
-      {
-        "id": "open-review",
-        "kind": "command",
-        "label": "AI 结果与审批",
-        "description": "查看 AI 作业结果，逐条确认后写入卡片或世界书。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "review",
-          "type": "modal"
-        },
-        "priority": 45
-      },
-      {
-        "id": "propose-library",
-        "kind": "command",
-        "label": "AI 设计分类体系",
-        "description": "分析整个卡片库，提出分类方案与标签池；只创建结构，不动卡片。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "propose",
-          "type": "modal"
-        },
-        "priority": 46
-      },
-      {
-        "id": "open-profiles",
-        "kind": "command",
-        "label": "AI 提示词档案",
-        "description": "按任务分组管理提示词档案：模板、破限段、格式与字数规则。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "profiles",
-          "type": "modal"
-        },
-        "priority": 47
-      },
-      {
-        "id": "assistant-settings",
-        "kind": "settings",
-        "label": "AI 助手设置",
-        "description": "Provider、密钥、用量与新标签建议。",
-        "icon": "frontend/assets/icon.svg",
-        "surface": {
-          "id": "settings",
-          "type": "modal"
-        },
-        "priority": 80
-      }
-    ]
+        {
+          "id": "open-profiles",
+          "title": "AI 提示词档案",
+          "description": "按任务分组管理提示词档案：模板、破限段、格式与字数规则。",
+          "icon": "frontend/assets/icon.svg",
+          "module": "frontend/commands.js",
+          "export": "openProfiles"
+        }
+      ]
+    }
   },
-  "permissions": [
+  "capabilities": [
     "cards.read",
     "cards.write",
     "worldbook.read",

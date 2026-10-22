@@ -3,9 +3,14 @@
  *
  * 契约：导出 `activate(api)`，可选导出 `deactivate(api)`。
  *
- * 入口**不由插件绘制**：`manifest.frontend.entries` 声明 11 条入口，宿主把它们
- * 渲染到坞 / 批量菜单 / 右键菜单 / 命令面板 / 设置页；容器也由宿主提供
+ * 入口**不由插件绘制**：`manifest.frontend.contributions` 声明 14 个菜单节点
+ * （dock / context.folder / batch.actions / commandPalette / settings.nav，其中
+ * 右键与批量入口收拢在 2 个显式 submenu 里）与 4 条命令，宿主按声明把它们渲染到
+ * 坞 / 批量菜单 / 右键菜单 / 命令面板 / 设置页；容器也由宿主提供
  * （`static/js/pluginSurfaceHost.js`）。
+ *
+ * 契约 v3：`frontend.entries[]` 与旧的 `api.entries` 命名空间已删除——结构必须静态声明，
+ * 运行期只用 `api.contributions.update/remove/trigger` 改贡献项状态。
  *
  * 本次重写的要点（见 docs/2026-10-19-task-centric-redesign.md）：
  * - **一个用户能力 = 一个任务 = 一个 surface**，入口只声明「作用域 + surface」；
@@ -19,15 +24,18 @@ import { createViews, mountView, SURFACES } from './panel.js';
 import { createPromptPreview } from './promptPreview.js';
 
 /**
- * 入口运行期状态回报器。
+ * 贡献项运行期状态回报器（v3）。
  *
- * `PluginHost.loadAll()` 先 `activate()`，之后才 `EntryRegistry.setPlugins()` 建表，
- * 因此激活期间写状态会静默失败。这里记住期望值并在 `entries:changed` 时重放，
- * 且只在值变化时写，保证重放幂等。
+ * `PluginHost.loadAll()` 先 `activate()`，之后才把 manifest.contributions 装进
+ * `ContributionRegistry`，因此激活期间写状态会因查不到节点而返回 false。
+ * 这里记住期望值并在 `contributions:changed` 时重放，且只在值变化时写，保证重放幂等。
+ *
+ * v3 映射（设计文档 §10.2）：旧的入口状态写入（status / badge / progress）→
+ * `api.contributions.update(id, { status, badge, progress, busy })`。
  */
-function createEntryStatusReporter(api) {
-  // 角标与状态点要**同时**写到多个入口：坞（workbench）与命令面板（open-review）。
-  // 注意不能写成 `.some()` —— 那只会在第一个成功的入口处短路，后面的入口永远
+function createContributionReporter(api) {
+  // 角标与状态点要**同时**写到多个节点：坞（workbench）与命令面板（open-review）。
+  // 注意不能写成 `.some()` —— 那只会在第一个成功的节点处短路，后面的节点永远
   // 拿不到角标（`open-review` 从此看不见待审批数）。
   const entryIds = ['workbench', 'open-review'];
   const status = { current: '' };
@@ -35,28 +43,28 @@ function createEntryStatusReporter(api) {
   let writtenStatus = null;
   let writtenBadge = undefined;
 
-  /** 逐个写入（不能 `.some()` —— 短路会让后面的入口永远拿不到值）。 */
+  /** 逐个写入（不能 `.some()` —— 短路会让后面的节点永远拿不到值）。 */
   const writeStatus = (value) => {
     let any = false;
     for (const id of entryIds) {
-      if (api.entries.setStatus(id, value)) any = true;
+      if (api.contributions.update(id, { status: value })) any = true;
     }
     return any;
   };
   const writeBadge = (value) => {
     let any = false;
     for (const id of entryIds) {
-      if (api.entries.setBadge(id, value)) any = true;
+      if (api.contributions.update(id, { badge: value })) any = true;
     }
     return any;
   };
 
   /**
-   * 任务 → 该任务的入口 id。
+   * 任务 → 该任务的菜单节点 id。
    *
-   * 用于把「正在跑 3/12」写到**该任务所有入口**上：宿主的批量菜单与右键菜单
-   * 都会画进度条（`entry.progress` 形如 `{done, total}`），因此用户在任何
-   * 落点都能看到「这个任务已经在跑」。不写的话进度条永远不出现。
+   * 用于把「正在跑 3/12」写到**该任务所有节点**上：v3 的 dock 节点渲染
+   * `progress`（0–1）与 `busy`，菜单树节点渲染 badge，因此用户在任何落点
+   * 都能看到「这个任务已经在跑」。不写的话进度永远不出现。
    */
   const TASK_ENTRIES = {
     analyze: ['analyze-selected', 'analyze-folder'],
@@ -66,8 +74,17 @@ function createEntryStatusReporter(api) {
     review: ['open-review'],
   };
 
-  /** 每个任务最近一次进度（`null` = 无进度）。重放时按它恢复。 */
+  /** 每个任务最近一次进度（0–1 的比值，`null` = 无进度）。重放时按它恢复。 */
   const taskProgress = new Map();
+
+  /** 写进度（`progress` 为 0–1 的比值或 `null`；`busy` 同步置位）。 */
+  const writeProgress = (id, progress) => {
+    try {
+      return api.contributions.update(id, { progress, busy: progress !== null });
+    } catch (error) {
+      return false;
+    }
+  };
 
   const apply = () => {
     if (status.current && writtenStatus !== status.current) {
@@ -76,21 +93,15 @@ function createEntryStatusReporter(api) {
     if (badges.has && writtenBadge !== badges.current) {
       if (writeBadge(badges.current)) writtenBadge = badges.current;
     }
-    // 进度同样可能在入口表就绪前写入（自动续跑、页面刚加载），一并重放
+    // 进度同样可能在注册表就绪前写入（自动续跑、页面刚加载），一并重放
     taskProgress.forEach((progress, taskId) => {
       const ids = TASK_ENTRIES[String(taskId)] || [];
-      ids.forEach((id) => {
-        try {
-          api.entries.setProgress(id, progress);
-        } catch (error) {
-          /* 忽略：重放是尽力而为 */
-        }
-      });
+      ids.forEach((id) => writeProgress(id, progress));
     });
   };
 
   apply();
-  const off = api.on('entries:changed', apply);
+  const off = api.on('contributions:changed', apply);
 
   return {
     setStatus(next) {
@@ -110,24 +121,18 @@ function createEntryStatusReporter(api) {
       if (writeBadge(badges.current)) writtenBadge = badges.current;
     },
     /**
-     * 把「正在跑」写到该任务的全部入口上（`{done, total}` / `null` 清除）。
+     * 把「正在跑」写到该任务的全部节点上（`{done, total}` / `null` 清除）。
      *
-     * 宿主的批量菜单与右键菜单都渲染 `entry.progress`，因此这里一次写入
-     * 就能让所有落点显示同一条进度，不需要每个面板各画一套。
+     * v3 的 `progress` 是 0–1 的比值（宿主的 dock 节点据此渲染进度环），这里把
+     * 作业的 done/total 归一化；批量/右键菜单节点只渲染 badge，不会重复画进度条。
      */
     setTaskProgress(taskId, progress) {
       const ids = TASK_ENTRIES[String(taskId || '')] || [];
-      const next = progress && Number(progress.total) > 0
-        ? { done: Number(progress.done) || 0, total: Number(progress.total) || 0 }
+      const ratio = progress && Number(progress.total) > 0
+        ? Math.min(1, Math.max(0, (Number(progress.done) || 0) / Number(progress.total)))
         : null;
-      taskProgress.set(String(taskId), next);
-      for (const id of ids) {
-        try {
-          api.entries.setProgress(id, next);
-        } catch (error) {
-          console.warn(`[stm-ai] 写入入口进度失败（${id}）:`, error);
-        }
-      }
+      taskProgress.set(String(taskId), ratio);
+      for (const id of ids) writeProgress(id, ratio);
     },
     dispose() {
       if (typeof off === 'function') off();
@@ -165,7 +170,7 @@ export async function activate(api) {
     notifyReview: null,
   };
 
-  const reporter = createEntryStatusReporter(api);
+  const reporter = createContributionReporter(api);
   context.setPendingBadge = (value) => reporter.setPendingBadge(value);
   context.setTaskProgress = (taskId, progress) => reporter.setTaskProgress(taskId, progress);
 

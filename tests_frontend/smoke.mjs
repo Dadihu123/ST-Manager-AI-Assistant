@@ -192,16 +192,16 @@ function createFakeApi({ providers = 1, pending = 0 } = {}) {
       close(id) { return true; },
       isOpen(id) { return opened.some((item) => item.id === id); },
     },
-    entries: {
-      register: () => true,
-      update: () => true,
+    contributions: {
+      update(id, patch = {}) {
+        if (Object.prototype.hasOwnProperty.call(patch, 'badge')) badges.push([id, patch.badge]);
+        if (Object.prototype.hasOwnProperty.call(patch, 'status')) statuses.push([id, patch.status]);
+        return true;
+      },
       remove: () => true,
-      setBadge(id, value) { badges.push([id, value]); return true; },
-      setProgress: () => true,
-      setStatus(id, value) { statuses.push([id, value]); return true; },
-      setBusy: () => true,
-      open: () => true,
+      get: () => null,
       list: () => [],
+      trigger: () => true,
     },
     ui: {
       icon: (name) => makeNode('span'),

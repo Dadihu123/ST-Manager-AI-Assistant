@@ -28,7 +28,7 @@ import { createSettings } from './views/settings.js';
 import { createTaskPanel } from './views/task.js';
 import { TASKS, TASK_ORDER } from './tasks.js';
 
-/** surface id → 标题 / 图标 / 尺寸。manifest 的 `surface` 字段与这里必须一致。 */
+/** surface id → 标题 / 图标 / 尺寸。manifest 的 `action.surface.id` 与这里必须一致。 */
 export const SURFACES = {
   hub: { title: 'AI 助手', icon: 'wand', size: 'lg', description: '任务中心' },
   analyze: { title: 'AI 打标', icon: 'tags', size: 'lg', description: '生成概览与标签' },

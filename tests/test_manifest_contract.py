@@ -1,7 +1,17 @@
-"""manifest 契约：与主程序 `core/plugins/manifest.py` 的校验规则对齐。
+"""manifest 契约（v3）：与主程序 `core/plugins/contract.py` 对齐。
 
-白名单与正则在此**复刻**，以便在无主程序的环境下也能自检；若主程序仓库可用，
-另有真实调用校验（见 `test_manifest_passes_main_app_validator`）。
+v3 删除了插件仓库里的宿主逻辑复刻（设计文档附录 B：manifest 白名单、
+`evaluateWhen`、CSS 扫描器三份复刻）。契约的唯一事实源是主程序
+`core/plugins/contract.py`，插件仓库的离线自检入口是
+`scripts/stm_plugin_check.py`（由主程序工具链生成、与 contract.py 同源）。
+
+因此本文件只保留三类断言：
+
+1. **插件自己的语义约束**：哪些落点 / 命令 / 图标 / 文案必须有、坞上限、
+   快捷键不冲突、任务面板必须可达；
+2. **真实校验器交叉验证**：主程序仓库可用时调用
+   `contract.validate_manifest(..., strict=True)`，与插件仓库 CI 使用同一套规则；
+3. 不依赖契约白名单的模块边界、schema 子集、图标存在性检查。
 """
 
 import json
@@ -14,70 +24,49 @@ import pytest
 from conftest import MAIN_APP_DIR, ROOT
 
 MANIFEST_PATH = os.path.join(ROOT, 'manifest.json')
+HOST_AVAILABLE = os.path.isdir(MAIN_APP_DIR)
 
-# 复刻自 core/plugins/manifest.py
-KNOWN_HOOKS = frozenset({
-    'app.ready', 'card.created', 'card.updated', 'card.deleted', 'card.moved',
-    'tag.applied', 'tag.deleted', 'worldbook.saved', 'worldbook.entry_changed',
-    'scan.completed', 'index.job_done',
+#: v1 落点清单（与主程序 `contract.MENU_PLACEMENTS` 一致；仅用于语义断言）。
+MENU_PLACEMENTS = frozenset({
+    'context.folder', 'context.card', 'context.footer', 'batch.actions',
+    'commandPalette', 'dock', 'settings.nav',
 })
-KNOWN_PERMISSIONS = frozenset({
-    'cards.read', 'cards.write', 'worldbook.read', 'worldbook.write',
-    'tags.read', 'tags.write', 'secrets.read', 'network.outbound', 'jobs.run',
+#: 命名插槽清单（与主程序 `contract.SLOT_NAMES` 一致）。
+SLOT_NAMES = frozenset({
+    'settings.section', 'header.actions', 'card.detail.tabs',
+    'page.cards.toolbar', 'page.worldinfo.toolbar',
 })
-KNOWN_TOP_LEVEL_KEYS = frozenset({
-    'id', 'name', 'version', 'api_version', 'manifest_version', 'author',
-    'description', 'homepage', 'license', 'icon', 'min_app_version',
-    'backend', 'frontend', 'permissions', 'requires', 'config_schema',
-    'secret_schema', 'i18n',
-})
-KNOWN_BACKEND_KEYS = frozenset({'entry', 'register', 'jobs', 'hooks'})
-KNOWN_FRONTEND_KEYS = frozenset({'entry', 'styles', 'entries'})
-LEGACY_FRONTEND_KEYS = ('panels', 'settings_tab', 'detail_tab')
-
-# 复刻自 core/plugins/entries.py
-KNOWN_ENTRY_KEYS = frozenset({
-    'id', 'kind', 'label', 'description', 'icon', 'contexts',
-    'requires_selection', 'surface', 'priority', 'badge', 'shortcut',
-    'when', 'disabledHint',
-    # 菜单分组：同一插件的 context/batch 入口折叠成一个父项（如「AI 助手」）
-    'group',
-})
-KNOWN_WHEN_KEYS = frozenset({
-    'mode', 'selection', 'indexState', 'config', 'hostVersion', 'feature', 'target',
-})
-ENTRY_KINDS = frozenset({
-    'dock', 'nav', 'settings', 'context', 'command', 'status', 'batch',
-})
-SURFACE_TYPES = frozenset({'panel', 'modal', 'page', 'sheet'})
-SELECTION_MODES = frozenset({'none', 'any', 'single', 'multi'})
-TARGET_KINDS = frozenset({'folder', 'card', 'any'})
+#: 菜单节点 / 命令 id 正则（与主程序一致）。
+NODE_ID_PATTERN = re.compile(r'^[a-z][a-z0-9-]{0,63}$')
+#: 宿主工作模式（`when.mode` 的取值；与前端 `KNOWN_MODES` 一致）。
 KNOWN_MODES = frozenset({
     'cards', 'worldinfo', 'chats', 'presets',
     'regex', 'scripts', 'quick_replies', 'beautify',
 })
-MAX_ENTRIES_PER_PLUGIN = 16
-ENTRY_ID_PATTERN = re.compile(r'^[a-z][a-z0-9-]{0,63}$')
-
-# 归属分级（D5）：由主程序仓库的 `static/plugins/catalog.json` 决定，manifest 无权声明。
-# 本插件已登记为 official（`catalog.json` 里 `tier: "official"`）。
-# official 可用全部 7 类 kind；若将来降级为 community，则 nav / status 不可用。
-OFFICIAL_ENTRY_KINDS = frozenset({
-    'dock', 'nav', 'settings', 'context', 'command', 'status', 'batch',
-})
-COMMUNITY_ENTRY_KINDS = frozenset({'dock', 'command', 'context', 'settings', 'batch'})
-# 本插件实际使用的 kind（保守集合：即使被降级为 community 也仍然合法）
-USED_ENTRY_KINDS = COMMUNITY_ENTRY_KINDS
-
-PLUGIN_ID_PATTERN = re.compile(r'^[a-z][a-z0-9-]{1,63}$')
-SEMVER_PATTERN = re.compile(r'^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$')
-JOB_TYPE_PATTERN = re.compile(r'^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$')
+#: `when.selection` 取值（与主程序一致）。
+SELECTION_MODES = frozenset({'none', 'any', 'single', 'multi'})
+#: v3 已删除的 `when` 子键：落点由 placement 表达，不再需要 target。
+REMOVED_WHEN_KEYS = ('target', 'contexts')
+#: 快捷键格式（与宿主 `commandPalette.shortcutCombo()` 的折算规则一致）。
+SHORTCUT_PATTERN = re.compile(
+    r'^(Ctrl\+)?(Alt\+)?(Shift\+)?(Meta\+)?'
+    r'([A-Z0-9]|F\d{1,2}|Arrow(Up|Down|Left|Right)|Enter|Escape|Space|Tab|Backspace|Delete)$'
+)
 
 SCHEMA_TYPES = frozenset({'string', 'integer', 'number', 'boolean', 'enum'})
 SCHEMA_ALLOWED_KEYS = frozenset({
     'type', 'title', 'description', 'default', 'minimum', 'maximum',
     'enum', 'secret', 'required', 'properties',
 })
+
+#: 本插件升级到 v3 后的能力披露（v2 `permissions` 的同名迁移）。
+EXPECTED_CAPABILITIES = frozenset({
+    'cards.read', 'cards.write', 'worldbook.read', 'worldbook.write',
+    'tags.read', 'tags.write', 'secrets.read', 'network.outbound', 'jobs.run',
+})
+
+
+# --------------------------------------------------------------- fixtures
 
 
 @pytest.fixture(scope='module')
@@ -87,41 +76,132 @@ def manifest():
 
 
 @pytest.fixture(scope='module')
-def entries(manifest):
-    return manifest['frontend'].get('entries') or []
+def frontend(manifest):
+    return manifest['frontend']
+
+
+@pytest.fixture(scope='module')
+def contributions(frontend):
+    return frontend.get('contributions') or {}
+
+
+@pytest.fixture(scope='module')
+def menus(contributions):
+    return contributions.get('menus') or []
+
+
+@pytest.fixture(scope='module')
+def slots(contributions):
+    return contributions.get('slots') or []
+
+
+@pytest.fixture(scope='module')
+def commands(contributions):
+    return contributions.get('commands') or []
+
+
+@pytest.fixture(scope='module')
+def nodes(menus):
+    """扁平化菜单树：`[(depth, placement, node), …]`（placement 继承根节点）。"""
+    out = []
+
+    def walk(items, depth=0, placement=''):
+        for node in items or []:
+            current = placement or str(node.get('placement') or '')
+            out.append((depth, current, node))
+            walk(node.get('children') or [], depth + 1, current)
+
+    walk(menus)
+    return out
+
+
+@pytest.fixture(scope='module')
+def nodes_by_id(menus):
+    return {node.get('id'): node for _depth, _placement, node in _flatten(menus)}
+
+
+def _flatten(menus, depth=0, placement=''):
+    out = []
+    for node in menus or []:
+        current = placement or str(node.get('placement') or '')
+        out.append((depth, current, node))
+        out.extend(_flatten(node.get('children') or [], depth + 1, current))
+    return out
+
+
+@pytest.fixture(scope='module')
+def plugin_source():
+    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
+        return handle.read()
+
+
+@pytest.fixture(scope='module')
+def panel_source():
+    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
+        return handle.read()
 
 
 @pytest.fixture(scope='module')
 def tasks_source():
-    """`frontend/tasks.js` 源码：任务注册表是入口文案与主按钮的单一来源。"""
     with open(os.path.join(ROOT, 'frontend', 'tasks.js'), 'r', encoding='utf-8') as handle:
         return handle.read()
 
 
+def _load_host_contract():
+    """导入主程序 v3 契约模块；主程序未迁移时跳过（而不是复刻一份规则）。"""
+    if not HOST_AVAILABLE:
+        pytest.skip('主程序仓库不可用')
+    sys.path.insert(0, MAIN_APP_DIR)
+    try:
+        from core.plugins import contract  # noqa: PLC0415
+
+        return contract
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f'主程序尚未提供 v3 contract 模块: {exc}')
+    finally:
+        sys.path.remove(MAIN_APP_DIR)
+
+
+# --------------------------------------------------------------- 版本与结构
+
+
 def test_manifest_id_and_version(manifest):
     assert manifest['id'] == 'stm-ai-assistant'
-    assert PLUGIN_ID_PATTERN.match(manifest['id'])
-    assert SEMVER_PATTERN.match(manifest['version'])
+    assert re.match(r'^[a-z][a-z0-9-]{1,63}$', manifest['id'])
+    assert re.match(r'^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$',
+                    manifest['version'])
 
 
 def test_api_version_and_min_app_version(manifest):
-    """D2：`api_version` 是宿主契约版本，`manifest_version` 是清单结构版本。"""
-    assert manifest['api_version'] == 2
-    assert manifest['manifest_version'] == 2
+    """v3：`api_version` 与 `manifest_version` 都固定为 3（不保留 v2 兼容）。"""
+    assert manifest['api_version'] == 3
+    assert manifest['manifest_version'] == 3
     assert manifest['min_app_version'] == '1.0.0'
 
 
-def test_manifest_has_no_unknown_structural_keys(manifest):
-    """D3：结构键严格校验——多一个键主程序会**拒绝加载**整个插件。"""
-    assert set(manifest) <= KNOWN_TOP_LEVEL_KEYS, sorted(set(manifest) - KNOWN_TOP_LEVEL_KEYS)
-    assert set(manifest.get('backend') or {}) <= KNOWN_BACKEND_KEYS
-    assert set(manifest.get('frontend') or {}) <= KNOWN_FRONTEND_KEYS
+def test_legacy_keys_are_gone(manifest, frontend, contributions):
+    """v3 删除且不保留别名：`permissions`、`frontend.entries[]`、旧三字段。"""
+    assert 'permissions' not in manifest
+    assert 'entries' not in frontend
+    for legacy in ('panels', 'settings_tab', 'detail_tab'):
+        assert legacy not in frontend, legacy
+    assert set(frontend) <= {
+        'entry', 'styles', 'global_styles', 'render_mode', 'contributions',
+    }
+    assert set(contributions) <= {'menus', 'slots', 'commands'}
 
 
-def test_frontend_drops_legacy_keys(manifest):
-    """D1：旧三字段已彻底删除且不保留别名，出现即拒绝加载。"""
-    frontend = manifest['frontend']
-    assert [key for key in LEGACY_FRONTEND_KEYS if key in frontend] == []
+def test_manifest_passes_main_app_contract(manifest):
+    """用主程序真实校验器（strict）加载本插件 manifest：零 issue 是最硬断言。"""
+    contract = _load_host_contract()
+    normalized, issues = contract.validate_manifest(manifest, strict=True)
+    assert issues == [], issues
+    assert normalized['api_version'] == 3
+    assert normalized['manifest_version'] == 3
+    assert set(normalized['capabilities']) == EXPECTED_CAPABILITIES
+    assert normalized['frontend']['render_mode'] == 'declarative'
+    assert normalized['frontend']['contributions']['menus']
+    assert len(normalized['frontend']['contributions']['commands']) == 4
 
 
 def test_backend_entry_declares_package_with_init(manifest):
@@ -134,368 +214,345 @@ def test_declared_jobs_are_valid_and_registered(manifest):
     jobs = manifest['backend']['jobs']
     assert jobs, '至少要声明一个作业类型'
     for job_type in jobs:
-        assert JOB_TYPE_PATTERN.match(job_type), job_type
+        assert re.match(r'^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$', job_type), job_type
     assert 'ai.analyze' in jobs
 
 
-def test_hooks_are_within_whitelist(manifest):
-    for hook in manifest['backend'].get('hooks') or []:
-        assert hook in KNOWN_HOOKS, hook
+def test_backend_declares_no_hooks(manifest):
+    """本插件用不到后端 hook（前端通过 api.on 订阅核心事件）。"""
+    assert not (manifest['backend'].get('hooks') or [])
 
 
-def test_permissions_are_within_whitelist(manifest):
-    permissions = manifest.get('permissions') or []
-    assert permissions, '权限声明不能为空（如实声明是审计的前提）'
-    for permission in permissions:
-        assert permission in KNOWN_PERMISSIONS, permission
-    assert 'secrets.read' in permissions
-    assert 'network.outbound' in permissions
+def test_capabilities_are_declared_honestly(manifest):
+    """v3 `capabilities` 取代 v2 `permissions`：如实披露，不缩水。"""
+    capabilities = manifest.get('capabilities') or []
+    assert capabilities, '能力声明不能为空（如实声明是审计的前提）'
+    assert set(capabilities) == EXPECTED_CAPABILITIES, sorted(
+        set(capabilities) ^ EXPECTED_CAPABILITIES)
+    assert 'secrets.read' in capabilities
+    assert 'network.outbound' in capabilities
 
 
-def test_frontend_entry_and_styles_exist(manifest):
-    frontend = manifest['frontend']
+def test_render_mode_is_declarative(manifest, frontend):
+    """本插件的界面全部是宿主容器（surface）+ 贡献声明，不自绘、不注入全局样式。"""
+    assert frontend.get('render_mode') == 'declarative'
+    assert not (frontend.get('global_styles') or [])
+    capabilities = set(manifest.get('capabilities') or [])
+    assert 'ui.custom' not in capabilities
+    assert 'ui.global_styles' not in capabilities
+
+
+def test_frontend_entry_and_styles_exist(frontend):
     assert os.path.isfile(os.path.join(ROOT, frontend['entry']))
     for style in frontend['styles']:
         assert os.path.isfile(os.path.join(ROOT, style))
 
 
-# --------------------------------------------------------------- entries 结构
+# --------------------------------------------------------------- 三原语结构
 
 
-def test_entries_declared(entries):
-    """重写后入口由 manifest 声明（旧版是自绘浮动按钮）。"""
-    assert entries, 'frontend.entries 不能为空'
-    assert len(entries) <= MAX_ENTRIES_PER_PLUGIN
+def test_contributions_declared(menus, slots, commands):
+    """菜单树与命令必须声明；本插件没有 settings.section 插槽（设置走 surface）。"""
+    assert menus, 'frontend.contributions.menus 不能为空'
+    assert commands, 'frontend.contributions.commands 不能为空'
+    assert slots == [], '本插件的设置页是独立 surface，不使用 settings.section 插槽'
 
 
-def test_entry_keys_are_within_whitelist(entries):
-    """D3：`entries[]` 子键也是严格白名单，多一个键会拒绝加载整个插件。"""
-    for index, entry in enumerate(entries):
-        unknown = sorted(set(entry) - KNOWN_ENTRY_KEYS)
-        assert unknown == [], f'entries[{index}] 含未知键: {unknown}'
+def test_menu_ids_are_unique_and_match_pattern(menus):
+    ids = [node.get('id') for _depth, _placement, node in _flatten(menus)]
+    assert len(ids) == len(set(ids)), f'菜单节点 id 重复: {ids}'
+    for node_id in ids:
+        assert NODE_ID_PATTERN.match(str(node_id or '')), node_id
 
 
-def test_entry_ids_match_pattern_and_are_unique(entries):
-    ids = [entry.get('id') for entry in entries]
-    for entry_id in ids:
-        assert ENTRY_ID_PATTERN.match(str(entry_id or '')), entry_id
-    assert len(ids) == len(set(ids)), '入口 id 不得重复'
+def test_command_ids_are_unique_and_match_pattern(commands):
+    ids = [command.get('id') for command in commands]
+    assert len(ids) == len(set(ids)), f'命令 id 重复: {ids}'
+    for command_id in ids:
+        assert NODE_ID_PATTERN.match(str(command_id or '')), command_id
 
 
-def test_entry_kinds_are_valid_and_within_community_subset(entries):
-    """D5：kind 必须合法，且只用 community 也允许的那 5 类。
-
-    本插件已登记为 official（可用全部 7 类），但实际只用了
-    `dock` / `context` / `batch` / `settings`——这是**刻意**的保守选择：
-    即使将来从 catalog 摘掉（降级为 community），入口也不会被静默忽略。
-    """
-    for entry in entries:
-        kind = entry.get('kind')
-        assert kind in ENTRY_KINDS, kind
-        assert kind in USED_ENTRY_KINDS, (
-            f'入口 {entry.get("id")} 使用了 {kind}；'
-            f'本插件只应使用 {sorted(USED_ENTRY_KINDS)}（community 子集）'
-        )
-
-
-def test_entries_land_on_distinct_host_locations(entries):
-    """入口必须覆盖宿主真实存在的落点，且每条入口都有自己的落点。
-
-    重构后（任务化）不再「一个 kind 只准出现一次」——一个任务需要同时从右键、
-    批量菜单进入。真正要守的是：
-    - 每个 kind 都在宿主的可渲染集合里（不会被静默丢弃）；
-    - 同 kind 的入口靠 `surface` 区分，指向不同任务面板；
-    - 入口数不超过宿主上限（`MAX_ENTRIES_PER_PLUGIN = 16`）。
-    """
-    kinds = [entry.get('kind') for entry in entries]
-    assert set(kinds) == {'dock', 'context', 'batch', 'command', 'settings'}, kinds
-    assert len(entries) <= 16, f'入口数 {len(entries)} 超过宿主上限 16'
-
-    # 同一 kind 下不应有两条入口在**同样的上下文**里打开同一个 surface
-    seen = {}
-    for entry in entries:
-        kind = entry.get('kind')
-        surface = (entry.get('surface') or {}).get('id')
-        if not surface:
-            continue
-        when = entry.get('when') or {}
-        pair = (kind, surface, when.get('mode') and tuple(when['mode']), when.get('target'))
-        assert pair not in seen, (
-            f'入口 {entry.get("id")} 与 {seen.get(pair)} 在同样上下文里都打开 {surface}，属于重复入口'
-        )
-        seen[pair] = entry.get('id')
-
-    # 单插件坞槽位上限 2
-    dock_entries = [entry for entry in entries if entry.get('kind') == 'dock']
-    assert len(dock_entries) <= 2, f'坞入口 {len(dock_entries)} 超过单插件上限 2'
-
-
-def test_every_task_has_at_least_one_entry(entries):
-    """每个任务都必须至少有一个入口，否则「功能存在但进不去」。
-
-    任务的唯一声明处是 `frontend/tasks.js`；这里解析它的 `surface:` 取值，
-    再做双向核对：任务 → 入口、入口 → 已注册 surface。
-    """
-    with open(os.path.join(ROOT, 'frontend', 'tasks.js'), 'r', encoding='utf-8') as handle:
-        source = handle.read()
-
-    task_surfaces = re.findall(r"surface:\s*'([a-z-]+)'", source)
-    assert task_surfaces, '未能从 tasks.js 解析出任务 surface'
-    assert len(task_surfaces) == len(set(task_surfaces)), '两个任务指向了同一个 surface'
-
-    entry_surfaces = {
-        (entry.get('surface') or {}).get('id')
-        for entry in entries
-    }
-    for surface in task_surfaces:
-        assert any(
-            (entry.get('surface') or {}).get('id') == surface or entry.get('id') == surface
-            for entry in entries
-        ), f'任务面板 {surface} 没有任何入口'
-
-    # 反向：每个入口的 surface 必须在 panel.js 的 SURFACES 里注册过
-    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
-        panel_source = handle.read()
-    registered = set(re.findall(r"^\s{2}([a-z-]+):\s*\{ title:", panel_source, re.M))
-    assert registered, '未能从 panel.js 解析出 SURFACES'
-    for entry in entries:
-        surface = (entry.get('surface') or {}).get('id')
-        if surface:
-            assert surface in registered, f'入口 {entry.get("id")} 指向未注册的 surface: {surface}'
-
-
-def test_entry_labels_use_user_vocabulary(tasks_source):
-    """入口文案必须用用户词（打标 / 精简 / 归类 / 提议），而不是内部术语。
-
-    这是 F2/F3 的回归护栏：三个功能此前完全没有入口，命令面板也搜不到。
-    `label` 决定命令面板能否被搜到，`verb` 决定主按钮文案——
-    两者必须说同一套词。
-    """
-    labels = tasks_source
-    for word in ('打标', '精简', '归类', '提议'):
-        assert word in labels, f'任务注册表里缺少用户词「{word}」'
-
-
-def test_folder_context_entry_declares_folder_target(entries):
-    """`analyze-folder` 必须声明 `when.target: "folder"`。
-
-    没有它，这个入口会出现在**卡片**右键菜单里（那才是旧的 `analyze-selected`
-    行为），而右键分类 → 分析整个分类这条路径就丢了。
-    """
-    by_id = {entry.get('id'): entry for entry in entries}
-    folder_entry = by_id.get('analyze-folder')
-    assert folder_entry is not None, '缺少 analyze-folder 入口'
-    assert folder_entry['kind'] == 'context'
-    assert (folder_entry.get('when') or {}).get('target') == 'folder'
-    assert str(folder_entry.get('disabledHint') or '').strip()
-
-    # 右键菜单专属：不得再声明 selection（右键分类的作用域与全局选中集无关）
-    assert 'selection' not in (folder_entry.get('when') or {})
-
-
-def test_selected_batch_entry_requires_selection_with_hint(entries):
-    """`analyze-selected` 是批量菜单项：`kind: "batch"` + `when.selection: "any"`。"""
-    by_id = {entry.get('id'): entry for entry in entries}
-    entry = by_id.get('analyze-selected')
-    assert entry is not None, '缺少 analyze-selected 入口'
-    assert entry['kind'] == 'batch'
-    assert (entry.get('when') or {}).get('selection') == 'any'
-    assert str(entry.get('disabledHint') or '').strip()
-
-
-def test_obsolete_single_surface_entries_are_gone(entries):
-    """四个入口全部指向同一个 `workbench` surface 的旧结构必须消失。
-
-    旧版 `analyze-selected` / `analyze-folder` / `assistant-settings` 都开同一个
-    四页签面板，于是「入口很多、点开都一样」。现在每条入口都有自己的 surface。
-    """
-    by_id = {entry.get('id'): entry for entry in entries}
-    workbench_targets = [
-        entry for entry in entries
-        if (entry.get('surface') or {}).get('id') == 'workbench'
-    ]
-    assert workbench_targets == [], '不应再有入口直接指向 workbench surface'
-    assert by_id['analyze-selected']['surface']['id'] == 'analyze'
-    assert by_id['assistant-settings']['surface']['id'] == 'settings'
-
-
-def test_pending_badge_targets_the_workbench_entry():
-    """待审批角标必须挂在仍然存在的入口上。
-
-    `setBadge` 查不到条目会静默返回 false，角标就丢了。重构后角标同时写
-    `workbench`（坞）与 `open-review`（命令面板），两处都要存在。
-    """
-    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
-        source = _strip_js_comments(handle.read())
-
-    assert 'setBadge' in source, 'plugin.js 不再写入口角标'
-    assert "'workbench'" in source, '角标必须覆盖 workbench 入口'
-    assert 'open-review' in source, '角标必须覆盖 open-review 入口'
-
-
-def test_workbench_surface_routes_to_the_hub(entries):
-    """坞入口必须落在「任务中心」而不是某个具体任务面板。
-
-    任务化之后坞是统一出发页；若它指向 `analyze`，用户点「AI 助手」会直接进
-    打标面板，其余三个任务不可达。
-    """
-    by_id = {entry.get('id'): entry for entry in entries}
-    dock = by_id['workbench']
-    assert dock['kind'] == 'dock'
-    assert dock['surface']['id'] == 'hub'
-    assert dock['surface']['type'] == 'modal'
-    assert str(dock.get('shortcut') or '').strip(), '坞入口必须保留快捷键'
-
-    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
-        source = handle.read()
-    assert "api.surfaces.register(surfaceId" in source, (
-        'plugin.js 应按 SURFACES 表批量注册，而不是手写四条 register'
-    )
-    assert "'modal'" in source, 'surface 类型必须是 modal'
-
-
-def test_entry_labels_present(entries):
-    """缺 label 的入口会被宿主丢弃 + 警告。"""
-    for entry in entries:
-        assert str(entry.get('label') or '').strip(), entry.get('id')
-
-
-def test_entry_surface_types_are_valid(entries):
-    for entry in entries:
-        surface = entry.get('surface')
-        if surface is None:
-            continue
-        assert isinstance(surface, dict), entry.get('id')
-        assert set(surface) <= {'id', 'type'}, sorted(surface)
-        surface_type = surface.get('type')
-        if surface_type is not None:
-            assert surface_type in SURFACE_TYPES, surface_type
-
-
-def test_entry_when_expression_is_valid(entries):
-    """D7：`when` 只声明，求值归宿主。非法子键会被忽略 + 警告。"""
-    for entry in entries:
-        when = entry.get('when')
-        if when is None:
-            continue
-        assert isinstance(when, dict), entry.get('id')
-        assert set(when) <= KNOWN_WHEN_KEYS, sorted(set(when) - KNOWN_WHEN_KEYS)
-
-        for mode in when.get('mode') or []:
-            assert mode in KNOWN_MODES, mode
-
-        if 'selection' in when:
-            assert when['selection'] in SELECTION_MODES, when['selection']
-
-        if 'target' in when:
-            assert when['target'] in TARGET_KINDS, when['target']
-
-        if 'config' in when:
-            assert isinstance(when['config'], dict)
-            assert set(when['config']) <= {'requireKeys'}, sorted(when['config'])
-
-
-def test_entries_require_selection_have_disabled_hint(entries):
-    """置灰必须给出理由（D7：不是无反应，而是「可见但置灰 + 提示」）。"""
-    for entry in entries:
-        when = entry.get('when') or {}
-        needs_selection = bool(entry.get('requires_selection')) or 'selection' in when
-        if needs_selection:
-            assert str(entry.get('disabledHint') or '').strip(), (
-                f'入口 {entry.get("id")} 依赖选中项，必须声明 disabledHint'
+def test_root_placements_are_known_and_children_omit_them(menus):
+    for node in menus:
+        assert node.get('placement') in MENU_PLACEMENTS, node.get('placement')
+        for child in node.get('children') or []:
+            assert 'placement' not in child, (
+                f'子节点 {child.get("id")} 不得声明 placement（落点由根节点决定）'
             )
 
 
-def test_when_config_require_keys_exist_in_schemas(manifest):
-    """D7：`when.config.requireKeys` 读的是 `config_schema` 与 `secret_schema` 的键。"""
+def test_node_types_are_valid_and_actions_resolve(nodes, commands):
+    """节点类型合法；item 的 action 必须带 id；command 引用必须已声明。"""
+    command_ids = {command.get('id') for command in commands}
+    for _depth, _placement, node in nodes:
+        node_type = node.get('type')
+        assert node_type in {'item', 'submenu', 'separator'}, node.get('id')
+        if node_type == 'separator':
+            assert not node.get('label') and not node.get('action')
+            continue
+        if node_type == 'submenu':
+            assert node.get('children'), f'submenu {node.get("id")} 缺少 children'
+            continue
+        action = node.get('action') or {}
+        assert action.get('type') in {'surface', 'command', 'url'}, node.get('id')
+        if action.get('type') == 'command':
+            assert action.get('id') in command_ids, (
+                f'菜单节点 {node.get("id")} 引用了未声明的命令: {action.get("id")}'
+            )
+        if action.get('type') == 'surface':
+            assert action.get('id'), node.get('id')
+        if action.get('type') == 'url':
+            assert str(action.get('url') or '').startswith(('http://', 'https://'))
+
+
+def test_command_declarations_complete(commands):
+    """命令必须声明标题、处理器模块 / 导出名，模块文件真实存在。"""
+    for command in commands:
+        command_id = command.get('id')
+        assert str(command.get('title') or '').strip(), command_id
+        module = str(command.get('module') or '')
+        assert module, f'命令 {command_id} 缺少 module'
+        assert os.path.isfile(os.path.join(ROOT, module)), module
+        assert str(command.get('export') or '').strip(), f'命令 {command_id} 缺少 export'
+
+
+# --------------------------------------------------------------- 落点语义
+
+
+def test_exactly_one_dock_entry(menus):
+    """坞入口只能有一个（全局 8 槽位、单插件上限 2，这里保守占 1）。"""
+    docks = [node for node in menus if node.get('placement') == 'dock']
+    assert len(docks) == 1, f'应有且仅有一个 dock 入口，实际 {len(docks)} 个'
+
+
+def test_workbench_dock_routes_to_hub_via_command(menus, nodes_by_id, commands):
+    """坞入口 = 命令 open-workbench（快捷键 Ctrl+Shift+A，处理器打开 hub）。
+
+    v3 用命令承载「有处理器 + 有快捷键」的入口；surface 的 type 只来自
+    `api.surfaces.register()`，manifest 不再声明 surface type。
+    """
+    dock = nodes_by_id['workbench']
+    assert dock.get('placement') == 'dock'
+    assert dock.get('type') == 'item'
+    assert dock['action'] == {'type': 'command', 'id': 'open-workbench'}
+    assert str(dock.get('label') or '').strip()
+    assert str(dock.get('description') or '').strip()
+
+    open_workbench = next(c for c in commands if c['id'] == 'open-workbench')
+    assert open_workbench.get('shortcut') == 'Ctrl+Shift+A'
+    assert open_workbench.get('export') == 'openWorkbench'
+
+    with open(os.path.join(ROOT, 'frontend', 'commands.js'), 'r', encoding='utf-8') as handle:
+        command_source = handle.read()
+    assert re.search(r"""openSurface\(ctx,\s*['"]hub['"]""", command_source)
+
+
+def test_folder_context_group_has_expected_entries(nodes_by_id):
+    """右键分类：`context.folder` 下 4 个 item，mode 过滤正确，且不再需要 when.target。"""
+    group = nodes_by_id['ai-helper-context']
+    assert group.get('placement') == 'context.folder'
+    assert group.get('type') == 'submenu'
+    children = {child['id']: child for child in group['children']}
+    assert set(children) == {
+        'analyze-folder', 'classify-folder', 'polish-embedded', 'polish-folder',
+    }
+    for child in children.values():
+        assert child.get('type') == 'item'
+        assert child.get('action', {}).get('type') == 'surface'
+        assert str(child.get('disabledHint') or '').strip(), child['id']
+        when = child.get('when') or {}
+        assert 'selection' not in when, '右键分类的作用域是右键目标，与全局选中集无关'
+        for key in REMOVED_WHEN_KEYS:
+            assert key not in when, f'{child["id"]} 仍在使用已删除的 when.{key}'
+    assert children['analyze-folder']['when'] == {'mode': ['cards']}
+    assert children['classify-folder']['when'] == {'mode': ['cards']}
+    assert children['polish-embedded']['when'] == {'mode': ['cards']}
+    assert children['polish-folder']['when'] == {'mode': ['worldinfo']}
+
+
+def test_batch_group_requires_selection(nodes_by_id):
+    """批量菜单：`batch.actions` 下 3 个 item，全部声明 selection: any + disabledHint。"""
+    group = nodes_by_id['ai-helper-batch']
+    assert group.get('placement') == 'batch.actions'
+    assert group.get('type') == 'submenu'
+    children = {child['id']: child for child in group['children']}
+    assert set(children) == {'analyze-selected', 'classify-selected', 'polish-selector'}
+    for child in children.values():
+        when = child.get('when') or {}
+        assert when.get('selection') == 'any', child['id']
+        assert str(child.get('disabledHint') or '').strip(), child['id']
+        for key in REMOVED_WHEN_KEYS:
+            assert key not in when, f'{child["id"]} 仍在使用已删除的 when.{key}'
+    assert children['analyze-selected']['when']['mode'] == ['cards']
+    assert children['classify-selected']['when']['mode'] == ['cards']
+    assert children['polish-selector']['when']['mode'] == ['worldinfo']
+
+
+def test_command_palette_entries(menus, commands):
+    """命令面板列出 3 条命令入口；它们没有 when（全局可用）。"""
+    palette = [node for node in menus if node.get('placement') == 'commandPalette']
+    assert {node['id'] for node in palette} == {
+        'open-review', 'propose-library', 'open-profiles',
+    }
+    command_ids = {command.get('id') for command in commands}
+    for node in palette:
+        assert node.get('action', {}).get('type') == 'command'
+        assert node['action']['id'] in command_ids
+        assert not (node.get('when') or {}), f'{node["id"]} 是全局入口，不该声明 when'
+        assert str(node.get('label') or '').strip()
+        assert str(node.get('description') or '').strip()
+
+
+def test_settings_nav_entry_points_at_settings_surface(nodes_by_id):
+    """设置导航项打开独立的 settings surface（不是内联插槽）。"""
+    entry = nodes_by_id['assistant-settings']
+    assert entry.get('placement') == 'settings.nav'
+    assert entry.get('type') == 'item'
+    assert entry['action'] == {'type': 'surface', 'id': 'settings'}
+    assert str(entry.get('label') or '').strip()
+
+
+def test_selection_dependent_nodes_have_hints(nodes):
+    """依赖选中项的节点必须给出置灰理由（可见但置灰 + 提示，而不是消失）。"""
+    for _depth, _placement, node in nodes:
+        when = node.get('when') or {}
+        if 'selection' in when:
+            assert str(node.get('disabledHint') or '').strip(), (
+                f'节点 {node.get("id")} 依赖选中项，必须声明 disabledHint'
+            )
+
+
+def test_when_config_require_keys_exist_in_schemas(manifest, nodes, commands):
+    """`when.config.requireKeys` 读的是 config_schema / secret_schema 的键。"""
     declared = set()
     for field in ('config_schema', 'secret_schema'):
         schema = manifest.get(field) or {}
         declared.update((schema.get('properties') or {}).keys())
 
-    for entry in manifest['frontend'].get('entries') or []:
+    entries = [node for _d, _p, node in nodes] + list(commands)
+    for entry in entries:
         when = entry.get('when') or {}
         for key in ((when.get('config') or {}).get('requireKeys') or []):
-            assert key in declared, f'入口 {entry.get("id")} 引用了未声明的配置键: {key}'
+            assert key in declared, f'{entry.get("id")} 引用了未声明的配置键: {key}'
 
 
-def test_entry_shortcuts_are_wellformed_and_unique(entries):
-    """`shortcut` 是「建议快捷键，宿主可覆盖」（设计文档 2.2）。
+def test_when_expressions_use_supported_shape(nodes, commands):
+    """`when` 只声明、求值归宿主；v3 已删除 `target` / `contexts`。"""
+    for entry in [node for _d, _p, node in nodes] + list(commands):
+        when = entry.get('when')
+        if when is None:
+            continue
+        assert isinstance(when, dict), entry.get('id')
+        for key in REMOVED_WHEN_KEYS:
+            assert key not in when, f'{entry.get("id")} 仍在使用已删除的 when.{key}'
+        for mode in when.get('mode') or []:
+            assert mode in KNOWN_MODES, mode
+        if 'selection' in when:
+            assert when['selection'] in SELECTION_MODES, when['selection']
 
-    格式必须与宿主 `commandPalette.shortcutCombo()` 的折算规则一致，否则
-    用户按下去永远匹配不上：`Ctrl+Alt+Shift+Meta` 固定顺序 + 主键大写。
-    """
-    combo_pattern = re.compile(
-        r'^(Ctrl\+)?(Alt\+)?(Shift\+)?(Meta\+)?'
-        r'([A-Z0-9]|F\d{1,2}|Arrow(Up|Down|Left|Right)|Enter|Escape|Space|Tab|Backspace|Delete)$'
-    )
 
+def test_entry_shortcuts_are_wellformed_and_unique(commands):
+    """`shortcut` 是「建议快捷键，宿主可覆盖」；格式必须与宿主折算规则一致。"""
     seen = {}
-    for entry in entries:
-        combo = str(entry.get('shortcut') or '').strip()
+    for command in commands:
+        combo = str(command.get('shortcut') or '').strip()
         if not combo:
             continue
-        assert combo_pattern.match(combo), (
-            f'入口 {entry.get("id")} 的快捷键格式不符合宿主折算规则: {combo!r}'
+        assert SHORTCUT_PATTERN.match(combo), (
+            f'命令 {command.get("id")} 的快捷键格式不符合宿主折算规则: {combo!r}'
         )
         assert combo not in seen, (
-            f'快捷键 {combo} 被多个入口声明: {seen[combo]} 与 {entry.get("id")}'
+            f'快捷键 {combo} 被多个命令声明: {seen[combo]} 与 {command.get("id")}'
         )
-        seen[combo] = entry.get('id')
+        seen[combo] = command.get('id')
 
 
-def test_shortcuts_do_not_collide_with_host_reserved_combos(entries):
+def test_shortcuts_do_not_collide_with_host_reserved_combos(commands):
     """不要占用宿主已用的组合键（`Ctrl+K` = 命令面板）。"""
     reserved = {'Ctrl+K', 'Ctrl+Shift+K'}
-    for entry in entries:
-        combo = str(entry.get('shortcut') or '').strip()
+    for command in commands:
+        combo = str(command.get('shortcut') or '').strip()
         assert combo not in reserved, (
-            f'入口 {entry.get("id")} 占用了宿主保留快捷键 {combo}'
+            f'命令 {command.get("id")} 占用了宿主保留快捷键 {combo}'
         )
 
 
-def test_surface_ids_are_consistent_across_entries(entries):
-    """坑 2：坞按 `<pluginId>:<surface.id ?? entry.id>` 查表，两侧必须一致。
+def test_every_task_has_at_least_one_menu_node(menus, commands, tasks_source):
+    """每个任务都必须至少有一个入口，否则「功能存在但进不去」。
 
-    这里只能验证声明层自洽（多个入口复用同一个 surface id 是允许的，但 id 必须合法）。
+    任务的唯一声明处是 `frontend/tasks.js`；解析它的 `surface:` 取值，
+    再做双向核对：任务 → 菜单节点 / 命令处理器、菜单节点 → 已注册 surface。
     """
-    for entry in entries:
-        surface = entry.get('surface') or {}
-        surface_id = surface.get('id')
-        if surface_id is None:
+    task_surfaces = re.findall(r"surface:\s*'([a-z-]+)'", tasks_source)
+    assert task_surfaces, '未能从 tasks.js 解析出任务 surface'
+    assert len(task_surfaces) == len(set(task_surfaces)), '两个任务指向了同一个 surface'
+
+    action_surfaces = {
+        (node.get('action') or {}).get('id')
+        for _depth, _placement, node in _flatten(menus)
+        if (node.get('action') or {}).get('type') == 'surface'
+    }
+    with open(os.path.join(ROOT, 'frontend', 'commands.js'), 'r', encoding='utf-8') as handle:
+        command_surfaces = set(re.findall(
+            r"""openSurface\(ctx, ['"]([a-z-]+)['"]""", handle.read()))
+    reachable = action_surfaces | command_surfaces
+    for surface in task_surfaces:
+        assert surface in reachable, f'任务面板 {surface} 没有任何入口'
+
+
+def test_all_action_surfaces_are_registered_in_frontend(menus, plugin_source, panel_source):
+    """`action.surface.id` 必须在插件侧真实注册过，否则宿主只警告并忽略。"""
+    registered = set(re.findall(r"^\s{2}([a-z0-9-]+):\s*\{ title:", panel_source, re.M))
+    registered.update(re.findall(r"api\.surfaces\.register\(\s*'([a-z0-9-]+)'", plugin_source))
+    assert registered, '未能解析出已注册的 surface'
+    assert 'surfaceIds' in plugin_source, 'plugin.js 应遍历 SURFACES 批量注册'
+
+    for _depth, _placement, node in _flatten(menus):
+        action = node.get('action') or {}
+        if action.get('type') != 'surface':
             continue
-        assert ENTRY_ID_PATTERN.match(str(surface_id)), surface_id
+        assert action.get('id') in registered, (
+            f'菜单节点 {node.get("id")} 指向未注册的 surface: {action.get("id")}'
+        )
+
+    # 反向：除程序化打开的 prompt-preview 外，注册的 surface 都应该有入口
+    # （菜单节点 action 或命令处理器）。
+    action_surfaces = {
+        (node.get('action') or {}).get('id')
+        for _depth, _placement, node in _flatten(menus)
+        if (node.get('action') or {}).get('type') == 'surface'
+    }
+    with open(os.path.join(ROOT, 'frontend', 'commands.js'), 'r', encoding='utf-8') as handle:
+        action_surfaces |= set(re.findall(
+            r"""openSurface\(ctx, ['"]([a-z-]+)['"]""", handle.read()))
+    programmatic = {'prompt-preview'}
+    missing = registered - action_surfaces - programmatic
+    assert not missing, f'以下 surface 没有任何入口，用户永远打不开: {sorted(missing)}'
 
 
-# --------------------------------------------------------------- 图标名
+# --------------------------------------------------------------- 图标
 
 
-@pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
-def test_entry_icons_are_existing_host_icons(entries):
-    """D4：`entries[].icon` 用宿主图标名，不存在会降级为占位并记警告。
+def test_contribution_icons_are_plugin_assets(menus, commands):
+    """品牌图标统一用插件自己的 `frontend/assets/icon.svg`（同一插件到处同一图标）。"""
+    icon = 'frontend/assets/icon.svg'
+    assert os.path.isfile(os.path.join(ROOT, icon)), f'插件图标不存在: {icon}'
 
-    直接问主程序的图标索引（与 `GET /api/plugins/ui-icons` 同一份数据）。
-    """
-    sys.path.insert(0, MAIN_APP_DIR)
-    try:
-        from core.plugins.icons import is_host_icon_name, sprite_for_icon  # noqa: PLC0415
-    except Exception as exc:  # pragma: no cover
-        pytest.skip(f'无法导入主程序图标索引: {exc}')
-    finally:
-        sys.path.remove(MAIN_APP_DIR)
-
-    for entry in entries:
-        name = str(entry.get('icon') or '').strip()
-        if not name or not is_host_icon_name(name):
+    for _depth, _placement, node in _flatten(menus):
+        if node.get('type') == 'separator':
             continue
-        assert sprite_for_icon(name), (
-            f'入口 {entry.get("id")} 引用了不存在的宿主图标: {name}'
+        assert node.get('icon') == icon, (
+            f'菜单节点 {node.get("id")} 图标应为 {icon}，实际 {node.get("icon")!r}'
+        )
+    for command in commands:
+        assert command.get('icon') == icon, (
+            f'命令 {command.get("id")} 图标应为 {icon}，实际 {command.get("icon")!r}'
         )
 
 
-@pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
+@pytest.mark.skipif(not HOST_AVAILABLE, reason='主程序仓库不可用')
 def test_frontend_ui_icons_exist_in_host():
-    """`frontend/plugin.js` 与视图里通过 `api.ui.icon()` 引用的名字同样必须存在。"""
+    """`api.ui.icon()` 引用的宿主图标名必须存在。"""
     sys.path.insert(0, MAIN_APP_DIR)
     try:
         from core.plugins.icons import sprite_for_icon  # noqa: PLC0415
@@ -504,10 +561,9 @@ def test_frontend_ui_icons_exist_in_host():
     finally:
         sys.path.remove(MAIN_APP_DIR)
 
-    frontend_dir = os.path.join(ROOT, 'frontend')
     pattern = re.compile(r"""api\.ui\.icon\(\s*['"]([a-z0-9-]+)['"]""")
     used = set()
-    for dirpath, _dirnames, filenames in os.walk(frontend_dir):
+    for dirpath, _dirnames, filenames in os.walk(os.path.join(ROOT, 'frontend')):
         for filename in filenames:
             if not filename.endswith('.js'):
                 continue
@@ -518,11 +574,9 @@ def test_frontend_ui_icons_exist_in_host():
     assert missing == [], f'引用了不存在的宿主图标: {missing}'
 
 
-def test_panel_surface_icons_are_host_icons():
+@pytest.mark.skipif(not HOST_AVAILABLE, reason='主程序仓库不可用')
+def test_panel_surface_icons_are_host_icons(panel_source):
     """`panel.js` 的 SURFACES 图标名必须存在（它们是面板标题行的图标）。"""
-    if not os.path.isdir(MAIN_APP_DIR):
-        pytest.skip('主程序仓库不可用')
-
     sys.path.insert(0, MAIN_APP_DIR)
     try:
         from core.plugins.icons import sprite_for_icon  # noqa: PLC0415
@@ -531,10 +585,7 @@ def test_panel_surface_icons_are_host_icons():
     finally:
         sys.path.remove(MAIN_APP_DIR)
 
-    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
-        source = handle.read()
-
-    names = re.findall(r"\{ title: '[^']+', icon: '([a-z0-9-]+)'", source)
+    names = re.findall(r"\{ title: '[^']+', icon: '([a-z0-9-]+)'", panel_source)
     assert names, '未能从 panel.js 解析出 surface 图标名'
     missing = sorted(name for name in names if not sprite_for_icon(name))
     assert missing == [], f'surface 引用了不存在的宿主图标: {missing}'
@@ -605,13 +656,7 @@ def test_core_layer_stays_free_of_flask_and_main_app(manifest):
 
 
 def test_no_backend_module_imports_main_app_modules(manifest):
-    """插件后端**零越界**：不再有任何模块导入主程序 `core.*`。
-
-    历史：决策 Q5 曾允许 `summary_bridge.py` 导入 `core.data.ui_store` +
-    `core.services.card_service` 来写「概览」，因为主程序当时没有对应 API。
-    主程序的域命名空间已提供 `api.cards.read_note` / `write_note`，
-    该越界点已消除——本测试从此断言**零容忍**，防止它再被引入。
-    """
+    """插件后端**零越界**：不得导入主程序 `core.*`（域命名空间 API 已覆盖）。"""
     pattern = re.compile(r'^\s*(?:import|from)\s+core\b', re.MULTILINE)
     offenders = []
     for dirpath, _dirnames, filenames in os.walk(os.path.join(ROOT, 'backend')):
@@ -643,16 +688,17 @@ def _iter_frontend_js():
                 continue
             path = os.path.join(dirpath, filename)
             with open(path, 'r', encoding='utf-8') as handle:
-                yield os.path.relpath(path, ROOT).replace('\\', '/'), _strip_js_comments(handle.read())
+                yield os.path.relpath(path, ROOT).replace('\\', '/'), _strip_js_comments(
+                    handle.read())
 
 
 def test_frontend_avoids_removed_host_apis():
-    """重写后插件不得再依赖宿主已删除 / 不该用的成员。"""
+    """v3 删除的 API / 旧的入口运行期注册都不得再出现。"""
     forbidden = {
         'setFullscreenScrim': '宿主自己管遮罩合成（pluginSurfaceHost.js）',
-        'registerModal': '已废弃，改用 entries + surfaces',
-        'registerSettingsSection': '已废弃，改用 entries.register({kind: "settings"})',
-        'createRoot': '入口/面板不该再用自绘容器',
+        'registerModal': 'v3 已删除，改用 contributions + surfaces',
+        'registerSettingsSection': 'v3 已删除，改用 contributions + slots',
+        'entries': 'v3 已删除 api.entries，改用 api.contributions',
     }
     offenders = []
     for relative, source in _iter_frontend_js():
@@ -663,17 +709,12 @@ def test_frontend_avoids_removed_host_apis():
 
 
 def test_frontend_has_no_global_keydown_or_overlay_teardown():
-    """重写目标：插件不再自己承担层级 / 焦点 / ESC / 遮罩。
-
-    `dom.js` 的自定义下拉（`styledSelect`）自己处理方向键与 ESC 是**控件级**
-    键盘交互（宿主原语没有等价控件），因此只针对「面板/入口」这类宿主职责文件
-    做全局 `document` 监听检查。
-    """
+    """插件不再自己承担层级 / 焦点 / ESC / 遮罩。"""
     offenders = []
     for relative, source in _iter_frontend_js():
-        if relative.endswith(('dom.js', 'panel.js')):
+        if relative.endswith('panel.js'):
             # panel.js 是 surface 内容渲染器，不该绑全局键盘
-            if relative.endswith('panel.js') and re.search(r"document\.addEventListener\(\s*'keydown'", source):
+            if re.search(r"document\.addEventListener\(\s*'keydown'", source):
                 offenders.append(f'{relative}: document keydown（ESC 归宿主）')
             continue
         if re.search(r"document\.addEventListener\(\s*'keydown'", source):
@@ -707,157 +748,55 @@ def test_frontend_uses_noun_namespaced_api():
     assert offenders == [], f'仍在使用裸动词别名: {offenders}'
 
 
-def test_entry_status_writes_are_replayed_after_registry_ready():
-    """回归：`activate()` 早于 `EntryRegistry.setPlugins()`，入口写入必须可重放。
+def test_contribution_writes_are_replayed_after_registry_ready(plugin_source):
+    """回归：`activate()` 早于 ContributionRegistry 建表，状态写入必须可重放。
 
-    `PluginHost.loadAll()` 先 `loadPlugin()`（= 调用 `activate`），**之后**才
-    `EntryRegistry.setPlugins(items)` 建表（`pluginHost.js:183-194`）。
-    因此 `activate()` 期间 `api.entries.setStatus()` 会静默失败
-    （`entryRegistry.js:566-573` 查不到条目直接 return），自检结论会丢失。
-
-    这里锁定 `plugin.js` 的重放机制：写入必须**只**发生在写入器内部
-    （它订阅 `entries:changed` 重放），其余代码走 `reporter.*`。
+    `PluginHost.loadAll()` 先 `loadPlugin()`（= 调用 `activate`），之后才把
+    manifest.contributions 装进注册表。因此 activate() 期间
+    `api.contributions.update()` 会查不到节点而返回 false，自检结论会丢失。
     """
-    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
-        raw = handle.read()
-    # 注释里会**提到**这些 API 名（说明为什么不能直接调），因此只看代码
-    source = _strip_js_comments(raw)
+    source = _strip_js_comments(plugin_source)
 
-    assert "api.on('entries:changed'" in source, (
-        'plugin.js 必须订阅 entries:changed 以重放 activate() 期间的入口写入'
+    assert "api.on('contributions:changed'" in source, (
+        'plugin.js 必须订阅 contributions:changed 以重放 activate() 期间的状态写入'
     )
-    assert 'createEntryStatusReporter' in source
+    assert 'createContributionReporter' in source
 
-    # 写入器的定义体之外，不得再直接调 api.entries.setStatus / setBadge
-    start = source.index('function createEntryStatusReporter')
+    start = source.index('function createContributionReporter')
     end = source.index('export async function activate')
     reporter_body = source[start:end]
     outside = source[:start] + source[end:]
 
-    assert 'api.entries.setStatus(' in reporter_body, '写入器必须真的写入口状态'
-    assert 'api.entries.setStatus(' not in outside, (
-        '自检结论必须走 reporter.setStatus（直接写会因注册表未就绪而丢失）'
-    )
-    assert 'api.entries.setBadge(' not in outside, (
-        '角标必须走 reporter.setPendingBadge'
+    assert 'api.contributions.update(' in reporter_body, '回报器必须真的写贡献项状态'
+    assert 'api.contributions.update(' not in outside, (
+        '自检结论必须走 reporter（直接写会因注册表未就绪而丢失）'
     )
     assert 'reporter.setStatus(' in outside, 'activate() 里应通过 reporter 写状态'
 
 
-def test_pending_badge_goes_through_injected_writer():
-    """待审批角标必须走注入的写入器（带「注册表就绪重放」）。
-
-    宿主先 `activate()` 再建入口表，激活期间直接 `api.entries.setBadge()` 会静默
-    失败。因此 `plugin.js` 里的回报器要记住期望值、在 `entries:changed` 时重放。
-    """
-    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
-        source = _strip_js_comments(handle.read())
-
+def test_pending_badge_goes_through_injected_writer(plugin_source):
+    """待审批角标必须走注入的写入器（带「注册表就绪重放」）。"""
+    source = _strip_js_comments(plugin_source)
     assert 'setPendingBadge' in source, 'plugin.js 应暴露待审批角标的写入器'
-    assert 'entries:changed' in source, '必须订阅 entries:changed 做重放'
-    assert 'api.entries.setBadge(' in source, '最终仍要写到宿主入口角标上'
+    assert 'contributions:changed' in source, '必须订阅 contributions:changed 做重放'
+    assert 'api.contributions.update(' in source, '最终仍要写到宿主贡献项角标上'
+
+
+def test_commands_module_uses_host_api():
+    """命令处理器通过 ctx.api 访问宿主 API，不直接 import 宿主模块。"""
+    with open(os.path.join(ROOT, 'frontend', 'commands.js'), 'r', encoding='utf-8') as handle:
+        source = _strip_js_comments(handle.read())
+    assert 'ctx.api' in source or 'ctx && ctx.api' in source
+    assert 'api.entries' not in source
+    assert source.count('export function') == 4, '应有 4 个命令处理器导出'
 
 
 # --------------------------------------------------------------- 真实校验器
 
 
 @pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
-def test_manifest_passes_main_app_validator():
-    """用主程序的真实校验器加载本插件 manifest（最强契约验证）。"""
-    sys.path.insert(0, MAIN_APP_DIR)
-    try:
-        from core.plugins.manifest import PluginManifest  # noqa: PLC0415
-    except Exception as exc:  # pragma: no cover
-        pytest.skip(f'无法导入主程序 manifest 校验器: {exc}')
-    finally:
-        sys.path.remove(MAIN_APP_DIR)
-
-    parsed = PluginManifest.load(ROOT, check_dir_name=False)
-    assert parsed.plugin_id == 'stm-ai-assistant'
-    assert parsed.api_version == 2
-    assert parsed.manifest_version == 2
-    assert parsed.backend_jobs == [
-        'ai.analyze', 'ai.wi_rewrite', 'ai.classify', 'ai.propose', 'ai.agent',
-    ]
-    assert parsed.has_backend and parsed.has_frontend
-    assert len(parsed.frontend_entries) == 12
-    # 「新契约零警告」是最强断言：图标名、entries 子键、权限、hook 全部干净
-    assert parsed.warnings == [], parsed.warnings
-
-
-@pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
-def test_entries_pass_tier_filter_for_both_tiers():
-    """D5：两种 tier 下 4 个入口都必须全部保留。
-
-    - `official`：本插件在 catalog 里的实际分级（坞默认进槽位）。
-    - `community`：降级后的兜底。本插件刻意只用 community 子集的 kind，
-      所以即使被从 catalog 摘掉，入口也不会被静默忽略。
-    """
-    sys.path.insert(0, MAIN_APP_DIR)
-    try:
-        from core.plugins.manifest import PluginManifest  # noqa: PLC0415
-        from core.plugins.entries import apply_tier  # noqa: PLC0415
-    except Exception as exc:  # pragma: no cover
-        pytest.skip(f'无法导入主程序 entries 模块: {exc}')
-    finally:
-        sys.path.remove(MAIN_APP_DIR)
-
-    parsed = PluginManifest.load(ROOT, check_dir_name=False)
-    expected = {
-        'workbench',
-        'analyze-folder', 'analyze-selected',
-        'classify-folder', 'classify-selected',
-        'polish-embedded', 'polish-selector', 'polish-folder',
-        'open-review', 'propose-library', 'open-profiles',
-        'assistant-settings',
-    }
-
-    for tier in ('official', 'community'):
-        kept, warnings = apply_tier(parsed.plugin_id, parsed.frontend_entries, tier=tier)
-        assert warnings == [], f'{tier}: {warnings}'
-        assert len(kept) == len(parsed.frontend_entries), tier
-        assert {item['id'] for item in kept} == expected, tier
-        assert all(item['tier'] == tier for item in kept), tier
-
-
-@pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
-def test_when_target_survives_the_host_normalizer():
-    """`when.target` 必须被宿主的规范化器**保留**下来（不是当作未知子键丢掉）。
-
-    这条是跨仓库契约回归：若主程序侧漏掉 `TARGET_KINDS` 校验分支，
-    `when.target` 会被静默丢弃 → 右键菜单里 context 入口对任何目标都可用，
-    「右键分类才可用」的约束形同虚设。
-    """
-    sys.path.insert(0, MAIN_APP_DIR)
-    try:
-        from core.plugins.entries import normalize_entries  # noqa: PLC0415
-    except Exception as exc:  # pragma: no cover
-        pytest.skip(f'无法导入主程序 entries 模块: {exc}')
-    finally:
-        sys.path.remove(MAIN_APP_DIR)
-
-    entries, warnings = normalize_entries('demo-plugin', [
-        {'id': 'a', 'kind': 'context', 'label': 'x', 'when': {'target': 'folder'}},
-    ])
-    assert warnings == []
-    assert entries[0]['when'] == {'target': 'folder'}
-
-    # 非法值被拒（忽略 + 警告），而不是原样透传
-    bad, bad_warnings = normalize_entries('demo-plugin', [
-        {'id': 'b', 'kind': 'context', 'label': 'y', 'when': {'target': 'category'}},
-    ])
-    assert bad[0]['when'] == {}
-    assert any('target' in item for item in bad_warnings)
-
-
-@pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
 def test_plugin_is_registered_as_official_in_main_app_catalog():
-    """本插件必须在主程序包内 catalog 里登记为 official。
-
-    `tier` 只能由**宿主仓库**的清单决定（manifest 无权声明），所以这条断言
-    是「官方插件」这一事实在插件仓库侧的回归保护：若主程序侧被误删/误改，
-    这里会立刻失败。
-    """
+    """本插件必须在主程序包内 catalog 里登记为 official（tier 只能由宿主决定）。"""
     catalog_path = os.path.join(MAIN_APP_DIR, 'static', 'plugins', 'catalog.json')
     if not os.path.isfile(catalog_path):
         pytest.skip('主程序 catalog.json 不存在')
@@ -870,32 +809,30 @@ def test_plugin_is_registered_as_official_in_main_app_catalog():
     assert entries['stm-ai-assistant'].get('tier') == 'official'
 
 
-@pytest.mark.skipif(not os.path.isdir(MAIN_APP_DIR), reason='主程序仓库不可用')
-def test_surface_ids_match_frontend_registrations():
-    """坑 2：manifest 的 `surface.id` 必须在插件侧真实注册过。
+@pytest.mark.skipif(not HOST_AVAILABLE, reason='主程序仓库不可用')
+def test_manifest_normalizes_without_warnings_through_main_app():
+    """用主程序 manifest 层加载（若已迁移到 v3）：零警告 + contributions 计数。"""
+    sys.path.insert(0, MAIN_APP_DIR)
+    try:
+        from core.plugins.manifest import PluginManifest  # noqa: PLC0415
+    except Exception as exc:  # pragma: no cover
+        pytest.skip(f'无法导入主程序 manifest 校验器: {exc}')
+    finally:
+        sys.path.remove(MAIN_APP_DIR)
 
-    坞与命令面板都按 `<pluginId>:<surface.id ?? entry.id>` 查表；写错会导致
-    「点击无反应且不报错」——所以这里做静态对齐检查。
+    parsed = PluginManifest.load(ROOT, check_dir_name=False)
+    if not hasattr(parsed, 'frontend_contributions'):
+        pytest.skip('主程序尚未迁移到 v3（PluginManifest 无 frontend_contributions）')
 
-    重构后 surface 由 `panel.js` 的 `SURFACES` 表批量注册（`plugin.js` 遍历它），
-    因此核对对象是那张表 + `prompt-preview` 这条手工注册的次级 surface。
-    """
-    with open(os.path.join(ROOT, 'frontend', 'plugin.js'), 'r', encoding='utf-8') as handle:
-        source = handle.read()
-    with open(os.path.join(ROOT, 'frontend', 'panel.js'), 'r', encoding='utf-8') as handle:
-        panel_source = handle.read()
-
-    registered = set(re.findall(r"^\s{2}([a-z0-9-]+):\s*\{ title:", panel_source, re.M))
-    registered.update(re.findall(r"api\.surfaces\.register\(\s*'([a-z0-9-]+)'", source))
-    assert registered, '未能解析出已注册的 surface'
-    assert 'surfaceIds' in source, 'plugin.js 应遍历 SURFACES 批量注册'
-
-    with open(MANIFEST_PATH, 'r', encoding='utf-8') as handle:
-        manifest = json.load(handle)
-
-    for entry in manifest['frontend'].get('entries') or []:
-        surface = entry.get('surface') or {}
-        surface_id = surface.get('id') or entry.get('id')
-        assert surface_id in registered, (
-            f'入口 {entry.get("id")} 的 surface "{surface_id}" 未注册'
-        )
+    assert parsed.api_version == 3
+    assert parsed.manifest_version == 3
+    assert parsed.plugin_id == 'stm-ai-assistant'
+    assert parsed.backend_jobs == [
+        'ai.analyze', 'ai.wi_rewrite', 'ai.classify', 'ai.propose', 'ai.agent',
+    ]
+    assert parsed.has_backend and parsed.has_frontend
+    assert parsed.frontend_render_mode == 'declarative'
+    assert set(parsed.capabilities) == EXPECTED_CAPABILITIES
+    assert len(parsed.frontend_contributions['menus']) == 7
+    assert len(parsed.frontend_contributions['commands']) == 4
+    assert parsed.warnings == [], parsed.warnings

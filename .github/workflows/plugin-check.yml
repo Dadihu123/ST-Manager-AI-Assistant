@@ -1,0 +1,37 @@
+# 插件契约 v3 的独立严格校验（stm-plugin-check）。
+#
+# `scripts/stm_plugin_check.py` 是从主程序 ST-Manager 生成并复制过来的**独立**
+# 校验器：它内嵌 `core/plugins/contract.py` 的规则与宿主事实常量，不 import
+# 宿主仓库。任何会导致宿主丢弃/降级的问题（结构、落点、数量/深度、action 引用、
+# 模块导出、when/shortcut、render_mode/capabilities、CSS 作用域、图标）都会
+# 让本工作流失败。
+#
+# 注意：契约要求 `manifest.id` 等于插件目录名，而 GitHub 归档/检出目录名是
+# 仓库名（ST-Manager-AI-Assistant），因此先把仓库内容摊到以插件 id 命名的
+# 临时目录再校验。
+name: plugin-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Stage plugin under its manifest id
+        run: |
+          mkdir -p "$RUNNER_TEMP/stm-ai-assistant"
+          rsync -a --exclude '.git' --exclude '.pytest_cache' --exclude 'tmp*' \
+            ./ "$RUNNER_TEMP/stm-ai-assistant/"
+
+      - name: Validate manifest & contributions (strict)
+        run: python scripts/stm_plugin_check.py "$RUNNER_TEMP/stm-ai-assistant"

@@ -336,8 +336,9 @@ def test_plugin_brand_icon_is_a_plugin_owned_asset():
     用户原话：「既然是同一个插件，应该保持相同的图标更有辨识度，包括右键菜单，
     包括批量处理，入口总览哪里直接调成相同的插件图标即可。」
 
-    实现方式：`entries[].icon` 与 `surfaces.register().icon` 都写
-    `frontend/assets/icon.svg`（插件内相对路径）。宿主 `utils/icons.js:resolveIcon`
+    实现方式：`contributions.menus[].icon` / `contributions.commands[].icon` 与
+    `surfaces.register().icon` 都写 `frontend/assets/icon.svg`（插件内相对路径）。
+    宿主 `utils/icons.js:resolveIcon`
     三态解析：含 `/` 或 `.` 的值 → `/api/plugins/<id>/assets/<path>`，
     `uiPrimitives.js:icon()` 对资源路径渲染 `<span>` + CSS mask。
     `core/plugins/assets.py` 的 `ALLOWED_EXTENSIONS` 含 `.svg`，该路由可用。
@@ -355,10 +356,20 @@ def test_plugin_brand_icon_is_a_plugin_owned_asset():
     assert 'currentColor' in svg, '图标必须用 currentColor 才能跟随主题前景色'
     assert '<path' in svg
 
-    # ① manifest 的每个入口都用同一个插件资源路径
+    # ① manifest 的每个菜单节点 / 命令都用同一个插件资源路径
     with open(os.path.join(ROOT, 'manifest.json'), 'r', encoding='utf-8') as handle:
         manifest = json.load(handle)
-    icons = [entry.get('icon') for entry in manifest['frontend']['entries']]
+    contributions = manifest['frontend'].get('contributions') or {}
+    menu_nodes = []
+
+    def _walk(items):
+        for node in items or []:
+            menu_nodes.append(node)
+            _walk(node.get('children') or [])
+
+    _walk(contributions.get('menus') or [])
+    icons = [node.get('icon') for node in menu_nodes if node.get('type') != 'separator']
+    icons += [command.get('icon') for command in contributions.get('commands') or []]
     assert set(icons) == {'frontend/assets/icon.svg'}, (
         f'所有入口必须用同一个插件图标（含右键/批量/总览）：{icons}'
     )

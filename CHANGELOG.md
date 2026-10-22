@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 未发布（2026-10-22，迁移到插件契约 v3）
+
+### 变更
+
+- `api_version` / `manifest_version` 升到 3；`permissions` → `capabilities`
+  （同名 9 项，未缩水）。
+- `frontend.entries[]`（12 条）→ `frontend.contributions`：7 个根菜单节点
+  （展开 14 个，含 `ai-helper-context` / `ai-helper-batch` 两个显式 submenu）
+  + 4 条命令（`open-workbench` 带建议快捷键 `Ctrl+Shift+A`，其余走命令面板）；
+  `frontend.render_mode: "declarative"`（界面全部是宿主 surface，不自绘）。
+- 运行期状态回报改走 `api.contributions.update(id, {status|badge|progress|busy})`
+  并订阅 `contributions:changed` 重放；v2 的入口运行期 API 与 `entries:changed`
+  已随宿主删除。进度由 `{done, total}` 归一化为 0–1 比值（宿主 dock 渲染进度环）。
+- 新增 `frontend/commands.js`（4 个命令处理器）。
+- 测试迁移：`test_manifest_contract.py` 改为用主程序真实
+  `contract.validate_manifest(..., strict=True)` 交叉验证（不再复刻白名单）；
+  `test_entry_matrix.py` 重写为 v3 贡献 × 落点矩阵；`test_css_scope.py` 的入口
+  图标检查改读 `contributions`；`tests_frontend/smoke.mjs` 的假 API 改用
+  `api.contributions.update`。
+- 新增 `scripts/stm_plugin_check.py`（从主程序生成并复制的独立严格校验器）与
+  `.github/workflows/plugin-check.yml`（CI 按 `manifest.id` 摊目录后跑严格校验）。
+- 版本 `0.3.0`。
+
 ## 未发布（2026-10-21，入口收进二级菜单）
 
 宿主新增 `entries[].group` 后，右键菜单 / 批量菜单里的 7 条 context/batch 入口

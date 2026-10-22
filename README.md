@@ -24,16 +24,21 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 3. 入口坞（屏幕右侧的图标条）会出现「AI 助手」入口；点击打开宿主提供的**居中弹层**。
    也可以在命令面板里搜「AI 助手」。
 
-> **需要主程序 `PLUGIN_API_VERSION >= 2`**（本插件 `api_version = 2`）；旧主程序会以
+> **需要主程序 `PLUGIN_API_VERSION = 3`**（本插件 `api_version = 3`）；旧主程序会以
 > `PluginApiVersionError` 拒绝加载。
 >
 > 主程序以 `st_plugin_stm_ai_assistant` 模块名加载 `backend/`，**不注入 `sys.path`**，因此插件内部一律使用相对导入。
 > 插件私有数据（档案、缓存、用量）写在 `data/plugins/stm-ai-assistant/data/`，卸载时由主程序按需清理。
 
-### 插件声明的入口
+### 插件声明的贡献（menus / slots / commands）
 
-插件**不画入口**——入口在 `manifest.json` 的 `frontend.entries` 里声明，由宿主渲染。
-**一个用户能力 = 一个任务 = 一个面板**：每个任务都有自己的入口组合，
+插件**不画入口**——菜单、命令与插槽在 `manifest.json` 的
+`frontend.contributions` 里**静态声明**，由宿主渲染。v3 起 `frontend.entries[]`
+与旧的 `api.entries` 命名空间已删除：运行期只能
+`api.contributions.update(id, patch)` 改 `status` / `badge` / `progress` / `busy`，
+不能再注册或搬动节点。
+
+**一个用户能力 = 一个任务 = 一个面板**：每个任务都有自己的落点组合，
 右键 / 批量 / 命令面板分别承载一种作用域。
 
 | 任务（面板） | 坞 | 批量菜单 | 右键菜单 | 命令面板 |
@@ -46,31 +51,43 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 | **提示词档案** | 任务中心 | — | — | ✅ |
 | **设置** | 任务中心 | — | — | — |
 
-共 12 条入口，`label` 全部使用用户词（打标 / 精简 / 归类 / 提议），
+共 **7 个根菜单节点**（展开 14 个，含 2 个显式 submenu）与 **4 条命令**；
+`label` 全部使用用户词（打标 / 精简 / 归类 / 提议），
 因此在命令面板里搜这些词都能命中。
 
-| 入口 id | kind | 落点 | 打开的面板 |
+| 节点 id | placement | 动作 | 打开的面板 |
 |---|---|---|---|
-| `workbench` | `dock` | 入口坞 / 快捷键 | 任务中心（`hub`） |
-| `analyze-selected` | `batch` | 批量操作菜单（cards） | `analyze` |
-| `analyze-folder` | `context` | 右键分类（cards） | `analyze` |
-| `classify-selected` | `batch` | 批量操作菜单（cards） | `classify` |
-| `classify-folder` | `context` | 右键分类（cards） | `classify` |
-| `polish-selector` | `batch` | 批量操作菜单（worldinfo） | `polish` |
-| `polish-folder` | `context` | 右键分类（worldinfo） | `polish` |
-| `polish-embedded` | `context` | 右键分类（cards） | `polish` |
-| `open-review` | `command` | 命令面板 | `review` |
-| `propose-library` | `command` | 命令面板 | `propose` |
-| `open-profiles` | `command` | 命令面板 | `profiles` |
-| `assistant-settings` | `settings` | 设置页插件区 | `settings` |
+| `workbench` | `dock` | command `open-workbench` | 任务中心（`hub`） |
+| `ai-helper-context` | `context.folder` | submenu（容器） | — |
+| └ `analyze-folder` | 子项 | surface `analyze` | `analyze` |
+| └ `classify-folder` | 子项 | surface `classify` | `classify` |
+| └ `polish-folder` | 子项 | surface `polish` | `polish` |
+| └ `polish-embedded` | 子项 | surface `polish` | `polish` |
+| `ai-helper-batch` | `batch.actions` | submenu（容器） | — |
+| └ `analyze-selected` | 子项 | surface `analyze` | `analyze` |
+| └ `classify-selected` | 子项 | surface `classify` | `classify` |
+| └ `polish-selector` | 子项 | surface `polish` | `polish` |
+| `open-review` | `commandPalette` | command `open-review` | `review` |
+| `propose-library` | `commandPalette` | command `propose-library` | `propose` |
+| `open-profiles` | `commandPalette` | command `open-profiles` | `profiles` |
+| `assistant-settings` | `settings.nav` | surface `settings` | `settings` |
 
-所有入口用**同一个图标**（插件品牌图形 `frontend/assets/icon.svg`），
+| 命令 id | 快捷键 | 处理器 | 作用 |
+|---|---|---|---|
+| `open-workbench` | `Ctrl+Shift+A` | `commands.js:openWorkbench` | 打开任务中心 |
+| `open-review` | — | `openReview` | 打开结果与审批 |
+| `propose-library` | — | `proposeLibrary` | 打开分类体系提议 |
+| `open-profiles` | — | `openProfiles` | 打开提示词档案 |
+
+所有贡献用**同一个图标**（插件品牌图形 `frontend/assets/icon.svg`），
 在坞、右键菜单、批量菜单与入口总览里辨识度一致。
 
 > **作用域怎么传**：宿主把「这次点击的语义目标」放进 `ctx.target`
-> （`{kind: 'selection' | 'folder' | 'card', mode, path, id, ids}`），
-> 插件用 `api.cards.list` / `api.worldbook.sources` **自己解析**——
-> 宿主不在点击瞬间拉全量卡片，解析失败也能如实报错（而不是显示「0 张」）。
+> （`{kind: 'selection' | 'folder' | 'card' | 'none', mode, path, id, ids}`），
+> 同时给出 `ctx.source`（`dock` / `batch` / `context` / `palette` / `shortcut`）
+> 与 `ctx.entryId`（本次点了哪个贡献项）。插件用 `api.cards.list` /
+> `api.worldbook.sources` **自己解析**——宿主不在点击瞬间拉全量卡片，
+> 解析失败也能如实报错（而不是显示「0 张」）。
 > 详见 [宿主补丁清单](docs/2026-10-19-host-patch.md)。
 >
 > **作用域是面板的局部状态**：从右键进入再关掉、再从坞打开，看到的一定是干净的
@@ -92,27 +109,25 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 > （设置 → 插件管理 → 入口总览 → 快捷键列的「设定 / 改绑 / 清除」）。
 > 注意 `Ctrl+K` 是宿主的命令面板，不要占用。
 >
-> 入口总览页的快捷键列**按面板去重**：多个入口指向同一个面板时只有第一个能设快捷键。
-> `context`（右键）类**不提供**快捷键设置——右键菜单没有「右键目标」这个键盘概念，
-> 且所有右键入口打开的是同一个面板，设了也没有可用落点。
+> 入口总览页的快捷键列**按面板去重**：多个贡献项指向同一个面板时只有第一个能设快捷键。
+> `context.folder`（右键）类**不提供**快捷键设置——右键菜单没有「右键目标」这个
+> 键盘概念，且所有右键入口打开的是同一个面板，设了也没有可用落点。
 
 > 本插件的归属分级是 `official`（登记在主程序 `static/plugins/catalog.json`，`tier` 只能
-> 由宿主仓库清单决定，插件 manifest 无权声明），因此 dock 入口**默认进坞槽位**。
+> 由宿主仓库清单决定，插件 manifest 无权声明），因此 dock 节点**默认进坞槽位**。
 >
-> 尽管 official 允许全部 7 类 kind，本插件**刻意只使用 community 也允许的 5 类**
-> （`dock` / `context` / `batch` / `settings`），不声明 `nav` / `status`——这样即使
-> 将来从 catalog 摘掉而降级，入口也不会被静默忽略。
+> v3 的落点清单（design §5.1）：`dock` / `context.folder` / `context.card` /
+> `context.footer` / `batch.actions` / `commandPalette` / `settings.nav`。
+> 原 v2 的 `nav` / `status` 入口语义已删除（导航归 `settings.nav`，运行期状态
+> 改成 `api.contributions.update` 的 `status` / `progress`）。
 >
 > 不可用的入口**可见但置灰**，点击会跳到对应的配置位置，不会无反应。
 
-> **未实现的 kind**：主程序目前只有 4 类 kind 有真实渲染消费者
-> （`dock` / `context` / `command` / `batch`）。`settings` / `nav` / `status` 只在
-> 契约里存在——入口总览页会如实标注「（宿主未实现）」，不会假装已生效。
->
-> ⚠️ 由此带来的两个**已知缺口**（见 [宿主补丁清单](docs/2026-10-19-host-patch.md)）：
+> ⚠️ 两个**已知缺口**（见 [宿主补丁清单](docs/2026-10-19-host-patch.md)）：
 > - 批量菜单项**不渲染角标**（右键菜单渲染了），所以「有几条待审批」只在右键菜单可见；
 > - 批量菜单**没有移动端渲染**，手机上无法从选中栏触发打标 / 归类 / 精简。
-> 插件侧已把角标写到入口上，宿主补上渲染即可生效。
+> 插件侧已把角标写到对应贡献项上（`api.contributions.update(id, {badge})`），
+> 宿主补上渲染即可生效。
 
 ### 界面约定
 
@@ -132,8 +147,8 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
   「分类「科幻」（含子分类）· 12 张卡片」）。
 - Prompt 全文预览走独立的 `modal` 弹层。
 
-> **关于图标**：全部图标位（`entries[].icon` 与弹层标题行）都用**插件自己的品牌
-> 图形** `frontend/assets/icon.svg`，由主程序解析成
+> **关于图标**：全部图标位（`contributions.menus[]` / `commands[]` 的 icon 与弹层
+> 标题行）都用**插件自己的品牌图形** `frontend/assets/icon.svg`，由主程序解析成
 > `/api/plugins/stm-ai-assistant/assets/…` 并用 CSS `mask` 着色（跟随主题前景色）。
 > 因此同一个插件在坞、右键菜单、批量菜单、入口总览与弹层标题里显示**同一个图标**。
 > 详见设计文档 §E.5 与约束 C25。
@@ -687,7 +702,7 @@ python app.py plugin stm-ai-assistant analyze Alice.png --apply   # 写回磁盘
 |---|---|
 | 插件列表显示「加载失败」 | 查看管理界面的 `load_error`；常见原因是 `api_version` 与主程序不匹配（需更新主程序） |
 | 坞里没有「AI 助手」入口 | ① 确认插件已启用且重启过；② 坞槽位上限 8 个、单插件最多 2 个，超额时入口进**溢出菜单**，可在入口总览页固定；③ 打开控制台看 `[pluginHost]` 日志（样式未通过作用域检查时会被拒绝加载） |
-| 点击坞入口没反应 | manifest 的 `surface.id` 与 `plugin.js` 的 `api.surfaces.register()` id 不一致时**不报错且无反应**（本插件统一用 `workbench`）；检查控制台有无 `[surfaceHost] 未注册的 surface` |
+| 点击坞入口没反应 | `contributions.menus` 里 `action.surface.id` 与 `plugin.js` 的 `api.surfaces.register()` id 不一致时**不报错且无反应**（本插件统一用 `workbench` / `hub`）；检查控制台有无 `[surfaceHost] 未注册的 surface` |
 | 右键菜单里没有「AI 打标此分类全部卡片」 | ① 该入口只在**角色卡视图**且右键的是**分类**时可用（右键卡片时它是灰的）；② 面板已打开时再次从别的分类右键进入，作用域会刷新（靠 `onOpen`），若仍显示旧分类请报告 |
 | 批量操作菜单里没有「AI 打标选中卡片」 | 需要先勾选至少一张卡片（未勾选时菜单本身不显示）；置灰表示当前视图不是角色卡 |
 | 面板里显示的作用域不是我以为的 | 右键菜单 / 批量菜单进入时作用域由入口决定，不由你后来勾选的卡片决定。要改用勾选集，点面板内的「读取主程序选择」 |
@@ -710,7 +725,15 @@ python -m pytest tests -q
 # 与主程序仓库交叉验证（默认路径 D:\Workspace\MyOwn\ST-Manager，可用环境变量覆盖）
 $env:STM_MAIN_APP_DIR = "D:\path\to\ST-Manager"
 python -m pytest tests -q
+
+# 插件契约 v3 的独立严格校验（与 CI 的 plugin-check 工作流同一份脚本；
+# 它由主程序生成并复制过来，不 import 宿主仓库）
+python scripts/stm_plugin_check.py .
 ```
+
+> `scripts/stm_plugin_check.py` 要求 `manifest.id` 等于目录名。本地开发时目录通常
+> 已经叫 `stm-ai-assistant`；如果仓库目录名不同，先摊到同名临时目录再校验
+> （CI 工作流就是这么做的）。
 
 代码结构：
 
@@ -737,15 +760,18 @@ python -m pytest tests -q
 > 旧的扁平名（`api.read_card` / `api.apply_tags` / `api.ui_data_update` / `api.db` …）
 > **已被移除**，主程序不保留别名。裸 SQL 连接 `api.db()` 也取消了——
 > 读作业条目用 `api.jobs.items()`，查卡片用 `api.cards.list()`。
-- `frontend/`：ES module 前端。`plugin.js` 只做接线（注册 surface、回报入口状态、返回清理函数）；
-  `panel.js` 是 surface **内容**渲染器（不含 overlay / ESC / 遮罩），并负责把宿主传入的
-  入口作用域（`ctx.targetKind` / `ctx.targetIds`）折算成 `context.openTarget`；
+- `frontend/`：ES module 前端。`plugin.js` 只做接线（注册 surface、贡献项状态回报、
+  订阅 `contributions:changed` 重放、返回清理函数）；`panel.js` 是 surface 视图注册表
+  （`SURFACES` + `createViews`，不含 overlay / ESC / 遮罩）；`scope.js` 把宿主传入的
+  打开上下文（`ctx.source` / `ctx.entryId` / `ctx.target`）折算成任务面板的局部作用域；
   `dom.js` 里
   `icon`/`button`/`badge`/`section` 委托 `api.ui.*`，`styledSelect`/`numberInput` 为插件自有控件；
   `selection.js` 集中唯一的 Provisional 耦合点（读取选中卡片，仅坞 / 快捷键路径使用）；
   `assets/icon.svg` 是插件品牌图标（走插件资源路由，不占宿主图标名）。
   CSS 全部以 `.plugin-stm-ai-assistant` 作用域限定，且**不含 `position: fixed`**（层级归宿主容器）。
 - `tests/`：`FakeApi` / `FakeCtx` 替身 + `FakeTransport` 打桩，覆盖纯函数、LLM 重试与取消、作业写回语义、HTTP 路由与审批应用；
-  `test_manifest_contract.py` / `test_css_scope.py` 复刻主程序校验规则做静态自检，并用真实实现交叉验证。
+  `test_manifest_contract.py` / `test_entry_matrix.py` / `test_css_scope.py` 用主程序真实的
+  `core/plugins/contract.py` 交叉验证，并用 `scripts/stm_plugin_check.py`（与主程序同源、
+  独立可运行）做严格自检。
 
 设计文档：[`docs/2026-10-08-stm-ai-assistant-design.md`](docs/2026-10-08-stm-ai-assistant-design.md)（本仓库的唯一事实来源；实现与文档冲突时先改文档）。
