@@ -21,6 +21,7 @@ from . import summary_bridge
 from .core import agent as agent_core
 from .core import classify as classify_core
 from .core import hashing
+from .core import prefilter as prefilter_core
 from .core import proposal as proposal_core
 from .core import prompt as prompt_core
 from .core import wicheck as wicheck_core
@@ -748,6 +749,10 @@ def register_routes(api, store) -> None:
                 if not isinstance(entry, dict):
                     continue
                 content = str(entry.get('content') or '')
+                # 前置过滤（§7）：这里把「这条会被跳过吗」提前告诉前端，
+                # 面板才能把命中项置灰并显示原因。否则用户勾了 20 条、
+                # 实际只处理 12 条，要等作业跑完在审批页才知道为什么。
+                skip_reason = prefilter_core.skip_reason(entry)
                 items.append({
                     'uid': str(entry.get('uid') or entry.get('id') or ''),
                     'name': str(entry.get('comment') or entry.get('name') or ''),
@@ -756,6 +761,8 @@ def register_routes(api, store) -> None:
                     'enabled': not bool(entry.get('disable')),
                     'constant': bool(entry.get('constant')),
                     'content_preview': content[:200],
+                    'skip_reason': skip_reason,
+                    'skip_label': prefilter_core.describe(skip_reason),
                 })
             books.append({
                 'source': source,

@@ -338,7 +338,35 @@ function createFakeApi({ providers = 1, pending = 0 } = {}) {
         '/jobs': { success: true, jobs: [{ run_id: 'abcdef123456', task: 'analyze', status: 'completed', counts: { total: 2, completed: 2 }, created_at: 1700000000 }] },
         '/categories': { success: true, items: [{ path: '科幻', count: 3 }] },
         '/prompt/preview': { success: true, messages: [{ role: 'system', content: 'hi' }], tokens: { total: 10 }, profile: { id: 'x', name: 'X' }, provider: { model: 'm1' } },
-        '/wi/entries': { success: true, items: [{ uid: '1', name: 'E1', tokens: 10, enabled: true }] },
+        // 与真实接口一致：既有 `books`（前端按书分组渲染）也有展平后的 `items`。
+        // 其中一条带 `skip_reason` —— 前置过滤会跳过它（§7）。
+        '/wi/entries': {
+          success: true,
+          books: [{
+            source: { source_type: 'embedded', card_id: 'a.json' },
+            readable: true,
+            total: 2,
+            source_revision: 'rev-1',
+            items: [
+              { uid: '1', name: 'E1', tokens: 10, enabled: true, skip_reason: '', skip_label: '' },
+              {
+                uid: '2', name: '[MVU] InitVar', tokens: 20, enabled: true,
+                skip_reason: 'protected:name', skip_label: '名字命中数据/机制类',
+              },
+            ],
+          }],
+          items: [
+            { uid: '1', name: 'E1', tokens: 10, enabled: true, skip_reason: '', skip_label: '' },
+            {
+              uid: '2', name: '[MVU] InitVar', tokens: 20, enabled: true,
+              skip_reason: 'protected:name', skip_label: '名字命中数据/机制类',
+            },
+          ],
+          total: 2,
+          sources: 1,
+          books_total: 1,
+          books_truncated: false,
+        },
         '/proposal/sample': { success: true, sample: { count: 5, tokens: 100 } },
       };
       if (path.startsWith('/jobs/') && path.endsWith('/apply')) return { success: true, applied: 2, skipped: 0, stale: 0, failed: 0, details: [] };
@@ -539,6 +567,42 @@ async function main() {
       true,
       '缺少「落地策略」三选一',
     );
+  });
+
+  // §7：预览里把前置过滤命中项置灰并写明原因 —— 否则用户勾了 20 条、
+  // 跑完才发现只处理了 12 条。
+  await check('预览把会被前置过滤的条目置灰并说明原因', async () => {
+    api.surfaces.open('polish', {
+      source: 'context',
+      // 真实宿主传的是 `ctx.target` 对象；平铺的 targetKind/targetId 不会被识别。
+      target: { kind: 'card', id: 'a.json', mode: 'cards' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const previewBtns = allNodes.filter(
+      (node) => node.tagName === 'BUTTON' && node.textContent === '预览',
+    );
+    assert.equal(previewBtns.length > 0, true, '没渲染出「预览」按钮');
+    // 每个任务面板各有一个「预览」；全部点一遍，世界书面板那个才会真正渲染条目。
+    previewBtns.forEach((button) => button.click());
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const texts = allNodes.map((node) => String(node.textContent || '')).filter(Boolean);
+    assert.equal(
+      texts.some((text) => text.includes('会被前置过滤跳过')),
+      true,
+      `书头要提示「几条会被跳过」；实际尾部文本：${JSON.stringify(texts.slice(-8))}`,
+    );
+    assert.equal(
+      texts.some((text) => text.includes('会被跳过：名字命中数据/机制类')),
+      true,
+      '命中项要写明原因',
+    );
+    const protectedBox = allNodes.find(
+      (node) => node.dataset && node.dataset.skipReason === 'protected:name',
+    );
+    assert.ok(protectedBox, '命中项要带 skipReason 标记');
+    assert.equal(protectedBox.classList.contains('is-protected'), true);
   });
 
   // C13：删标签不可逆 —— 每条建议前有勾选框，且**默认不勾**。

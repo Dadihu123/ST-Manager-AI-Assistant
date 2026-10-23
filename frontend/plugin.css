@@ -173,6 +173,16 @@
   cursor: pointer;
 }
 
+/* 前置过滤命中项（§7）：置灰 + 保留可勾选。
+ * 它是「默认会被跳过」，不是「不可选」——所以只降透明度，不设 disabled。 */
+.plugin-stm-ai-assistant-checkbox.is-protected {
+  opacity: 0.55;
+}
+
+.plugin-stm-ai-assistant-checkbox.is-protected span {
+  font-style: italic;
+}
+
 /* ------------------------------------------------------------ 下拉框（styledSelect）
  * 复刻主程序 components/styled_select.html + components.css .icon-select 的结构与交互，
  * 类名加插件前缀以满足 F11；视觉 token 全部复用主程序。 */

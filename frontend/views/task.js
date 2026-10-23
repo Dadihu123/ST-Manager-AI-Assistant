@@ -797,9 +797,15 @@ function buildPolishOptions(host, state, client, select) {
         const label = source.file_path || source.card_id || '（未知来源）';
         const group = el('div', 'plugin-stm-ai-assistant-book-group');
         const head = el('div', 'plugin-stm-ai-assistant-subtitle');
+        // 前置过滤（§7）：先把「有几条会被跳过」摆在书头上，
+        // 用户才不会勾了 20 条、跑完发现只处理了 12 条。
+        const protectedCount = (book.items || []).filter((entry) => entry.skip_reason).length;
+        const protectedNote = protectedCount
+          ? `（其中 ${protectedCount} 条会被前置过滤跳过）`
+          : '';
         head.textContent = book.readable === false
           ? `${label} · 读取失败：${book.message || ''}`
-          : `${label} · ${book.total} 条`;
+          : `${label} · ${book.total} 条${protectedNote}`;
         if (book.readable === false) head.classList.add('is-error');
         group.append(head);
 
@@ -807,14 +813,21 @@ function buildPolishOptions(host, state, client, select) {
           const list = el('div', 'plugin-stm-ai-assistant-checks');
           (book.items || []).forEach((entry) => {
             const uid = String(entry.uid);
+            const skipped = entry.skip_reason
+              ? ` · 会被跳过：${entry.skip_label || entry.skip_reason}`
+              : '';
             const box = checkbox(
               Boolean(entry.enabled),
-              `${entry.name || '(未命名)'} · ${formatNumber(entry.tokens)} token`,
+              `${entry.name || '(未命名)'} · ${formatNumber(entry.tokens)} token${skipped}`,
             );
             box.dataset.uid = uid;
             // 勾选回传时需要知道属于哪本书
             box.dataset.book = label;
             if (!entry.enabled) box.classList.add('is-disabled');
+            if (entry.skip_reason) {
+              box.classList.add('is-protected');
+              box.dataset.skipReason = String(entry.skip_reason);
+            }
             list.append(box);
           });
           group.append(list);

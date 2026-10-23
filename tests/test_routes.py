@@ -814,6 +814,27 @@ def _removal_row():
     })
 
 
+def test_wi_entries_marks_prefilter_protected_entries(tmp_path, monkeypatch):
+    """预览要能提前告诉用户「哪几条会被前置过滤跳过」（§7）。"""
+    client, api, _store = build_app(tmp_path=tmp_path)
+    book = {
+        'entries': [
+            {'uid': '1', 'comment': '[MVU] InitVar', 'content': '变量: 0'},
+            {'uid': '2', 'comment': '世界观', 'content': '北境常年积雪。'},
+        ],
+        'source_revision': 'rev-1',
+    }
+    monkeypatch.setattr(api.worldbook, 'read', lambda source: book)
+
+    payload = client.post('/wi/entries', json={'card_id': 'Alice.png'}).get_json()
+
+    assert payload['success'] is True
+    items = {item['uid']: item for item in payload['items']}
+    assert items['1']['skip_reason'] == 'protected:name'
+    assert items['1']['skip_label'], '要给人话原因'
+    assert items['2']['skip_reason'] == ''
+
+
 def test_apply_removes_selected_tags_only(tmp_path):
     client, api, _store = build_app(
         cards={'Alice.png': dict(CARD, tags=['奇幻', '冒险'])},
