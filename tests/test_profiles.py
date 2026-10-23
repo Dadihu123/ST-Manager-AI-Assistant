@@ -290,3 +290,26 @@ def test_select_profile_keeps_generic_user_profile_for_any_task():
     ]
     selected = profiles.select_profile(candidates, 'deepseek-chat', task='classify')
     assert selected['id'] == 'my-generic'
+
+
+def test_user_copy_of_builtin_wins_on_tie():
+    """用户复制内置档案改了提示词 → 必须真的被选中（否则「改了不生效」）。
+
+    同 task、同 model_match、同 priority 时，`builtin=False` 的用户档案优先。
+    这正是「分类描述拿不到 → 让用户自己改提示词」这条路的兜底：
+    直接改内置档案也能生效，但复制一份改更安全（可随时删掉副本）。
+    """
+    copy = profiles.normalize_profile({
+        'id': 'my-classify', 'name': '我的归类', 'task': 'classify',
+        'model_match': '', 'priority': 0,
+        'system': '自定义归类准则', 'user_template': '判断 {{ card.name }}',
+    })
+    candidates = profiles.builtin_profiles() + [copy]
+
+    selected = profiles.select_profile(candidates, 'deepseek-chat', task='classify')
+    assert selected['id'] == 'my-classify', '用户副本要盖过 builtin-classify'
+
+    # 没有副本时仍然是内置档案
+    assert profiles.select_profile(
+        profiles.builtin_profiles(), 'deepseek-chat', task='classify',
+    )['id'] == 'builtin-classify'

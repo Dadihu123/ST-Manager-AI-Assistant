@@ -624,11 +624,21 @@ def normalize_profile(raw, *, profile_id: str = '') -> dict:
     # 静默丢弃正是 P1-3 难排查的原因：用户写了 `task` 却以为生效了。
     task = str(data.get('task') or '').strip().lower()
 
+    # `model_match` 空串的含义是「不参与按模型自动匹配」（功能型档案，例如内置的
+    # 归类 / 精简档案）。以前空串会被无脑补成 '*' —— 于是用户「复制内置归类档案、
+    # 改提示词」之后，副本既不属于任务（空串任务才算通用）又变成兜底档案，
+    # 永远选不中，表现为「改了不生效」。
+    # 现在只有**既没有匹配模式、又不属于任何任务**时才补 '*'（否则它永远选不中）。
+    raw_match = data.get('model_match')
+    model_match = str(raw_match if raw_match is not None else '*').strip()
+    if not model_match and not task:
+        model_match = '*'
+
     return {
         'schema_version': _normalize_int(data.get('schema_version'), SCHEMA_VERSION),
         'id': identifier,
         'name': str(data.get('name') or identifier),
-        'model_match': str(data.get('model_match') or '*').strip(),
+        'model_match': model_match,
         'priority': _normalize_int(data.get('priority'), 0),
         'builtin': bool(data.get('builtin', False)),
         'version': max(1, _normalize_int(data.get('version'), 1)),
@@ -721,8 +731,11 @@ def validate_profile(profile, *, known=None) -> list:
     if not str(data['name']).strip():
         errors.append('name 不能为空')
 
-    if not str(data['model_match']).strip():
-        errors.append('model_match 不能为空（兜底档案请填 "*"）')
+    if not str(data['model_match']).strip() and not data['task']:
+        errors.append(
+            'model_match 不能为空（兜底档案请填 "*"；'
+            '绑定任务的功能型档案可以留空，表示不参与模型匹配）',
+        )
 
     if data['task'] not in TASK_IDS:
         errors.append(f'task 必须是 {list(TASK_IDS)} 之一（空串 = 通用）')
@@ -871,6 +884,9 @@ def select_profile(profiles, model, task: str = '') -> dict:
     if matched:
         matched.sort(key=lambda item: (
             -int(item.get('priority') or 0),
+            # 同优先级时**用户档案优先于内置档案**：用户复制一份改了提示词，
+            # 结果被内置档案抢走 = 「改了不生效」，这是最难排查的一类问题。
+            bool(item.get('builtin')),
             *_pattern_specificity(item.get('model_match')),
             str(item.get('id') or ''),
         ))
@@ -889,6 +905,8 @@ def select_profile(profiles, model, task: str = '') -> dict:
         if dedicated:
             dedicated.sort(key=lambda item: (
                 -int(item.get('priority') or 0),
+                # 同上：用户复制的「归类档案」要能盖过内置的那份。
+                bool(item.get('builtin')),
                 str(item.get('id') or ''),
             ))
             return dedicated[0]

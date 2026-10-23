@@ -150,6 +150,28 @@ def test_resolve_unknown_profile_raises(store):
     assert excinfo.value.code == errors.CODE_PROFILE_NOT_FOUND
 
 
+def test_duplicated_functional_profile_is_actually_selected(store):
+    """「复制内置归类档案 → 改提示词」必须真的生效。
+
+    这条路是「分类描述拿不到 → 让用户自己改提示词」的兜底。以前有两处会把它
+    吃掉：①`normalize_profile` 把空 `model_match` 补成 `*`（副本就再也当不了
+    任务专用档案）；②同优先级时按 id 排序，`builtin-classify` 恒定排在前面。
+    """
+    copy = store.duplicate_profile('builtin-classify', new_id='my-classify')
+
+    assert copy['task'] == 'classify', '副本要继承任务归属'
+    assert copy['builtin'] is False
+    assert copy['model_match'] == '', '空串才能让它走「按任务选中」那条路'
+    assert copy['system'], '提示词要带过来给用户改'
+
+    selected = store.resolve_profile('', 'deepseek-chat', task='classify')
+    assert selected['id'] == 'my-classify', '用户副本要盖过内置档案'
+
+    # 删掉副本后回到内置档案
+    store.delete_profile('my-classify')
+    assert store.resolve_profile('', 'deepseek-chat', task='classify')['id'] == 'builtin-classify'
+
+
 def test_profile_index_is_written_into_ui_namespace(store, api):
     store.sync_profile_index()
     index = api.private.read().get('prompt_index')
