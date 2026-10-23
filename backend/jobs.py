@@ -21,6 +21,7 @@ from .core import agent as agent_core
 from .core import classify as classify_core
 from .core import hashing
 from .core import parsing
+from .core import prefilter as prefilter_core
 from .core import proposal as proposal_core
 from .core import prompt as prompt_core
 from .core import selector as selector_core
@@ -283,7 +284,7 @@ def run_analyze(ctx, *, api, store) -> None:
 
     # ---- 档案与限制 ----
     try:
-        profile = store.resolve_profile(profile_id, model_name)
+        profile = store.resolve_profile(profile_id, model_name, task='analyze')
     except AiAssistantError as exc:
         _abort(ctx, exc.code, exc.message, total)
         return
@@ -697,7 +698,11 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
     与 `run_analyze` 的差别是**条目级**而非卡片级：一个作业项 = 一条世界书条目。
 
     **格式只是提示词约束**（设计文档 §6.3）：不做 YAML 解析校验，
-    只校验「内容有没有被破坏」（宏、HTML、压缩比、长度比、专有名词、调度字段）。
+    只校验「内容有没有被破坏」（宏、HTML 配平、专有名词、调度字段）。
+    压缩比与长度**只算指标、只作提示**——短条目本来省不了几个字，
+    要求它「必须变短」等于逼模型加壳（§0.1）。
+
+    真正该拦的「数据/代码类」条目由前置过滤挡在批次外（`core/prefilter.py`，§7）。
     """
     config = config_module.load_config(api)
     payload = ctx.payload if isinstance(ctx.payload, dict) else {}
@@ -708,7 +713,8 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
     budget_tokens = int(payload.get('budget_tokens') or 0)
     apply_mode = str(payload.get('apply_mode') or config['apply_mode'])
     dry_run = bool(payload.get('dry_run', False))
-    target_format = str(payload.get('target_format') or 'yaml')
+    # `target_format` 已废弃：请求里带了也忽略（兼容旧客户端）。
+    # 格式意图写进 `wicheck.REWRITE_OUTPUT_RULE`，不再让用户选容器（§2.2）。
     worldbook_source = payload.get('worldbook_source')
 
     total = len(ctx.items)
@@ -733,7 +739,7 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
     model_name = requested_model or str(provider.get('model') or '')
 
     try:
-        profile = store.resolve_profile(profile_id, model_name)
+        profile = store.resolve_profile(profile_id, model_name, task='wi_rewrite')
     except AiAssistantError as exc:
         _abort(ctx, exc.code, exc.message, total)
         return
@@ -744,7 +750,7 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
     ctx.log(
         'info',
         f'开始世界书改写：{total} 条 · provider={provider["id"]} · model={model_name} · '
-        f'档案={profile["id"]} · 目标格式={target_format} · 模式={apply_mode}'
+        f'档案={profile["id"]} · 模式={apply_mode}'
         + ('（dry-run）' if dry_run else ''),
     )
 
@@ -773,7 +779,7 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
                 worldbook_source=worldbook_source or item_payload.get('worldbook_source'),
                 profile=profile, model_name=model_name,
                 provider=provider, api_key=api_key, extra_headers=extra_headers,
-                target_format=target_format, apply_mode=apply_mode,
+                apply_mode=apply_mode,
                 dry_run=dry_run, force=bool(payload.get('force')),
             )
         except AiAssistantError as exc:
@@ -851,7 +857,6 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
         'provider_id': provider['id'],
         'model': model_name,
         'profile_id': profile['id'],
-        'target_format': target_format,
         'apply_mode': apply_mode,
         'dry_run': dry_run,
     }
@@ -882,21 +887,23 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
             logger.debug('登记待审批作业失败', exc_info=True)
 
 
-def _render_rewrite_prompt(profile, entry, target_format: str) -> dict:
+def _render_rewrite_prompt(profile, entry) -> dict:
     """渲染「改写这一条」的 messages。
 
     直接复用任务规格的模板 + 新增的 `wi.*` 变量（`entry_name` / `entry_keys` /
-    `entry_content` / `target_ratio` 本来就在变量表里）。
+    `entry_content`）。
     """
     variables = {
         'wi.entry_name': str(entry.get('comment') or entry.get('name') or ''),
         'wi.entry_keys': '、'.join(str(item) for item in (entry.get('keys') or [])),
         'wi.entry_content': str(entry.get('content') or ''),
+        # 保留注入：没有门限了，但旧用户档案里可能还写着 `{{ wi.target_ratio }}`，
+        # 不提供会渲染成空值。数值含义已经变成「精简不明显的提示线」。
         'wi.target_ratio': str(wicheck_core.MAX_LENGTH_RATIO),
     }
     rendered = prompt_core.render_messages(profile, variables, task='wi_rewrite')
 
-    instruction = wicheck_core.build_rewrite_instruction(target_format)
+    instruction = wicheck_core.build_rewrite_instruction()
     if instruction:
         # 追加到 system 末尾（不覆盖任务规格自己的要求）
         for message in rendered['messages']:
@@ -911,8 +918,13 @@ def _render_rewrite_prompt(profile, entry, target_format: str) -> dict:
 
 def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
                   profile, model_name, provider, api_key, extra_headers,
-                  target_format, apply_mode, dry_run, force=False) -> dict:
-    """处理单条世界书条目：读取 → 渲染 → 调用 → 校验 →（可选）准备写回。"""
+                  apply_mode, dry_run, force=False) -> dict:
+    """处理单条世界书条目：读取 → 前置过滤 → 渲染 → 调用 → 校验 →（可选）准备写回。
+
+    前置过滤（§7）在这一层做，因为**条目正文只有读出来才知道**：数据结构、
+    INI 段、藏在正文里的 EJS/代码，都不写在条目名里。命中就直接 `skipped`，
+    一次 LLM 调用都不发。`force=True` 可以绕过（面板里单独勾选强制处理）。
+    """
     started = time.monotonic()
 
     source = resolve_wi_source(card_id, worldbook_source)
@@ -949,7 +961,29 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
             'usage': {}, 'applied': False,
         }
 
-    rendered = _render_rewrite_prompt(profile, entry, target_format)
+    # ---- 前置过滤（§7）：数据/代码类条目根本不送 LLM ----
+    entry_name = str(entry.get('comment') or entry.get('name') or '')
+    if not force:
+        reason = prefilter_core.skip_reason(entry)
+        if reason:
+            ctx.log(
+                'info',
+                f'跳过「{entry_name or entry_uid}」：{prefilter_core.describe(reason)}',
+            )
+            return {
+                'status': 'done',
+                'result': {
+                    'entry_uid': entry_uid,
+                    'entry_name': entry_name,
+                    'worldbook_source': dict(source),
+                    'skipped': reason,
+                    'skipped_label': prefilter_core.describe(reason),
+                    'message': '已按前置过滤跳过（不送模型）；需要改写可在面板里强制处理',
+                },
+                'usage': {}, 'applied': False,
+            }
+
+    rendered = _render_rewrite_prompt(profile, entry)
 
     # 提示词变量缺失时不要带着空值去调模型：模板里 `{{wi.entry_content}}`
     # 这类必填变量若没被渲染，浪费一次调用还产出无法校验的结果。
@@ -1009,6 +1043,16 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
         'length_ratio': checked['metrics']['length_ratio'],
         'dropped_facts': checked['dropped_facts'],
         'candidate': candidate,
+        # 每条候选固定带一行指标（§6.4）：原 token → 后 token（±差值）。
+        # 展示层不出现「失败」字样，变长只是一种结果。
+        'metrics': {
+            'orig_tokens': checked['metrics']['original_tokens'],
+            'cand_tokens': checked['metrics']['candidate_tokens'],
+            'delta': (
+                checked['metrics']['candidate_tokens']
+                - checked['metrics']['original_tokens']
+            ),
+        },
         'warnings': warnings,
         'issues': list(checked['issues']),
         'duration_ms': duration_ms,
@@ -1118,18 +1162,15 @@ def run_classify(ctx, *, api, store) -> None:
     model_name = requested_model or str(provider.get('model') or '')
 
     try:
-        profile = store.resolve_profile(profile_id, model_name)
+        profile = store.resolve_profile(profile_id, model_name, task='classify')
     except AiAssistantError as exc:
         _abort(ctx, exc.code, exc.message, total)
         return
 
-    # 归类要的是 `category` 字段，而 `builtin-default` 的 schema 要求 `summary`/`tags`。
-    # 调用方没指定档案时会按模型名回落 → AI 的归类输出会被判「缺少必需字段」。
-    # 这里兜底到归类专用档案（仍是「配置」，不是硬编码提示词）。
-    if not str(profile_id or '').strip():
-        classify_profile = store.get_profile('builtin-classify')
-        if isinstance(classify_profile, dict):
-            profile = classify_profile
+    # 历史上这里有一段兜底：`profile_id` 为空时强制换成 `builtin-classify`，
+    # 因为按模型名回落会拿到 `builtin-deepseek`（schema 要求 summary/tags，
+    # 归类输出会被判缺少必需字段）。现在 `select_profile(..., task='classify')`
+    # 先按任务挑档案，兜底反而会覆盖用户自己匹配到的通用档案，故删除（C6/P1-3）。
 
     limits = prompt_core.build_limits(config, profile)
     if not model_name:
@@ -1489,7 +1530,8 @@ def build_proposal_messages(api, store, profile, config, *, options=None) -> dic
     categories = []
     if spec['include_existing_categories']:
         try:
-            categories = [str(item) for item in (api.cards.list_categories() or [])]
+            # 宿主新旧两种返回形状都归一（字符串数组 / 对象数组）
+            categories = classify_core.category_paths(api.cards.list_categories())
         except Exception:  # noqa: BLE001
             logger.debug('读取分类失败', exc_info=True)
 
@@ -1820,7 +1862,8 @@ def run_agent(ctx, *, api, store) -> None:
 
     categories, tags = [], []
     try:
-        categories = [str(name) for name in (api.cards.list_categories() or [])]
+        # 宿主新旧两种返回形状都归一（字符串数组 / 对象数组）
+        categories = classify_core.category_paths(api.cards.list_categories())
     except Exception:  # noqa: BLE001
         logger.debug('读取分类失败', exc_info=True)
     try:

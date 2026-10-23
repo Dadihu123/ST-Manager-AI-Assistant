@@ -459,6 +459,74 @@ async function main() {
     assert.equal(scope.count, 1);
   });
 
+  // §9 断链一、二：「选卡 → AI 世界书精简 → 预览」报「无法读取这本书」/ 0 条。
+  // 根因是 `as: 'embedded-books'` 只传给了 folder 分支，selection / card 分支
+  // 拿到的是卡片作用域，面板却按世界书列表去读。
+  await check('单卡 + as=embedded-books → 内嵌世界书作用域', async () => {
+    const { resolveScope } = await import('../frontend/scope.js');
+    const scope = await resolveScope(
+      api, { kind: 'card', id: 'a.json' }, { as: 'embedded-books' },
+    );
+    assert.equal(scope.kind, 'wi-folder');
+    assert.equal(scope.mode, 'worldinfo');
+    assert.equal(scope.count, 1);
+    assert.equal(scope.items[0].source_type, 'embedded');
+    assert.equal(scope.items[0].card_id, 'a.json');
+  });
+
+  await check('选中卡片 + as=embedded-books → 内嵌世界书作用域', async () => {
+    const { resolveScope } = await import('../frontend/scope.js');
+    const scope = await resolveScope(
+      api,
+      { kind: 'selection', mode: 'cards', ids: ['a.json', 'b.json'] },
+      { as: 'embedded-books' },
+    );
+    assert.equal(scope.kind, 'wi-folder');
+    assert.deepEqual(scope.items.map((item) => item.card_id), ['a.json', 'b.json']);
+  });
+
+  await check('不传 as 时仍是卡片作用域（不误转）', async () => {
+    const { resolveScope } = await import('../frontend/scope.js');
+    const scope = await resolveScope(api, { kind: 'card', id: 'a.json' });
+    assert.equal(scope.mode, 'cards');
+    assert.equal(scope.kind, 'card');
+  });
+
+  await check('世界书选中项不会被再套一层内嵌书', async () => {
+    const { resolveScope } = await import('../frontend/scope.js');
+    const scope = await resolveScope(
+      api,
+      { kind: 'selection', mode: 'worldinfo', ids: ['global::lorebooks/a.json'] },
+      { as: 'embedded-books' },
+    );
+    assert.equal(scope.kind, 'wi-selection');
+    assert.equal(scope.items[0].source_type, 'global');
+  });
+
+  // C4：格式可选项已删除（§2.2）。它曾让模型给正文套「名称/关键词/原文」外壳，
+  // 而外壳会被原样写进世界书正文。
+  await check('世界书面板不再有「改写格式」控件', async () => {
+    const before = allNodes.length;
+    api.surfaces.open('polish', {
+      source: 'context',
+      targetKind: 'card',
+      targetId: 'a.json',
+      mode: 'cards',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const texts = allNodes
+      .slice(before)
+      .map((node) => node.textContent)
+      .filter(Boolean)
+      .map((text) => String(text));
+    assert.equal(
+      texts.some((text) => text.includes('改写格式')),
+      false,
+      '「改写格式」下拉必须已删除',
+    );
+    assert.equal(texts.some((text) => text.includes('YAML 列表')), false);
+  });
+
   await check('坞打开不继承上次作用域', async () => {
     const { normalizeTarget } = await import('../frontend/scope.js');
     assert.equal(normalizeTarget({ source: 'dock' }), null);

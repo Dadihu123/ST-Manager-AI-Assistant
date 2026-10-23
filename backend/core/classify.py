@@ -125,6 +125,42 @@ def normalize_scheme(raw) -> list:
     return result
 
 
+def normalize_category_items(raw) -> list:
+    """把宿主返回的**分类列表**归一成 `[{'path', 'name', 'count'}]`。
+
+    宿主侧 `api.cards.list_categories()` 的返回形状变过（H4 / P0-6）：
+
+    - 旧：字符串数组 `['同人', '同人/动漫']`
+    - 新：对象数组 `[{'path': '同人/动漫', 'name': '动漫', 'count': 12}]`
+
+    **两种都要能读**。插件与宿主的版本是解耦的，用户可能只升级一边；
+    只认一种形状就会像修之前那样「读取现有分类永远是空的」且不报错。
+    """
+    items = raw if isinstance(raw, (list, tuple)) else []
+    result = []
+    for entry in items:
+        if isinstance(entry, dict):
+            path = str(entry.get('path') or entry.get('name') or '').strip()
+            name = str(entry.get('name') or '').strip() or path.rsplit(PATH_SEPARATOR, 1)[-1]
+            try:
+                count = int(entry.get('count') or 0)
+            except (TypeError, ValueError):
+                count = 0
+        else:
+            path = str(entry or '').strip()
+            name = path.rsplit(PATH_SEPARATOR, 1)[-1]
+            count = 0
+        if not path:
+            continue
+        result.append({'path': path, 'name': name, 'count': count})
+    return result
+
+
+def category_paths(raw) -> list:
+    """只要分类路径列表（提示词注入 / 方案校验用）。"""
+    return [item['path'] for item in normalize_category_items(raw)]
+
+
 def format_scheme(scheme) -> str:
     """把分类方案渲染成提示词片段。
 

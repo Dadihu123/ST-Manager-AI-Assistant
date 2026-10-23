@@ -313,8 +313,16 @@ class PluginStore:
             return profiles_core.normalize_profile(payload)
         return profiles_core.builtin_profile(identifier)
 
-    def resolve_profile(self, profile_id: str, model: str) -> dict:
-        """按 id 或模型名解析档案；两者都不可用时回落到内置兜底档案。"""
+    def resolve_profile(self, profile_id: str, model: str, task: str = '') -> dict:
+        """按 id、任务与模型名解析档案；都不可用时回落到内置兜底档案。
+
+        Args:
+            profile_id: 显式指定的档案 id（优先级最高，不做任务校验——
+                用户点名要用的档案就该用）。
+            model: 模型名，用于 `model_match` 自动匹配。
+            task: 任务标识（`profiles.TASK_IDS`）。**空串 = 不按任务过滤**：
+                只有自动挑选时才需要它，见 `profiles.select_profile`。
+        """
         identifier = str(profile_id or '').strip().lower()
         if identifier:
             found = self.get_profile(identifier)
@@ -324,7 +332,7 @@ class PluginStore:
                 CODE_PROFILE_NOT_FOUND, f'提示词档案不存在: {identifier}',
                 http_status=404, detail={'profile_id': identifier},
             )
-        return profiles_core.select_profile(self.list_profiles(), model)
+        return profiles_core.select_profile(self.list_profiles(), model, task=task)
 
     def save_profile(self, raw) -> dict:
         data = profiles_core.normalize_profile(raw)

@@ -13,14 +13,23 @@
 | 格式错的后果 | 解析失败 → 作业失败/静默空结果 | 读起来稍差，**不影响使用** |
 | 因此 | 必须强校验 + 容错挽救 | 只需提示词要求 |
 
-**保留的校验**（都是「内容被破坏」而非「格式不合法」）：
+**两级判定**（设计文档 §6.3）——这是本模块最关键的语义：
+
+| 级别 | 含义 | 落点 |
+|---|---|---|
+| `issues` | 内容被**破坏**（结构/宏/标签/数字/调度字段） | 默认不落地，但**不禁止人手动采纳** |
+| `warnings` | 结果不理想但没坏（变长、没精简、删得偏多） | 永不拦，只显示 |
+
+**「变长」是 note，「压坏」是 block。** 两者混在一起会让短条目全被判失败——
+短条目本来最多只能省几个字，要求它「必须变短」等于逼模型扩写或加壳
+（实测 53 条 yaml 候选里 39 条被加了「名称/关键词/原文」外壳，写回后进正文）。
+
+**保留的硬校验**（都是「内容被破坏」而非「格式不合法」）：
 
 | 规则 | 为什么 |
 |---|---|
 | 宏保真 | `{{…}}` 是**程序**读的注入机制，丢了就是功能性破坏 |
-| HTML 配平 | 卡片前端靠 HTML 渲染，配平破坏会显示错乱 |
-| 压缩有效 | 这是本能力的目的，不达标就没意义 |
-| 长度比 | 防止 AI 把整条删成一句话（静默丢设定） |
+| HTML 配平（相对原文） | 卡片前端靠 HTML 渲染；但**原文本来就不配平**的条目，候选延续原状不算破坏 |
 | 专有名词覆盖 | 防止丢关键设定；缺失项进 `dropped_facts` 供人确认 |
 | 调度字段不变 | `constant`/`insertion_order` 等是**程序**读的，改了会变触发行为 |
 """
@@ -60,12 +69,12 @@ SCHEDULE_FIELDS = (
     'position', 'role', 'group', 'disable', 'enabled',
 )
 
-#: 长度比允许区间
-MIN_LENGTH_RATIO = 0.30
+#: 改写后仍有原文 95% 以上 → 提示「精简不明显」（note，可正常落地）
 MAX_LENGTH_RATIO = 0.95
 
-#: 压缩目标：新文本至多是原文的 95% token
-COMPRESS_TARGET = 0.95
+#: 比原文短一半以上 → 提示「可能删多了」（note，可正常落地）。
+#: 注意这是**提示**不是门限：压缩本来就是本能力的目的，压得狠不等于做坏了。
+SHORT_NOTE_RATIO = 0.5
 
 MAX_REPORTED_FACTS = 20
 
@@ -160,38 +169,38 @@ def validate_rewrite(original, candidate, *, original_entry=None, candidate_entr
     if new_macros:
         warnings.append(f'新增了原文没有的宏: {"、".join(new_macros[:5])}')
 
-    # ---- 2. HTML 配平（硬）----
-    balanced, balance_message = html_balance(dst)
-    if not balanced:
+    # ---- 2. HTML 配平（硬，但只判「候选比原文更差」）----
+    #
+    # 实测教训：`[MVU] 变量更新规则`、`[核心] 中央统合系统` 两条**原文本身就不配平**
+    # （`<pokemon_custom_start>`、`<system_guide>` 原本没闭合），候选延续了同样的
+    # 不平衡状态，却被判失败。判据必须是「相对原文」，不是「绝对配平」。
+    src_balanced = html_balance(src)[0]
+    dst_balanced, balance_message = html_balance(dst)
+    if src_balanced and not dst_balanced:
         issues.append(f'HTML 未配平: {balance_message}')
-
-    # 原文本来就不配平的话，不因「延续原状」而判失败
-    if balanced and not html_balance(src)[0]:
+    elif dst_balanced and not src_balanced:
         warnings.append('原文 HTML 本来就不配平，改写后已配平')
 
-    # ---- 3. 压缩有效（硬：这是本能力的目的）----
+    # ---- 3. 指标：只算不判（不设压缩门限）----
     src_tokens = estimate(src)
     dst_tokens = estimate(dst)
     ratio = (dst_tokens / src_tokens) if src_tokens else 0.0
 
-    if src_tokens and dst_tokens > src_tokens * COMPRESS_TARGET:
-        issues.append(
-            f'没有压缩效果：{dst_tokens} token vs 原文 {src_tokens} token'
-            f'（需 ≤ {int(src_tokens * COMPRESS_TARGET)}）',
-        )
-
-    # ---- 4. 长度比（软警告 + 硬下限）----
+    # ---- 4. 长度：两个方向都只是提示，永不拦 ----
     src_len = len(src)
     dst_len = len(dst)
     length_ratio = (dst_len / src_len) if src_len else 0.0
 
-    if src_len and length_ratio < MIN_LENGTH_RATIO:
-        issues.append(
-            f'压缩过度：只剩原文的 {length_ratio:.0%}'
-            f'（下限 {MIN_LENGTH_RATIO:.0%}），疑似丢失设定',
+    if src_len and length_ratio > MAX_LENGTH_RATIO:
+        # 持平或变长：如实显示数字即可，「不出现失败字样」（§6.4）
+        warnings.append(
+            f'精简不明显：改写后仍有原文的 {length_ratio:.0%}（可正常落地）',
         )
-    elif src_len and length_ratio > MAX_LENGTH_RATIO:
-        warnings.append(f'压缩比偏高：仍有原文的 {length_ratio:.0%}')
+    elif src_len and length_ratio < SHORT_NOTE_RATIO:
+        # 压得狠不等于做坏了：只提示人确认，不拦
+        warnings.append(
+            f'删得偏多：只剩原文的 {length_ratio:.0%}，建议确认有没有丢设定',
+        )
 
     # ---- 5. 专有名词覆盖（软：缺失项供人确认）----
     dropped = []
@@ -234,26 +243,34 @@ def validate_rewrite(original, candidate, *, original_entry=None, candidate_entr
     }
 
 
-def build_rewrite_instruction(target_format: str = 'yaml') -> str:
-    """生成「怎么改写」的要求文本（拼进 system 或任务说明）。
+#: 固定的「怎么输出」要求（设计文档 §0.2 v2 版，实测 8/8 合理）。
+#:
+#: 历史教训：这里曾经按 `target_format` 分 yaml / text 两支，yaml 支强制
+#: 「所有多行文本一律用 block scalar 包裹」，结果模型给正文套了三层壳
+#: （`名称:` / `关键词:` / `原文: |-`）。那层壳**没有任何地方会拆**——
+#: `routes.py` 取 `candidate` 原样写进 `entry.content`。于是：
+#:
+#: - 校验侧：壳的 token 全算在压缩率上，短条目数学上不可能过；
+#: - 落地侧：侥幸过了的，世界书正文变成一份 YAML 文档。
+#:
+#: 这就是「越简越胀」的全部来源。现在只描述意图，不给容器：
+#: 「原文是什么形态就保持什么形态」，用户不用理解格式开关。
+REWRITE_OUTPUT_RULE = (
+    '输出要求：\n'
+    '- 直接输出条目正文本身。不要前言，不要用 Markdown 代码块包裹，\n'
+    '  不要加「名称：」「关键词：」「原文：」这类外层键。\n'
+    '- 原文是「定义：解释 + 缩进」的层级结构时，沿用这种 YAML 风格——\n'
+    '  它比 JSON/Markdown 省 token，人读起来也不差。\n'
+    '- 原文是散文就还是散文，不要为了方便 YAML 而自己造键。\n'
+    '- 原文是代码、模板、表格、INI 或机器解析的数据时，保持原样，不要转成 YAML。'
+)
 
-    **只是提示词约束，不做格式校验** —— 见模块 docstring。
-    YAML 用 block scalar 包裹多行文本，一次性消除转义问题。
+
+def build_rewrite_instruction() -> str:
+    """生成「怎么改写」的要求文本（拼进 system 末尾）。
+
+    只有一条固定规则，不再按格式分支 —— 格式意图已经写进规则本身，
+    `target_format` 这个用户可选项目前的价值为零（选哪个都不是「用 YAML
+    表达层级」），所以一并删掉（设计文档 §2.2）。
     """
-    if str(target_format or '').strip().lower() != 'yaml':
-        return (
-            '输出要求：\n'
-            '1. 只输出改写后的正文，不要解释、前言或 Markdown 代码块。\n'
-            '2. 保留全部 {{…}} 宏、HTML 标签结构与所有专有名词、数值设定。\n'
-            '3. 去掉重复表述与空话，使内容明显短于原文。'
-        )
-
-    return (
-        '输出要求：\n'
-        '1. 用 YAML 组织正文，便于后续阅读与复用。\n'
-        '2. **所有多行文本一律用 block scalar（`|-`）包裹**，'
-        '这样正文里的 `:`、`#`、行首 `- `、`---` 都不需要转义。\n'
-        '3. 保留全部 {{…}} 宏、HTML 标签结构与所有专有名词、数值设定。\n'
-        '4. 去掉重复表述与空话，使内容明显短于原文。\n'
-        '5. 只输出 YAML 正文，不要加 Markdown 代码块包裹，也不要解释。'
-    )
+    return REWRITE_OUTPUT_RULE

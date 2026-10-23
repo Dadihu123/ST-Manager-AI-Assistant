@@ -137,7 +137,9 @@ def build_preview(*, api, store, config, card_id: str, profile_id: str = '',
 
     provider = store.resolve_provider(str(provider_id or ''))
     model_name = str(model or provider.get('model') or '')
-    profile = store.resolve_profile(str(profile_id or ''), model_name)
+    # 预览走的是打标链路（下面 `render_messages(..., task='analyze')`），
+    # 档案也要按同一个任务挑，否则预览与实际作业可能用两个档案。
+    profile = store.resolve_profile(str(profile_id or ''), model_name, task='analyze')
 
     bundle = build_variables(
         api=api, config=config, card=card, profile=profile,

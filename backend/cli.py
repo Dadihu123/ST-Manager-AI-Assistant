@@ -224,7 +224,9 @@ def cmd_analyze(api, store, namespace) -> int:
 
     model_name = str(options.get('model') or provider.get('model') or '')
     try:
-        profile = store.resolve_profile(str(options.get('profile') or ''), model_name)
+        profile = store.resolve_profile(
+            str(options.get('profile') or ''), model_name, task='analyze',
+        )
     except AiAssistantError as exc:
         print(f'[error] {exc.code}: {exc.message}')
         return 1

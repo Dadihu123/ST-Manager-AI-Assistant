@@ -685,7 +685,7 @@ export function createTaskPanel(api, client, context, taskId) {
 function buildTaskOptions(taskId, host, state, client, ui) {
   const { select } = ui;
   if (taskId === 'analyze') return buildAnalyzeOptions(host, state, client);
-  if (taskId === 'polish') return buildPolishOptions(host, state, client, select);
+  if (taskId === 'polish') return buildPolishOptions(host, state, client);
   if (taskId === 'classify') return buildClassifyOptions(host, state, client);
   if (taskId === 'propose') return buildProposeOptions(host, state, client, select);
   return { submit: () => Promise.reject(new Error(`未知任务：${taskId}`)) };
@@ -720,15 +720,12 @@ function buildAnalyzeOptions(host, state, client) {
   };
 }
 
-function buildPolishOptions(host, state, client, select) {
-  const formatSelect = select([
-    { value: 'yaml', label: 'YAML 列表（推荐）' },
-    { value: 'text', label: '纯文本' },
-  ], 'yaml', () => {
-    state.targetFormat = formatSelect.value;
-  });
-  state.targetFormat = 'yaml';
-  host.append(field('改写格式', formatSelect, 'YAML 更省 token，纯文本更接近原文'));
+function buildPolishOptions(host, state, client) {
+  // 「改写格式」（YAML / 纯文本）下拉已删除（§2.2）。
+  // 这个选择对用户没有可预期收益：选 YAML 只会让模型给正文套上
+  // `名称/关键词/原文: |-` 的外壳，而外壳**没有任何地方会拆**——
+  // 它会被原样写进世界书条目正文，同时把 token 全算在压缩率上。
+  // 格式意图现在写在提示词里（`wicheck.REWRITE_OUTPUT_RULE`），用户不用理解这个开关。
 
   return {
     /** 预取条目清单：世界书任务的作用域是文件，条目在面板内按书分组勾选。 */
@@ -813,7 +810,6 @@ function buildPolishOptions(host, state, client, select) {
         card_id: books.length === 1 ? (books[0].card_id || '') : '',
         worldbook_source: sources,
         entry_uids: Array.from(wantedUids),
-        target_format: state.targetFormat || 'yaml',
       });
     },
   };
@@ -841,9 +837,14 @@ function buildClassifyOptions(host, state, client) {
         return;
       }
       items.forEach((item) => {
-        const path = String(item.path || item.name || '');
+        // 宿主新旧两种形状都要认：旧宿主返回字符串数组，新宿主返回
+        // `{path, name, count}` 对象数组（H4）。以前只读 `item.path || item.name`，
+        // 字符串项被整条跳过 → 「读取现有分类」永远 0 个且不报错（P0-6）。
+        const isObject = item && typeof item === 'object';
+        const path = String(isObject ? (item.path || item.name || '') : (item || ''));
         if (!path) return;
-        const box = checkbox(true, `${path}（${item.count || 0}）`);
+        const count = isObject ? Number(item.count || 0) : 0;
+        const box = checkbox(true, `${path}（${count}）`);
         box.dataset.path = path;
         schemeHost.append(box);
       });

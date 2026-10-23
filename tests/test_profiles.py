@@ -144,7 +144,12 @@ def test_normalize_profile_drops_extra_stop_items():
 
 def test_profile_index_entry_is_compact():
     entry = profiles.profile_index_entry(profiles.builtin_profile('builtin-gpt'))
-    assert set(entry) == {'id', 'name', 'model_match', 'priority', 'version', 'builtin', 'updated_at'}
+    assert set(entry) == {
+        'id', 'name', 'model_match', 'priority', 'version', 'builtin', 'updated_at',
+        # `task` 是 §4.3 新增的：前端 `candidateMatchesTask` 已经在读它，
+        # 但以前这个字段整条链路都不存在，所以 17 个档案全列出来。
+        'task',
+    }
 
 
 def test_merge_profiles_overrides_builtin_by_id():
@@ -159,3 +164,90 @@ def test_builtin_profile_returns_independent_copy():
     first = profiles.builtin_profile('builtin-gpt')
     first['name'] = 'changed'
     assert profiles.builtin_profile('builtin-gpt')['name'] != 'changed'
+
+
+# ------------------------------------------------------------------ 任务归属（C6 / §4.3）
+#
+# 「按任务选档案」这个概念以前在代码里**根本不存在**：5 个内置档案的 `task`
+# 全是 None，`normalize_profile` 是白名单会把用户的 `task` 丢掉，
+# `select_profile` 签名里没有 task，前端 `candidateMatchesTask` 读到 undefined
+# 就 `return true`。于是归类任务拿到了打标档案，实测 1/1 全失败。
+
+
+def test_normalize_profile_keeps_task():
+    data = profiles.normalize_profile({'id': 'x-1', 'task': 'classify'})
+    assert data['task'] == 'classify'
+
+
+def test_normalize_profile_normalizes_task_case():
+    data = profiles.normalize_profile({'id': 'x-1', 'task': ' WI_REWRITE '})
+    assert data['task'] == 'wi_rewrite'
+
+
+def test_normalize_profile_defaults_task_to_generic():
+    assert profiles.normalize_profile({'id': 'x-1'})['task'] == ''
+
+
+def test_builtin_profiles_carry_their_task():
+    expected = {
+        'builtin-wi-rewrite': 'wi_rewrite',
+        'builtin-classify': 'classify',
+        'builtin-deepseek': 'analyze',
+        'builtin-propose': 'propose',
+        'builtin-agent': 'agent',
+    }
+    for profile_id, task in expected.items():
+        assert profiles.builtin_profile(profile_id)['task'] == task
+
+
+def test_generic_builtin_profiles_stay_generic():
+    """模型家族档案（deepseek 除外）是通用档案，任何任务都能用。"""
+    for profile_id in ('builtin-default', 'builtin-gpt', 'builtin-claude', 'builtin-gemini'):
+        assert profiles.builtin_profile(profile_id)['task'] == ''
+
+
+def test_validate_profile_rejects_unknown_task():
+    errors = profiles.validate_profile({'id': 'x-1', 'task': 'nope'})
+    assert any('task' in item for item in errors)
+
+
+def test_select_profile_by_task_avoids_wrong_family():
+    """T13：归类任务选到 `builtin-classify`，不是 `builtin-deepseek`。"""
+    selected = profiles.select_profile(
+        profiles.builtin_profiles(), 'deepseek-chat', task='classify',
+    )
+    assert selected['id'] == 'builtin-classify'
+
+
+def test_select_profile_prefers_model_match_within_task():
+    """模型命中仍然优先：claude 跑打标不该拿 deepseek 档案。"""
+    selected = profiles.select_profile(
+        profiles.builtin_profiles(), 'claude-sonnet-4', task='analyze',
+    )
+    assert selected['id'] == 'builtin-claude'
+
+
+def test_select_profile_unknown_model_stays_generic():
+    """未知模型 + analyze 不该落到 deepseek 档案（它有 model_match）。"""
+    selected = profiles.select_profile(
+        profiles.builtin_profiles(), 'some-model', task='analyze',
+    )
+    assert selected['id'] == 'builtin-default'
+
+
+def test_select_profile_without_task_keeps_old_behaviour():
+    """没指定任务时不按任务过滤，别把 deepseek 家族藏起来。"""
+    assert profiles.select_profile(
+        profiles.builtin_profiles(), 'deepseek-chat',
+    )['id'] == 'builtin-deepseek'
+
+
+def test_select_profile_keeps_generic_user_profile_for_any_task():
+    """空 task 的用户档案任何任务都能用（不被任务过滤误伤）。"""
+    candidates = profiles.builtin_profiles() + [
+        profiles.normalize_profile(
+            {'id': 'my-generic', 'model_match': 'deepseek-*', 'priority': 200},
+        ),
+    ]
+    selected = profiles.select_profile(candidates, 'deepseek-chat', task='classify')
+    assert selected['id'] == 'my-generic'

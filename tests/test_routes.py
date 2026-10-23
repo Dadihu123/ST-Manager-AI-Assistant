@@ -800,3 +800,131 @@ def test_outbound_ack_endpoint(env):
     client, _api, store = env
     assert client.post('/outbound/ack').get_json()['acknowledged'] is True
     assert store.outbound_acknowledged() is True
+
+
+# ------------------------------------------------------------------ C4：改写格式已删除
+#
+# 「改写格式」这个用户可选项被删掉了（§2.2）。响应里不再回传它，作业 payload
+# 里也不再有它——但**旧客户端传了也不能报错**（兼容），只是被忽略。
+
+
+def test_submit_wi_rewrite_ignores_target_format(tmp_path, monkeypatch):
+    client, api, _store = build_app(tmp_path=tmp_path)
+    book = {
+        'entries': [{'uid': '7', 'comment': '世界观', 'content': '北境常年积雪。' * 12}],
+        'source_revision': 'rev-1',
+    }
+    monkeypatch.setattr(api.worldbook, 'read', lambda source: book)
+
+    payload = client.post('/jobs/wi-rewrite', json={
+        'card_id': 'Alice.png',
+        'entry_uids': ['7'],
+        'target_format': 'yaml',       # 旧客户端仍会传
+    }).get_json()
+
+    assert payload['success'] is True
+    assert 'target_format' not in payload, '响应里不再有格式字段'
+    submitted = api.submitted
+    assert submitted['job_type'] == 'ai.wi_rewrite'
+    assert 'target_format' not in submitted['payload'], '作业参数里不再带格式'
+
+
+# ------------------------------------------------------------------ C9：分类建失败不能报成功
+#
+# 修之前：9/9 分类全部创建失败（嵌套分类被宿主拒），接口仍返回 `success: true`，
+# 用户以为方案已经落地。
+
+
+def _propose_row(categories, tags=()):
+    result = {
+        'plan': {
+            'create_categories': list(categories),
+            'create_tags': list(tags),
+            'tag_merges': [],
+        },
+    }
+    return {
+        'run_id': 'run-1', 'key': 'proposal', 'status': 'done', 'seq': 0,
+        'attempt': 1, 'result': result, 'payload': {},
+    }
+
+
+def test_propose_apply_reports_failure_when_category_cannot_be_created(tmp_path):
+    client, api, _store = build_app(db_rows=[_propose_row(['同人/动漫', '游戏'])],
+                                    tmp_path=tmp_path)
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.propose', 'status': 'completed'}
+    # 宿主拒绝第一个分类（模拟 P0-5 的 `/` 名字被当叶子名拒掉）
+    api.cards.create_category = lambda name, **kwargs: name != '同人/动漫'
+
+    response = client.post('/jobs/run-1/apply', json={})
+    payload = response.get_json()
+
+    assert payload['success'] is False, '有分类没建出来就不能报成功'
+    assert '同人/动漫' in payload['msg']
+    assert payload['detail']['failed_categories'] == ['同人/动漫']
+    assert payload['detail']['created_categories'] == ['游戏']
+
+
+def test_propose_apply_reports_success_when_all_categories_created(tmp_path):
+    client, api, _store = build_app(db_rows=[_propose_row(['同人/动漫', '游戏'])],
+                                    tmp_path=tmp_path)
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.propose', 'status': 'completed'}
+
+    payload = client.post('/jobs/run-1/apply', json={}).get_json()
+
+    assert payload['success'] is True
+    assert payload['created_categories'] == ['同人/动漫', '游戏']
+    assert payload['failed_categories'] == []
+
+
+# ------------------------------------------------------------------ C10：分类列表两种形状都认
+#
+# 宿主 H4 之前返回字符串数组，之后返回 `{path, name, count}` 对象数组。
+# 插件必须两种都能读：只升级一边的用户不该看到「永远 0 个分类」。
+
+
+@pytest.mark.parametrize('raw,expected', [
+    # 旧宿主：字符串数组
+    (['同人', '同人/动漫'], [
+        {'path': '同人', 'name': '同人', 'count': 0},
+        {'path': '同人/动漫', 'name': '动漫', 'count': 0},
+    ]),
+    # 新宿主：对象数组
+    ([{'path': '同人/动漫', 'name': '动漫', 'count': 12}], [
+        {'path': '同人/动漫', 'name': '动漫', 'count': 12},
+    ]),
+    # 混杂 + 脏值：能读的读，读不了的丢
+    (['游戏', {'path': '同人'}, {'name': '科幻'}, '', None], [
+        {'path': '游戏', 'name': '游戏', 'count': 0},
+        {'path': '同人', 'name': '同人', 'count': 0},
+        {'path': '科幻', 'name': '科幻', 'count': 0},
+    ]),
+])
+def test_normalize_category_items_accepts_both_shapes(raw, expected):
+    classify_core = load_backend_submodule('core.classify')
+    assert classify_core.normalize_category_items(raw) == expected
+
+
+def test_categories_endpoint_returns_objects_for_old_host(tmp_path):
+    """旧宿主给字符串数组时，插件也要归一成对象再给前端。"""
+    client, api, _store = build_app(tmp_path=tmp_path)
+    api.cards.list_categories = lambda: ['同人', '同人/动漫']
+
+    payload = client.get('/categories').get_json()
+
+    assert payload['success'] is True
+    assert payload['items'] == [
+        {'path': '同人', 'name': '同人', 'count': 0},
+        {'path': '同人/动漫', 'name': '动漫', 'count': 0},
+    ]
+
+
+def test_categories_endpoint_passes_through_objects(tmp_path):
+    """新宿主给对象数组时原样透传（含 count）。"""
+    client, api, _store = build_app(tmp_path=tmp_path)
+    api.cards.list_categories = lambda: [
+        {'path': '同人/动漫', 'name': '动漫', 'count': 12},
+    ]
+
+    payload = client.get('/categories').get_json()
+    assert payload['items'] == [{'path': '同人/动漫', 'name': '动漫', 'count': 12}]

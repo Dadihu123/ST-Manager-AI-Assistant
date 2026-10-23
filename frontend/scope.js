@@ -113,10 +113,20 @@ export async function resolveScope(api, target, options = {}) {
   const as = String(options.as || 'cards');
 
   if (target.kind === 'selection') {
-    return resolveSelection(api, target);
+    const scope = await resolveSelection(api, target);
+    // `as: 'embedded-books'` 必须一路传到这里：以前只有 folder 分支认这个选项，
+    // 「选中几张卡 → 精简它们的卡片内嵌世界书」会拿到卡片作用域，面板于是按
+    // 世界书列表去读，报「无法读取这本书 / 0 条」（§9 断链一、二）。
+    // 只转 card 模式的作用域——世界书选中项本身已经是书，不能再套一层。
+    return as === 'embedded-books' && scope.mode === 'cards'
+      ? cardsToEmbeddedBooks(scope)
+      : scope;
   }
   if (target.kind === 'card') {
-    return resolveCard(api, target);
+    const scope = await resolveCard(api, target);
+    return as === 'embedded-books' && scope.mode === 'cards'
+      ? cardsToEmbeddedBooks(scope)
+      : scope;
   }
   if (target.kind === 'folder') {
     if (target.mode === 'cards') {

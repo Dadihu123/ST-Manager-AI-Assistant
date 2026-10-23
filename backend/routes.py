@@ -29,6 +29,7 @@ from .core.errors import (
     CODE_INVALID_PAYLOAD,
     CODE_JOB_NOT_FOUND,
     CODE_SECRET_MISSING,
+    CODE_VALIDATION_FAILED,
     AiAssistantError,
 )
 from .jobs import (
@@ -586,7 +587,9 @@ def register_routes(api, store) -> None:
             )
 
         model_name = str(payload.get('model') or provider.get('model') or '')
-        profile = store.resolve_profile(str(payload.get('profile_id') or ''), model_name)
+        profile = store.resolve_profile(
+            str(payload.get('profile_id') or ''), model_name, task='analyze',
+        )
 
         apply_mode = str(payload.get('apply_mode') or config['apply_mode']).strip().lower()
         if apply_mode not in ('auto', 'review'):
@@ -807,7 +810,9 @@ def register_routes(api, store) -> None:
             )
 
         model_name = str(payload.get('model') or provider.get('model') or '')
-        profile = store.resolve_profile(str(payload.get('profile_id') or ''), model_name)
+        profile = store.resolve_profile(
+            str(payload.get('profile_id') or ''), model_name, task='wi_rewrite',
+        )
 
         apply_mode = str(payload.get('apply_mode') or config['apply_mode']).strip().lower()
         if apply_mode not in ('auto', 'review'):
@@ -866,7 +871,8 @@ def register_routes(api, store) -> None:
             'apply_mode': apply_mode,
             'dry_run': bool(payload.get('dry_run')),
             'force': bool(payload.get('force')),
-            'target_format': str(payload.get('target_format') or 'yaml'),
+            # `target_format` 不再读取：格式意图写在提示词里（§2.2）。
+            # 旧客户端仍可以传，只是被忽略（不报错 = 兼容）。
             # 单本时沿用旧字段（回写链路按它聚合）；多本时每项自带 worldbook_source
             'worldbook_source': sources[0] if len(sources) == 1 else None,
             'secret_ref': SECRET_REF_TEMPLATE.format(provider_id=provider['id']),
@@ -892,7 +898,6 @@ def register_routes(api, store) -> None:
             profile={'id': profile.get('id'), 'name': profile.get('name')},
             provider={'id': provider.get('id'), 'model': model_name},
             apply_mode=apply_mode,
-            target_format=job_payload['target_format'],
         )
 
     # ---------------------------------------------------------- 自动归类
@@ -900,13 +905,17 @@ def register_routes(api, store) -> None:
     @api.http.route('/categories', ['GET'])
     @_handle_errors
     def list_categories():
-        """列出主程序现有的分类（供归类方案做初始值）。"""
+        """列出主程序现有的分类（供归类方案做初始值）。
+
+        统一返回对象数组 `[{path, name, count}]`：宿主新旧两种形状都在
+        `classify.normalize_category_items` 里归一，前端只认对象。
+        """
         try:
             items = api.cards.list_categories()
         except Exception:  # noqa: BLE001 - 索引不可用时降级为空
             logger.warning('读取分类列表失败', exc_info=True)
             items = []
-        return _ok(items=[str(item) for item in (items or []) if str(item or '').strip()])
+        return _ok(items=classify_core.normalize_category_items(items))
 
     @api.http.route('/jobs/classify', ['POST'])
     @_handle_errors
@@ -939,7 +948,9 @@ def register_routes(api, store) -> None:
             )
 
         model_name = str(payload.get('model') or provider.get('model') or '')
-        profile = store.resolve_profile(str(payload.get('profile_id') or ''), model_name)
+        profile = store.resolve_profile(
+            str(payload.get('profile_id') or ''), model_name, task='classify',
+        )
 
         apply_mode = str(payload.get('apply_mode') or config['apply_mode']).strip().lower()
         if apply_mode not in ('auto', 'review'):
@@ -1660,6 +1671,28 @@ def _apply_propose(api, store, run_id: str, job, payload) -> dict:
             store.clear_pending_review(run_id)
         except Exception:  # noqa: BLE001
             logger.debug('清理待审批登记失败', exc_info=True)
+
+    # 只要有分类没建出来，就不能报「成功」。
+    #
+    # 修之前这里恒返回 `success: true`：实测 9/9 分类全部建不出来（P0-5 嵌套分类
+    # 被宿主拒），前端却显示成功，用户以为方案已落地。部分成功也照样把**已建成**
+    # 的清单带回去，便于用户重试时只处理失败的那几条。
+    if failed_categories:
+        return _fail(
+            CODE_VALIDATION_FAILED,
+            f'{len(create_categories)} 个分类里有 {len(failed_categories)} 个创建失败：'
+            + '、'.join(failed_categories[:8])
+            + ('…' if len(failed_categories) > 8 else ''),
+            http_status=409,
+            detail={
+                'created_categories': created_categories,
+                'failed_categories': failed_categories,
+                'created_tags': created_tags,
+                'existing_tags': existing_tags,
+                'failed_tags': failed_tags,
+                'tag_merges': plan.get('tag_merges') or [],
+            },
+        )
 
     return _ok(
         created_categories=created_categories,
