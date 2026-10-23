@@ -727,6 +727,15 @@ function buildPolishOptions(host, state, client) {
   // 它会被原样写进世界书条目正文，同时把 token 全算在压缩率上。
   // 格式意图现在写在提示词里（`wicheck.REWRITE_OUTPUT_RULE`），用户不用理解这个开关。
 
+  // 前置过滤（§7）默认把数据/代码类条目挡在批次外。含双花括号宏的散文条目
+  // 也会命中（宏是程序注入用的，实测占全库四成多），所以必须给一个「强制处理」
+  // 的出口 —— 否则用户在面板里根本改不了这些条目。
+  const forceFiltered = checkbox(
+    false,
+    '连命中前置过滤的条目一起处理（代码 / 宏 / 变量初始化：可能被改坏，请逐条复核）',
+  );
+  host.append(forceFiltered);
+
   return {
     /** 预取条目清单：世界书任务的作用域是文件，条目在面板内按书分组勾选。 */
     previewPayload: (current) => {
@@ -810,6 +819,7 @@ function buildPolishOptions(host, state, client) {
         card_id: books.length === 1 ? (books[0].card_id || '') : '',
         worldbook_source: sources,
         entry_uids: Array.from(wantedUids),
+        force: forceFiltered.querySelector('input').checked,
       });
     },
   };

@@ -26,7 +26,8 @@ export const TASKS = {
     label: 'AI 世界书精简',
     verb: '精简',
     summary: '压缩世界书条目正文，写回前逐条校验关键信息是否丢失',
-    detail: '默认改写为 YAML 列表；每条都会给出 token 比与「缺少的事实」，可逐条接受。',
+    detail: '原样返回也算合格结果；每条给出 token 变化（不判「失败」），'
+      + '数据/代码类条目默认跳过，可在面板里强制处理。',
     icon: 'book',
     surface: 'polish',
     modes: ['worldinfo', 'cards'],

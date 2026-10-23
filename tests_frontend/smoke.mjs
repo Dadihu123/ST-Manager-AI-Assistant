@@ -506,7 +506,6 @@ async function main() {
   // C4：格式可选项已删除（§2.2）。它曾让模型给正文套「名称/关键词/原文」外壳，
   // 而外壳会被原样写进世界书正文。
   await check('世界书面板不再有「改写格式」控件', async () => {
-    const before = allNodes.length;
     api.surfaces.open('polish', {
       source: 'context',
       targetKind: 'card',
@@ -514,8 +513,9 @@ async function main() {
       mode: 'cards',
     });
     await new Promise((resolve) => setTimeout(resolve, 40));
+    // 视图是懒创建且只创建一次（前面的「注册了全部 surface」可能已经开过），
+    // 所以这里查全部节点，而不是只看本次新增的。
     const texts = allNodes
-      .slice(before)
       .map((node) => node.textContent)
       .filter(Boolean)
       .map((text) => String(text));
@@ -525,6 +525,13 @@ async function main() {
       '「改写格式」下拉必须已删除',
     );
     assert.equal(texts.some((text) => text.includes('YAML 列表')), false);
+    // 反过来必须有「强制处理被过滤条目」的出口：前置过滤会挡掉含宏的散文条目
+    // （实测占全库四成多），没有出口用户就改不了这些条目。
+    assert.equal(
+      texts.some((text) => text.includes('前置过滤')),
+      true,
+      '缺少「强制处理被过滤条目」开关',
+    );
   });
 
   await check('坞打开不继承上次作用域', async () => {
