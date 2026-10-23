@@ -21,10 +21,16 @@
 2. **结构化树**：能被 `yaml.safe_load` 解析成 dict/list 且「大或嵌套」。
    名字能骗人，结构不会。
 3. **INI 段**：3 段以上 `[section]`，专治 MVU 与状态栏模板。
-4. **旧标记 + 代码构造**：宏 / EJS / `<script>` / 布局 HTML / STscript / 变量函数 /
-   JS 特征 / Python / JS / JSON 块。
+4. **旧标记 + 代码构造**：EJS / `<script>` / 布局 HTML / STscript / **结构性宏**
+   （`getvar`、`setvar`、`format_message_variable` 等）/ JS 特征 / Python / JS / JSON 块。
 
-全库实测命中率（2,557 条）：旧标记 44.8%，加代码构造 47.2%，再加 INI/结构化约 48%。
+全库实测（2,543 条非空条目）：本模块保护 **611 条（24.0%）**，
+其中名字 44、结构化树 125、INI 133、EJS/HTML/代码/结构性宏 381（有重叠）。
+
+**这条口径比 §7 的原始写法窄一档，理由见 `_LEGACY_MARKERS` 上方注释**：
+「任意 `{{...}}` 都算信号」会多挡 695 条只在散文里写了 `{{user}}` 的条目
+（保护面 51.4%），而 §12.3 实测被改坏的 7 条全部靠名字/结构命中，与宏无关。
+纯文本宏由 `wicheck` 的「宏保真」硬闸兜底。
 
 **命中不是永久的**：作业参数 `force=True` 可以强制处理（面板里单独勾选），
 过滤只是「默认不送」。这与「检查器永不禁止手动采纳」是同一条原则。
@@ -48,9 +54,21 @@ STRICT_NAME = (
 #: INI / 状态栏模板块的段标记（独占一行的 `[xxx]`）
 INI_SECTION = re.compile(r'(?m)^[ \t]*\[[^\[\]\n]{1,40}\][ \t]*$')
 
-#: 旧标记：宏 / EJS / script / 布局 HTML / STscript / 变量函数 / JS 特征
+#: 旧标记：EJS / script / 布局 HTML / STscript / **结构性宏** / JS 特征
+#:
+#: 注意这里**没有**「任意 `{{...}}`」这一档。校准数据（2,543 条真实条目）：
+#:
+#: | 口径 | 保护条数 |
+#: |---|---|
+#: | 任意宏都算 | 1,306（51.4%） |
+#: | 只算结构性宏（本文件） | 611（24.0%） |
+#:
+#: 差的 695 条全是「正文里只有一个 `{{user}}` / `{{char}}`」的散文条目——
+#: 它们既不是数据也不是代码，把整条散文挡在批次外是过度保护。而真正会被改坏的
+#: 那 7 条（§12.3）靠**名字/结构**命中（41/41 仍被保护），与这条无关。
+#:
+#: 纯文本宏交给下游兜底：`wicheck` 的「宏保真」是**硬闸**，丢一个宏就 block。
 _LEGACY_MARKERS = (
-    ('macro', re.compile(r'\{\{.*?\}\}', re.S)),
     ('ejs', re.compile(r'<%.*?%>', re.S)),
     ('script', re.compile(r'</?script\b', re.I)),
     (
@@ -69,7 +87,16 @@ _LEGACY_MARKERS = (
             r'buttons|choice|random|pick)\b',
         ),
     ),
-    ('var_func', re.compile(r'\{\{(?:get|set|add|inc|dec|getglobal|setglobal)[^}]*\}\}', re.I)),
+    (
+        'var_func',
+        # 结构性宏：写/读变量与 MVU 的格式化宏。改动它们会改变程序行为，
+        # 不是「文本替换」那么简单（`{{random::}}`/`{{//}}` 不在此列）。
+        re.compile(
+            r'\{\{\s*(?:(?:get|set|add|inc|dec|del)var::|'
+            r'(?:get|set|add)globalvar::|var::|format_message_variable)',
+            re.I,
+        ),
+    ),
     ('js_code', re.compile(r'(function\s*\(|=>|document\.|window\.|localStorage)', re.I)),
 )
 
@@ -183,16 +210,18 @@ REASON_LABELS = {
     'protected:name': '名字命中数据/机制类（initvar、[核心]、[MVU] 等）',
     'protected:structured': '正文是结构化数据（YAML/JSON 树）',
     'protected:ini': '正文含 3 段以上 INI/状态栏模板',
-    'protected:macro': '正文含双花括号宏',
     'protected:ejs': '正文含 EJS 模板',
     'protected:script': '正文含 <script> 块',
     'protected:html': '正文含布局 HTML',
     'protected:stscript': '正文含 STscript 指令',
-    'protected:var_func': '正文含变量读写宏',
+    'protected:var_func': '正文含变量读写/格式化宏',
     'protected:js_code': '正文含 JS 代码特征',
     'protected:code_py': '正文含 Python 代码',
     'protected:code_js': '正文含 JS 代码',
     'protected:json_block': '正文含 JSON 块',
+    # 历史原因码：旧作业结果里可能还留着「任意宏都算」时代产生的记录，
+    # 保留文案以免审批页显示成裸代码。
+    'protected:macro': '正文含双花括号宏（旧口径，现已改为只挡结构性宏）',
 }
 
 
