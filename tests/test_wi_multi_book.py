@@ -115,6 +115,86 @@ BOOKS = {
 }
 
 
+# ---------------------------------------------------------------- uid = 0
+#
+# ST 世界书的 uid 从 **0** 开始编号，而 `entry.get('uid') or entry.get('id')` 会把
+# 整数 0 当成「缺失」：第一条在 `/wi/entries` 里 uid 变成空串 → 面板上勾不动、
+# 提交后被 `if not uid: continue` 跳过 → 用户看到的是「每本书第一条改不了」。
+# 统一走 `trimming.entry_uid()`（它用 `is None` 判断）之后这三处都要能过。
+
+ZERO_BOOKS = {
+    'lorebooks/zero.json': _book([
+        {'uid': 0, 'comment': 'Z0', 'content': 'zz0', 'keys': []},
+        {'uid': 1, 'comment': 'Z1', 'content': 'zz1', 'keys': []},
+    ]),
+}
+
+ZERO_SOURCE = {'source_type': 'global', 'file_path': 'lorebooks/zero.json'}
+
+
+def test_entry_with_uid_zero_is_listed_and_submittable(workdir, monkeypatch):
+    client, api, _store, _written = build_client(workdir, ZERO_BOOKS)
+
+    listed = client.post('/wi/entries', json={
+        'worldbook_source': [ZERO_SOURCE],
+    }).get_json()
+    assert [item['uid'] for item in listed['items']] == ['0', '1'], (
+        'uid=0 不能被当成「没有 uid」'
+    )
+
+    captured = {}
+
+    def fake_submit(job_type, *, items, payload=None):
+        captured['items'] = items
+        return 'run-zero'
+
+    monkeypatch.setattr(api.jobs, 'submit', fake_submit)
+    response = client.post('/jobs/wi-rewrite', json={
+        'worldbook_source': [ZERO_SOURCE],
+        'entry_uids': ['0'],
+        'provider_id': 'p1',
+    })
+
+    assert response.get_json()['success'] is True
+    assert [item['entry_uid'] for item in captured['items']] == ['0']
+
+
+def test_apply_writes_back_to_uid_zero_entry(workdir, monkeypatch):
+    """落地时要按 uid='0' 找到**第一条**，不能顺着找到第二条。"""
+    client, api, store, written = build_client(workdir, ZERO_BOOKS)
+    items = [{
+        'key': '0', 'status': 'done',
+        'result': {
+            'entry_uid': '0', 'candidate': 'rewritten-0',
+            'worldbook_source': ZERO_SOURCE,
+        },
+    }]
+    monkeypatch.setattr(routes_module, '_load_job_items', lambda *a, **k: items)
+
+    app = client.application
+    with app.test_request_context('/jobs/run/apply', method='POST', json={}):
+        payload = routes_module._apply_wi_rewrite(
+            api, store, 'run-zero', {'payload': {}}, {},
+        ).get_json()
+
+    assert payload['success'] is True
+    assert payload['applied'] == 1
+    assert written['lorebooks/zero.json'] == ['rewritten-0', 'zz1']
+
+
+def test_trimming_entry_uid_handles_zero_and_missing():
+    """`entry_uid` 的契约：0 是有效值，缺失才退回 id / 空串。"""
+    trimming = load_backend_submodule('core.trimming')
+
+    assert trimming.entry_uid({'uid': 0}) == '0'
+    assert trimming.entry_uid({'uid': '0'}) == '0'
+    assert trimming.entry_uid({'uid': 12}) == '12'
+    assert trimming.entry_uid({'id': 3}) == '3'
+    assert trimming.entry_uid({'uid': None, 'id': 4}) == '4'
+    assert trimming.entry_uid({}) == ''
+    assert trimming.entry_uid(None) == ''
+
+
 # ---------------------------------------------------------------- /wi/entries
 
 def test_list_entries_returns_per_book_groups(workdir):

@@ -26,6 +26,7 @@ from .core import proposal as proposal_core
 from .core import prompt as prompt_core
 from .core import wicheck as wicheck_core
 from .core import tokens as tokens_core
+from .core import trimming as trimming_core
 from .core.errors import (
     CODE_INVALID_PAYLOAD,
     CODE_JOB_NOT_FOUND,
@@ -754,7 +755,9 @@ def register_routes(api, store) -> None:
                 # 实际只处理 12 条，要等作业跑完在审批页才知道为什么。
                 skip_reason = prefilter_core.skip_reason(entry)
                 items.append({
-                    'uid': str(entry.get('uid') or entry.get('id') or ''),
+                    # `uid` 可以是 **0**：`entry.get('uid') or ...` 会把 0 当缺失，
+                    # 于是每本书的第一条都被当成「没有 uid」，既不能选也不能提交。
+                    'uid': trimming_core.entry_uid(entry),
                     'name': str(entry.get('comment') or entry.get('name') or ''),
                     'keys': [str(item) for item in (entry.get('keys') or [])],
                     'tokens': tokens_core.estimate(content),
@@ -853,7 +856,7 @@ def register_routes(api, store) -> None:
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
-                uid = str(entry.get('uid') or entry.get('id') or '')
+                uid = trimming_core.entry_uid(entry)
                 if not uid:
                     continue
                 if wanted and uid not in wanted:
@@ -1531,7 +1534,7 @@ def _apply_wi_rewrite(api, store, run_id: str, job, payload) -> dict:
             if not isinstance(entry, dict):
                 updated_entries.append(entry)
                 continue
-            uid = str(entry.get('uid') or entry.get('id') or '')
+            uid = trimming_core.entry_uid(entry)
             if uid in wanted:
                 patched = dict(entry)
                 patched['content'] = wanted[uid]

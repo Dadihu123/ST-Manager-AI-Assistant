@@ -24,6 +24,7 @@
 import logging
 
 from .core.errors import AiAssistantError
+from .core import trimming as trimming_core
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +180,7 @@ def _action_write_worldbook(api, store, card_id, value, params, context) -> dict
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        if str(entry.get('uid') or entry.get('id') or '') == entry_uid:
+        if trimming_core.entry_uid(entry) == entry_uid:
             entry['content'] = new_content
             found = True
             break

@@ -1042,7 +1042,7 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
     for item in entries:
         if not isinstance(item, dict):
             continue
-        if str(item.get('uid') or item.get('id') or '') == entry_uid:
+        if trimming.entry_uid(item) == entry_uid:
             entry = item
             break
 
@@ -1216,8 +1216,7 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
     updated = dict(book)
     updated_entries = []
     for item in entries:
-        if (isinstance(item, dict)
-                and str(item.get('uid') or item.get('id') or '') == entry_uid):
+        if (isinstance(item, dict) and trimming.entry_uid(item) == entry_uid):
             patched = dict(item)
             patched['content'] = candidate
             updated_entries.append(patched)
