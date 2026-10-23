@@ -38,6 +38,18 @@ const TASK_OF_JOB = {
   'ai.agent': 'propose',
 };
 
+/**
+ * 作业条目的稳定键。
+ *
+ * 主程序的作业条目字段是 `key`（`job_store._row_to_item`），插件前端以前统一读
+ * `item_key` —— 于是「接受」发出去的是 `undefined`，叠加上路由不支持 `/` 直接
+ * 产出 404（§9 的 P2-9 + P0-1）。这里做成单一出口，两种形状都认。
+ */
+function itemKeyOf(item) {
+  if (!item || typeof item !== 'object') return '';
+  return String(item.key || item.item_key || '');
+}
+
 export function createReview(api, client, context) {
   const root = el('div', 'plugin-stm-ai-assistant-view is-review');
   const state = {
@@ -209,7 +221,7 @@ export function createReview(api, client, context) {
       const head = el('div', 'plugin-stm-ai-assistant-review-head');
       head.append(toneBadge(ITEM_STATUS_LABELS[item.status] || item.status, item.status));
       head.append(el('span', 'plugin-stm-ai-assistant-review-key',
-        String(result.card_id || result.item_key || item.item_key || '')));
+        String(result.card_id || itemKeyOf(item))));
 
       const actions = el('div', 'plugin-stm-ai-assistant-review-actions');
       if (item.status === 'awaiting_review') {
@@ -351,7 +363,7 @@ export function createReview(api, client, context) {
     const jobType = String(state.job.job_type || '');
     const accepted = state.items
       .filter((item) => item.status === 'done')
-      .map((item) => String(item.item_key || (item.result || {}).card_id || ''))
+      .map((item) => itemKeyOf(item) || String((item.result || {}).card_id || ''))
       .filter(Boolean);
 
     if (jobType === 'ai.propose' || jobType === 'ai.agent') {
@@ -440,7 +452,7 @@ export function createReview(api, client, context) {
   async function reviewOne(item, status) {
     if (!state.runId) return;
     try {
-      await client.reviewItem(state.runId, item.item_key, status);
+      await client.reviewItem(state.runId, itemKeyOf(item), status);
       item.status = status;
       renderSummary();
       renderItems();
@@ -460,7 +472,7 @@ export function createReview(api, client, context) {
     try {
       const result = await client.reviewItems(
         state.runId,
-        targets.map((item) => ({ key: item.item_key, status })),
+        targets.map((item) => ({ key: itemKeyOf(item), status })),
       );
       // 批量结果以服务端为准，避免个别失败被本地状态掩盖
       await loadJob();

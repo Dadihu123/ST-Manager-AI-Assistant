@@ -349,8 +349,9 @@ function createFakeApi({ providers = 1, pending = 0 } = {}) {
           success: true,
           job: { run_id: 'abcdef123456', job_type: 'ai.analyze', status: 'completed', total: 2, completed: 2, failed: 0, skipped: 0, summary: {}, counts: { total: 2, completed: 2 } },
           items: [
-            { item_key: 'a.json', status: 'awaiting_review', result: { card_id: 'a.json', summary: '概览', tags: [{ name: '标签A', confidence: 0.9 }], new_tags: [{ name: '新标签' }] } },
-            { item_key: 'b.json', status: 'done', result: { card_id: 'b.json', summary: '概览B', tags: [] } },
+            // 真实宿主返回的字段是 `key`（不是 `item_key`），见 §9 的 P2-9。
+            { key: 'a.json', status: 'awaiting_review', result: { card_id: 'a.json', summary: '概览', tags: [{ name: '标签A', confidence: 0.9 }], new_tags: [{ name: '新标签' }] } },
+            { key: 'b.json', status: 'done', result: { card_id: 'b.json', summary: '概览B', tags: [] } },
           ],
         };
       }
@@ -393,7 +394,7 @@ function check(name, fn) {
 }
 
 async function main() {
-  const { api, registered, opened, badges } = createFakeApi({ pending: 2 });
+  const { api, registered, opened, badges, calls } = createFakeApi({ pending: 2 });
 
   const mod = await import('../frontend/plugin.js');
   await check('activate 不抛错', async () => {
@@ -613,6 +614,37 @@ async function main() {
     review.focusRun('abcdef123456');
     review.applyContext({ runId: 'abcdef123456' });
     await new Promise((resolve) => setTimeout(resolve, 60));
+  });
+
+  // §9 的 P2-9：宿主返回的条目字段是 `key`，旧前端统一读 `item_key`，
+  // 于是「接受」把 `undefined` 当作条目键发出去 → 404 / 落地变空操作。
+  await check('点「接受」时用真实 item key（不是 undefined）', async () => {
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const client = createClient(api);
+    const review = createReview(api, client, { notifyReview: () => {} });
+    await review.refresh();
+    review.focusRun('abcdef123456');
+    review.applyContext({ runId: 'abcdef123456' });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const accept = allNodes
+      .filter((node) => node.tagName === 'BUTTON' && node.textContent === '接受')
+      .pop();
+    assert.ok(accept, '没渲染出「接受」按钮');
+    const before = calls.length;
+    accept.click();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const sent = calls.slice(before).map((entry) => String(entry[1] || ''));
+    assert.ok(
+      sent.some((path) => path.includes('/items/a.json/review')),
+      `审批请求没带真实 key：${JSON.stringify(sent)}`,
+    );
+    assert.equal(
+      sent.some((path) => path.includes('undefined')),
+      false,
+      '审批请求里出现了 undefined',
+    );
   });
 
   await check('世界书结果渲染 diff（不抛错）', async () => {
