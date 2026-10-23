@@ -398,13 +398,19 @@ export function createReview(api, client, context) {
       };
     }
     if (jobType === 'ai.analyze') {
-      return {
+      const payload = {
         items: accepted,
         write: {
           note: state.writeNote,
           tags: state.writeTags,
         },
       };
+      // C13：勾选的删除项才提交（没有勾选框时 `selectedOf` 返回 null = 不删）。
+      const removals = selectedOf('removal', null);
+      if (Array.isArray(removals) && removals.length) {
+        payload.remove_tags = removals;
+      }
+      return payload;
     }
     return { items: accepted };
   }
@@ -586,6 +592,31 @@ function renderAnalyzeItem(result) {
       'plugin-stm-ai-assistant-note',
       `建议新增标签：${suggestions.map((tag) => (tag && tag.name) || tag).join('、')}（进建议队列，不直接写入）`,
     ));
+  }
+
+  // C13：删标签是不可逆的，所以默认**不勾**；勾了才会随 apply 一起提交。
+  const removals = Array.isArray(result.tag_removals) ? result.tag_removals : [];
+  if (removals.length) {
+    wrap.append(el(
+      'p',
+      'plugin-stm-ai-assistant-note',
+      '建议删除的现有标签（删标签不可逆，默认不删；勾选后才会移除）',
+    ));
+    const list = el('div', 'plugin-stm-ai-assistant-checks');
+    removals.forEach((entry) => {
+      const name = String((entry && entry.name) || entry || '').trim();
+      if (!name) return;
+      const label = el('label', 'plugin-stm-ai-assistant-checkbox');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.checked = false;
+      box.dataset.removal = name;
+      box.dataset.marqueeIgnore = 'true';
+      const reason = entry && entry.reason ? `：${entry.reason}` : '';
+      label.append(box, el('span', '', `${name}${reason}`));
+      list.append(label);
+    });
+    wrap.append(list);
   }
   return wrap;
 }

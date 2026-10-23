@@ -246,11 +246,24 @@ def normalize_result_category(data, scheme, *, allow_new: bool = False,
         warnings.append(f'置信度不是数字，已忽略: {confidence!r}')
 
     path, error = resolve_choice(raw_category, scheme, allow_new=allow_new)
+
+    # 模型明确说「不属于任何候选」（category 留空）= 自认不确定，**不是**落地失败。
+    # 按 §4.4 这属于 note 级：留给人看，而不是替人做决定。
+    undecided = not str(raw_category or '').strip()
+    if undecided:
+        error = ''
+        path = ''
+
     if error:
         issues.append(error)
 
     low = bool(score is not None and score < float(confidence_min or 0))
-    if low:
+    if undecided:
+        low = True
+        warnings.append(
+            '模型认为这张卡不属于任何候选分类（category 留空），需要人工指定',
+        )
+    if low and not undecided:
         warnings.append(
             f'置信度 {score:.2f} 低于 {confidence_min:.2f}，建议人工确认后再移动',
         )
@@ -269,18 +282,35 @@ def normalize_result_category(data, scheme, *, allow_new: bool = False,
 
 
 def build_classify_instruction(scheme) -> str:
-    """生成「怎么归类」的要求文本（追加在任务规格之后）。"""
+    """生成「怎么归类」的要求文本（追加在任务规格之后）。
+
+    三条实测补丁（§4.1）：
+
+    1. **注入 description**：只给路径名时，`原创/都市日常` 与 `综合/其他` 的边界
+       全靠猜（3 张判读偏弱的卡都是这么错的）。方案里带描述就一起给模型。
+    2. **幂等指令**：卡片已经在候选分类里时直接返回它，否则重复跑会重复产出待审项。
+    3. **允许说不知道**：拿不准给低 confidence；不属于任何候选就留空 category。
+       模型能说「我不确定」，系统就把这条留给人看，而不是替人做决定。
+    """
     items = normalize_scheme(scheme)
     lines = ['输出要求：', '1. 只输出一个 JSON 对象，不要解释或 Markdown 代码块。']
 
     if items:
-        lines.append('2. category 必须从下面的分类中选一个，不要发明新分类：')
+        has_desc = any(item['description'] for item in items)
+        lines.append(
+            '2. category 必须从下面的分类中选一个，不要发明新分类'
+            + ('（「路径 — 描述」是判断边界的主要依据）：' if has_desc else '：'),
+        )
         lines.append(format_scheme(items))
     else:
         lines.append('2. category 用一个简短的中文分类名概括这张卡。')
 
-    lines.append('3. confidence 为 0-1 的数值，表示你对这个分类的把握。')
-    lines.append('4. reason 用一句话说明判断依据（不超过 60 字）。')
+    lines.append('3. 若卡片**已经**在某个分类，且该分类在候选里，直接返回该分类。')
+    lines.append(
+        '4. confidence 为 0-1 的数值：拿不准就给低分，不要硬猜。'
+        '如果不属于任何候选分类，category 留空，并在 reason 里说明为什么。',
+    )
+    lines.append('5. reason 用一句话说明判断依据（不超过 60 字）。')
 
     return '\n'.join(lines)
 

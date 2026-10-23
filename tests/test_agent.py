@@ -442,6 +442,81 @@ def test_agent_loop_can_finalize_without_reading(env, monkeypatch):
     jobs.run_agent(ctx, api=api, store=store)
 
     assert ctx.summary['iterations'] == 1
+
+
+# ------------------------------------------------------------------ C23 轮次与 no_finalize
+
+
+def test_agent_default_iterations_scale_with_library(env, monkeypatch):
+    """默认轮次按库规模给（`min(ceil(卡数/6), 12)`，下限 4）。
+
+    固定 6 轮在几十张卡的库里会被 read 吃光 —— 实测第一轮作业就 `no_finalize`。
+    """
+    api, store = env  # 8 张卡 → ceil(8/6)=2 → 下限 4
+    monkeypatch.setattr(jobs.llm, 'chat', lambda *a, **k: _reply(FINAL))
+
+    ctx = FakeCtx([{'key': 'agent', 'payload': {}}], payload={'provider_id': 'openai'})
+    jobs.run_agent(ctx, api=api, store=store)
+
+    meta = ctx.reports[0]['result']['agent_meta']
+    assert meta['max_iterations'] == 4, '小库取下限 4，不是固定 6'
+
+
+def test_agent_explicit_iterations_is_respected(env, monkeypatch):
+    api, store = env
+    monkeypatch.setattr(jobs.llm, 'chat', lambda *a, **k: _reply(FINAL))
+
+    ctx = FakeCtx([{'key': 'agent', 'payload': {}}],
+                  payload={'provider_id': 'openai', 'budget': {'max_iterations': 9}})
+    jobs.run_agent(ctx, api=api, store=store)
+
+    assert ctx.reports[0]['result']['agent_meta']['max_iterations'] == 9
+
+
+def test_agent_nudges_finalize_after_max_iterations(env, monkeypatch):
+    """轮次用尽仍未 finalize → 补一次请求把它救回来（不是整轮重跑）。"""
+    api, store = env
+    replies = [
+        _reply({'action': 'search', 'query': '奇幻'}),
+        _reply({'action': 'search', 'query': '科幻'}),
+        _reply(FINAL),          # 补 finalize 的那一次
+    ]
+    calls = []
+
+    def fake_chat(*a, **k):
+        calls.append(1)
+        return replies.pop(0)
+
+    monkeypatch.setattr(jobs.llm, 'chat', fake_chat)
+
+    ctx = FakeCtx([{'key': 'agent', 'payload': {}}],
+                  payload={'provider_id': 'openai', 'budget': {'max_iterations': 2}})
+    jobs.run_agent(ctx, api=api, store=store)
+
+    assert len(calls) == 3, '2 轮 + 1 次补救'
+    assert ctx.summary['awaiting_review'] == 1
+    meta = ctx.reports[0]['result']['agent_meta']
+    assert meta['iterations'] == 2, '「最多 N 轮」的语义不能被补救悄悄改掉'
+    assert meta['finalize_nudge'] is True
+    assert meta['stop_reason'] == 'finalize_after_nudge'
+
+
+def test_agent_nudge_failure_still_reports_no_finalize(env, monkeypatch):
+    api, store = env
+    replies = [
+        _reply({'action': 'search', 'query': '奇幻'}),
+        _reply({'action': 'search', 'query': '奇幻'}),
+        _reply({'action': 'search', 'query': '奇幻'}),   # 补救也没用
+    ]
+    monkeypatch.setattr(jobs.llm, 'chat', lambda *a, **k: replies.pop(0))
+
+    ctx = FakeCtx([{'key': 'agent', 'payload': {}}],
+                  payload={'provider_id': 'openai', 'budget': {'max_iterations': 2}})
+    jobs.run_agent(ctx, api=api, store=store)
+
+    assert ctx.summary['failed'] == 1
+    assert ctx.reports[0]['error'] == 'no_finalize'
+    assert ctx.reports[0]['result']['finalize_nudge'] is True
     assert ctx.summary['cards_read'] == 0
 
 

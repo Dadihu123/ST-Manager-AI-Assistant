@@ -350,7 +350,7 @@ function createFakeApi({ providers = 1, pending = 0 } = {}) {
           job: { run_id: 'abcdef123456', job_type: 'ai.analyze', status: 'completed', total: 2, completed: 2, failed: 0, skipped: 0, summary: {}, counts: { total: 2, completed: 2 } },
           items: [
             // 真实宿主返回的字段是 `key`（不是 `item_key`），见 §9 的 P2-9。
-            { key: 'a.json', status: 'awaiting_review', result: { card_id: 'a.json', summary: '概览', tags: [{ name: '标签A', confidence: 0.9 }], new_tags: [{ name: '新标签' }] } },
+            { key: 'a.json', status: 'awaiting_review', result: { card_id: 'a.json', summary: '概览', tags: [{ name: '标签A', confidence: 0.9 }], new_tags: [{ name: '新标签' }], tag_removals: [{ name: '奇幻', reason: '与卡片无关' }] } },
             { key: 'b.json', status: 'done', result: { card_id: 'b.json', summary: '概览B', tags: [] } },
           ],
         };
@@ -541,8 +541,26 @@ async function main() {
     );
   });
 
-  // §6.2 硬规则 2：批量「全部接受」只接受没有 block 级问题的条目，
-  // 有问题的要单独点（避免低置信度/被改坏的候选被一把带走）。
+  // C13：删标签不可逆 —— 每条建议前有勾选框，且**默认不勾**。
+  await check('分析的「建议删除标签」默认不勾选', async () => {
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(api, createClient(api), { notifyReview: () => {} });
+    await review.refresh();
+    review.focusRun('abcdef123456');
+    review.applyContext({ runId: 'abcdef123456' });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const texts = allNodes.map((node) => String(node.textContent || '')).filter(Boolean);
+    assert.equal(
+      texts.some((text) => text.includes('删标签不可逆')),
+      true,
+      '要提示「默认不删」',
+    );
+    const boxes = allNodes.filter((node) => node.dataset && node.dataset.removal === '奇幻');
+    assert.equal(boxes.length >= 1, true, '没渲染出删除勾选框');
+    assert.equal(boxes.every((node) => node.checked === false), true, '默认必须是未勾选');
+  });
   await check('「全部接受」跳过有 block 问题的条目', async () => {
     const { createFakeApi: makeFake } = { createFakeApi };
     void makeFake;

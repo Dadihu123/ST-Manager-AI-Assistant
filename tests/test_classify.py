@@ -24,6 +24,49 @@ SCHEME = [
 ]
 
 
+# ------------------------------------------------------------------ C22 提示词
+#
+# 实测三张判读偏弱的卡：只给路径名时 `原创/都市日常` 与 `综合/其他` 的边界全靠猜。
+
+
+def test_instruction_injects_category_description():
+    """方案里带描述时，描述必须进提示词 —— 只给路径名时边界全靠猜。"""
+    text = classify.build_classify_instruction(SCHEME)
+    assert '剑与魔法、异世界' in text
+    assert '奇幻' in text
+
+
+def test_instruction_has_idempotency_rule():
+    text = classify.build_classify_instruction(SCHEME)
+    assert '已经' in text and '直接返回' in text
+
+
+def test_instruction_allows_saying_unknown():
+    text = classify.build_classify_instruction(SCHEME)
+    assert '留空' in text
+    assert '拿不准' in text
+
+
+def test_empty_category_is_undecided_not_a_failure():
+    """`category` 留空 = 模型自认不确定（note 级），不是落地失败。"""
+    decision = classify.normalize_result_category(
+        {'category': '', 'confidence': 0.2, 'reason': '都不像'}, SCHEME,
+    )
+    assert decision['issues'] == []
+    assert decision['category'] == ''
+    assert decision['low_confidence'] is True
+    assert any('不属于任何候选分类' in item for item in decision['warnings'])
+
+
+def test_out_of_scheme_category_is_still_a_block():
+    """方案外分类仍然要拦（这和「留空」是两回事）。"""
+    decision = classify.normalize_result_category(
+        {'category': '赛博朋克', 'confidence': 0.9}, SCHEME,
+    )
+    assert decision['issues']
+    assert decision['category'] == ''
+
+
 # ------------------------------------------------------------------ 路径安全
 
 
@@ -349,7 +392,7 @@ def test_run_classify_skips_when_already_in_target(env, monkeypatch):
                   payload={'provider_id': 'openai', 'apply_mode': 'auto', 'scheme': SCHEME})
     jobs.run_classify(ctx, api=api, store=store)
 
-    assert ctx.reports[0]['result']['skipped'] == 'unchanged'
+    assert ctx.reports[0]['result']['skipped'] == 'already_in_place'
     assert moves == [], '幂等：已在目标分类不重复移动'
 
 

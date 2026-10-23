@@ -56,6 +56,10 @@ def _action_apply_tags(api, store, card_id, value, params, context) -> dict:
 
     取值优先级：`context['accepted_tags']` > 字段值。前者是**已按标签库筛过**
     的清单（作业在解析阶段就算好了），后者可能含未知标签。
+
+    **也会删标签**（C13）：`context['removable_tags']` 是调用方允许删除的标签
+    （已经过「卡片确实有这个标签」校验）。删标签不可逆，所以默认是空列表——
+    只有 auto 模式显式开 `apply_removals`、或审批页逐条勾选后才会传进来。
     """
     accepted = context.get('accepted_tags')
     if not isinstance(accepted, list):
@@ -71,11 +75,17 @@ def _action_apply_tags(api, store, card_id, value, params, context) -> dict:
         if name and name not in names:
             names.append(name)
 
-    if not names:
+    removals = []
+    for item in (context.get('removable_tags') or []):
+        name = str(item or '').strip()
+        if name and name not in removals:
+            removals.append(name)
+
+    if not names and not removals:
         return {'ok': True, 'applied': False, 'skipped': 'empty', 'message': ''}
 
     replace = bool(params.get('replace', False))
-    result = api.cards.apply_tags([card_id], add=names, replace=replace)
+    result = api.cards.apply_tags([card_id], add=names, remove=removals, replace=replace)
 
     messages = []
     if result.get('skipped_blacklist'):
@@ -90,6 +100,7 @@ def _action_apply_tags(api, store, card_id, value, params, context) -> dict:
         'skipped': '',
         'message': '；'.join(messages),
         'added': list(result.get('added') or []),
+        'removed': list(result.get('removed') or []),
     }
 
 

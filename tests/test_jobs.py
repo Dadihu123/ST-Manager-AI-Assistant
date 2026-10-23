@@ -167,7 +167,9 @@ def test_auto_mode_writes_summary_and_merges_tags(api, store, stub_llm, stub_bri
     ctx = run_job(api, store, payload={'apply_mode': 'auto'})
 
     assert stub_bridge['Alice.png'].startswith('北境骑士')
-    assert api.applied_tags == [{'card_ids': ['Alice.png'], 'add': ['奇幻'], 'replace': False}]
+    assert api.applied_tags == [
+        {'card_ids': ['Alice.png'], 'add': ['奇幻'], 'remove': [], 'replace': False},
+    ]
     assert [report['status'] for report in ctx.reports] == ['done']
 
     result = ctx.reports[0]['result']
@@ -261,10 +263,20 @@ def test_review_mode_defers_writeback(api, store, stub_llm, stub_bridge):
     assert ctx.summary['awaiting_review'] == 1
 
 
-def test_review_mode_does_not_record_card_meta(api, store, stub_llm, stub_bridge):
-    """待审批的卡片不能被记为「已分析」，否则会被幂等判定误跳过。"""
+def test_review_mode_records_fingerprint_but_not_applied(api, store, stub_llm, stub_bridge):
+    """待审批也要记内容指纹（C14），但**不能**记成「已落地」。
+
+    修之前 review 模式什么都不记 → `skip_unchanged` 永不生效，同一张卡重复提交
+    就重复烧钱（P1-2）。现在只写 content_hash / profile_id / model / analyzed_at，
+    `applied_runs` / `applied_at` 仍然留空 —— 那才是「已落地」的判据。
+    """
     run_job(api, store, payload={'apply_mode': 'review'})
-    assert store.get_card_meta('Alice.png') == {}
+    meta = store.get_card_meta('Alice.png')
+
+    assert meta.get('content_hash'), '要记内容指纹，否则幂等跳过失效'
+    assert meta.get('profile_id')
+    assert 'applied_runs' not in meta
+    assert 'applied_at' not in meta
 
 
 def test_review_result_carries_proposals(api, store, stub_llm, stub_bridge):
@@ -509,3 +521,101 @@ def test_embedded_entries_supports_both_structures():
     assert jobs_module._embedded_entries({'character_book': CARD['character_book']['entries']}) \
         == CARD['character_book']['entries']
     assert jobs_module._embedded_entries({}) == []
+
+
+# ------------------------------------------------------------------ C11 自定义字段放行
+#
+# 修之前 `result_payload` 是硬编码白名单：profile 的 output_schema 新增任何字段
+# 都不会进结果、也不会进审批页 —— 「自定义提示词 + 自定义输出字段」这条路死掉。
+
+
+def _reply_with(**extra):
+    payload = json.loads(LLM_REPLY)
+    payload.update(extra)
+    return payload
+
+
+def test_custom_schema_field_flows_into_result(api, store, stub_llm, stub_bridge,
+                                               monkeypatch):
+    profile = profiles_core.normalize_profile({
+        'id': 'custom-mood', 'name': '自定义档案', 'model_match': '*',
+        'system': '你是分析助手。', 'user_template': '分析 {{ card.name }}',
+    })
+    profile['output_schema']['properties']['mood'] = {'type': 'string'}
+    store.save_profile(profile)
+
+    reply = _reply_with(mood='压抑', secret_note='不该出现')
+    monkeypatch.setattr(jobs_module.llm, 'chat', lambda *a, **k: {
+        'content': json.dumps(reply, ensure_ascii=False), 'usage': {},
+    })
+
+    ctx = run_job(api, store, payload={'apply_mode': 'review', 'profile_id': 'custom-mood'})
+    result = ctx.reports[0]['result']
+
+    assert result['mood'] == '压抑', 'schema 里声明过的字段必须能落地'
+    assert 'secret_note' not in result, '没声明的字段仍然要挡'
+    assert result['summary'], '内置字段不受影响'
+    assert 'mood' in result['schema_fields']
+
+
+# ------------------------------------------------------------------ C13 审查现有标签
+#
+# «只加不减»：修之前分析只会加标签，模型指出的「该删的」根本没有落地通道。
+
+
+def test_tag_removals_are_limited_to_existing_tags(api, store, stub_llm, stub_bridge,
+                                                   monkeypatch):
+    reply = _reply_with(tag_removals=[
+        {'name': '奇幻', 'reason': '与卡片无关'},
+        {'name': '不存在的标签', 'reason': '编的'},
+    ])
+    monkeypatch.setattr(jobs_module.llm, 'chat', lambda *a, **k: {
+        'content': json.dumps(reply, ensure_ascii=False), 'usage': {},
+    })
+
+    ctx = run_job(api, store, payload={'apply_mode': 'review'})
+    result = ctx.reports[0]['result']
+
+    assert [item['name'] for item in result['tag_removals']] == ['奇幻']
+    assert result['remove_tags'] == ['奇幻']
+    assert any('已忽略' in item for item in result['warnings'])
+
+
+def test_tag_removals_are_capped_at_three(api, store, stub_llm, stub_bridge, monkeypatch):
+    api._cards['Alice.png'] = dict(CARD, tags=['阶段', '主题', '风格', '题材'])
+    reply = _reply_with(tag_removals=[
+        {'name': name, 'reason': 'r'} for name in ('阶段', '主题', '风格', '题材')
+    ])
+    monkeypatch.setattr(jobs_module.llm, 'chat', lambda *a, **k: {
+        'content': json.dumps(reply, ensure_ascii=False), 'usage': {},
+    })
+
+    ctx = run_job(api, store, payload={'apply_mode': 'review'})
+    result = ctx.reports[0]['result']
+    assert len(result['tag_removals']) == 3
+    # 截断发生在 schema 层（`max_items: 3`）并带 note；作业里还有一道兜底
+    # （自定义档案没写 max_items 时按 3 截断）。
+    assert any('截断' in item for item in result['warnings'])
+
+
+def test_removals_are_not_applied_by_default(api, store, stub_llm, stub_bridge, monkeypatch):
+    """删标签不可逆：auto 模式默认不删。"""
+    reply = _reply_with(tag_removals=[{'name': '奇幻', 'reason': 'r'}])
+    monkeypatch.setattr(jobs_module.llm, 'chat', lambda *a, **k: {
+        'content': json.dumps(reply, ensure_ascii=False), 'usage': {},
+    })
+
+    run_job(api, store, payload={'apply_mode': 'auto'})
+    assert all(not entry['remove'] for entry in api.applied_tags)
+
+
+def test_removals_apply_when_explicitly_enabled(api, store, stub_llm, stub_bridge,
+                                                monkeypatch):
+    reply = _reply_with(tag_removals=[{'name': '奇幻', 'reason': 'r'}])
+    monkeypatch.setattr(jobs_module.llm, 'chat', lambda *a, **k: {
+        'content': json.dumps(reply, ensure_ascii=False), 'usage': {},
+    })
+
+    run_job(api, store, payload={'apply_mode': 'auto', 'apply_removals': True})
+    removes = [entry['remove'] for entry in api.applied_tags if entry['remove']]
+    assert removes == [['奇幻']]

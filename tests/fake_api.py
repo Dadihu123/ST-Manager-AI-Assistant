@@ -201,7 +201,12 @@ class _FakeCards:
 
     def apply_tags(self, card_ids, *, add=(), remove=(), replace=False):
         ids = [str(item) for item in (card_ids or [])]
-        self._api.applied_tags.append({'card_ids': ids, 'add': list(add), 'replace': bool(replace)})
+        self._api.applied_tags.append({
+            'card_ids': ids,
+            'add': list(add),
+            'remove': list(remove),
+            'replace': bool(replace),
+        })
         return {
             'updated': len(ids),
             'added': list(add),

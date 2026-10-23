@@ -166,6 +166,45 @@ def test_builtin_profile_returns_independent_copy():
     assert profiles.builtin_profile('builtin-gpt')['name'] != 'changed'
 
 
+# ------------------------------------------------------------------ C12 分析档案
+#
+# 三个具体缺陷：`content_flags` 零定义（可塞任意文本）、`card_type` 的
+# `values: []` 让校验空转、没有「审查现有标签」的输出字段。
+
+
+def test_default_schema_declares_tag_removals():
+    prop = profiles.DEFAULT_OUTPUT_SCHEMA['properties']['tag_removals']
+    assert prop['type'] == 'array'
+    assert prop['max_items'] == 3
+    assert set(prop['item']) == {'name', 'reason'}
+
+
+def test_card_type_enum_is_filled():
+    """`values: []` + `fallback: keep` 等于校验空转（提示词写了、schema 不认）。"""
+    prop = profiles.DEFAULT_OUTPUT_SCHEMA['properties']['card_type']
+    assert prop['values'] == ['OC', '同人', '工具卡', '群组卡']
+    assert prop['fallback'] == 'keep'
+
+
+def test_analyze_prompt_defines_content_flags():
+    template = profiles.BASE_USER_TEMPLATE
+    assert 'content_flags' in template
+    assert '3–5 个短语' in template
+    assert '不含褒贬评价' in template
+
+
+def test_analyze_prompt_asks_for_tag_removals():
+    """提示式，不是强制：先说不该删的情况，再说最多 3 条。"""
+    system = profiles.BASE_SYSTEM
+    assert 'tag_removals' in system
+    assert '宁可少删' in system
+    assert '没有把握的字段留空' in system
+
+    template = profiles.BASE_USER_TEMPLATE
+    assert 'tag_removals' in template
+    assert '"tag_removals"' in template, '输出 JSON 示例里要带上这个字段'
+
+
 # ------------------------------------------------------------------ 任务归属（C6 / §4.3）
 #
 # 「按任务选档案」这个概念以前在代码里**根本不存在**：5 个内置档案的 `task`

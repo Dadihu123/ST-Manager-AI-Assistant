@@ -272,6 +272,8 @@ def run_analyze(ctx, *, api, store) -> None:
     strict = bool(payload.get('strict', config['validation_strict']))
     budget_tokens = int(payload.get('budget_tokens') or 0)
     apply_tags_enabled = bool(payload.get('apply_tags', config['apply_tags']))
+    # C13：auto 模式下是否真的删标签（默认关：删标签不可逆，保守）
+    apply_removals_enabled = bool(payload.get('apply_removals', False))
 
     total = len(ctx.items)
     ctx.set_total(total)
@@ -351,6 +353,7 @@ def run_analyze(ctx, *, api, store) -> None:
                 wi_budget=wi_budget, keywords=keywords,
                 apply_mode=apply_mode, dry_run=dry_run, force=force, strict=strict,
                 apply_tags_enabled=apply_tags_enabled,
+                apply_removals=apply_removals_enabled,
             )
         except AiAssistantError as exc:
             counters['failed'] += 1
@@ -450,7 +453,8 @@ def _abort(ctx, code: str, message: str, total: int) -> None:
 def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
                 profile, limits, model_name, provider, api_key, extra_headers,
                 tag_library, known_tags, usage_map, wi_budget, keywords,
-                apply_mode, dry_run, force, strict, apply_tags_enabled) -> dict:
+                apply_mode, dry_run, force, strict, apply_tags_enabled,
+                apply_removals=False) -> dict:
     """处理单张卡片：读取 → 渲染 → 调用 → 解析 → （可选）写回。"""
     started = time.monotonic()
 
@@ -608,12 +612,68 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         'summary_origin': '',
     }
 
+    # ---- C11：schema 里声明过的字段一律放行 ----
+    #
+    # 以前这里是**硬编码白名单**：profile 的 output_schema 新增任何字段都不会进
+    # 结果、也不会进审批页 —— 「用户自定义提示词 + 自定义输出字段」这条路直接死掉。
+    # 现在按 `output_schema.properties` 动态放行；运行时字段（usage/model/…）已经
+    # 在 payload 里，用 setdefault 保证它们不会被模型的同名输出覆盖。
+    schema_properties = (profile.get('output_schema') or {}).get('properties') or {}
+    for key, value in parsed.items():
+        if key in schema_properties:
+            result_payload.setdefault(key, value)
+    result_payload['schema_fields'] = sorted(
+        name for name in schema_properties if name in result_payload
+    )
+
+    # ---- C13：审查现有标签（只认卡片真的有的，最多 3 条）----
+    card_tags = {
+        str(item).strip() for item in (card.get('tags') or []) if str(item or '').strip()
+    }
+    removals = []
+    ignored_removals = []
+    for entry in (parsed.get('tag_removals') or []):
+        name = str(
+            (entry or {}).get('name') if isinstance(entry, dict) else entry or '',
+        ).strip()
+        if not name:
+            continue
+        if name not in card_tags:
+            ignored_removals.append(name)
+            continue
+        if name in [item['name'] for item in removals]:
+            continue
+        reason = ''
+        if isinstance(entry, dict):
+            reason = str(entry.get('reason') or '')
+        removals.append({'name': name, 'reason': reason})
+    if len(removals) > 3:
+        warnings.append(f'tag_removals 超过 3 条，已截断（{len(removals)} → 3）')
+        removals = removals[:3]
+    if ignored_removals:
+        warnings.append(
+            'tag_removals 里有卡片没有的标签，已忽略: ' + '、'.join(ignored_removals[:5]),
+        )
+    result_payload['tag_removals'] = removals
+    result_payload['remove_tags'] = [item['name'] for item in removals]
+
     if dry_run:
         result_payload['dry_run'] = True
         return {'status': 'done', 'result': result_payload, 'usage': usage}
 
     if apply_mode == 'review':
-        # 待审批：不写盘，也不记入 card_meta（避免被幂等判定误认为已分析）
+        # 待审批：不写盘。但 **content_hash 必须记**（C14）——
+        # 否则 `skip_unchanged` 永远不生效，同一张卡重复提交就重复烧钱。
+        # 只记 hash/profile/model，不记 `applied_at`（那才是「已落地」的判据）。
+        try:
+            store.update_card_meta(ui_key, {
+                'content_hash': content_hash,
+                'profile_id': profile.get('id', ''),
+                'model': model_name,
+                'analyzed_at': int(time.time()),
+            })
+        except Exception:  # noqa: BLE001
+            logger.warning('登记待审卡片的内容指纹失败', exc_info=True)
         return {'status': 'awaiting_review', 'result': result_payload, 'usage': usage}
 
     # ---- auto：按 task spec 的 apply_actions 落地 ----
@@ -652,6 +712,12 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         context={
             'ui_key': ui_key,
             'accepted_tags': accepted_tags,
+            # C13：删标签是**不可逆**的，只有调用方显式要求（`apply_removals`）
+            # 才在 auto 模式落地；review 模式由审批页逐条勾选后走 apply 路由。
+            'removable_tags': (
+                [item['name'] for item in removals]
+                if apply_removals else []
+            ),
             'worldbook_source': None,
         },
     )
@@ -1499,9 +1565,17 @@ def classify_one(*, api, store, config, ctx, card_id, ui_key, current_category,
         result_payload['error'] = 'classify_failed'
         return {'status': 'failed', 'result': result_payload, 'usage': usage}
 
-    # 已经在目标分类 → 幂等跳过
+    # 模型自认不确定（category 留空）→ 不移动，等人工指定（auto 也不例外）。
+    # 少了这一步，auto 模式会把卡「移动」到空分类就成了根目录。
+    if not decision['category']:
+        result_payload['skipped'] = 'undecided'
+        result_payload['skipped_label'] = '模型认为不属于任何候选分类，需人工指定'
+        return {'status': 'awaiting_review', 'result': result_payload, 'usage': usage}
+
+    # 已经在目标分类 → 幂等跳过（P1-8：重复跑不该重复产待审项）
     if decision['category'] == current_category and not force:
-        result_payload['skipped'] = 'unchanged'
+        result_payload['skipped'] = 'already_in_place'
+        result_payload['skipped_label'] = '卡片已经在这个分类里'
         return {'status': 'done', 'result': result_payload, 'usage': usage,
                 'applied': False}
 
@@ -1936,6 +2010,20 @@ def run_agent(ctx, *, api, store) -> None:
     catalog = agent_core.build_catalog(rows, budget=budget)
     existing_context = proposal_core.format_existing_context(categories, tags)
 
+    # C23：默认轮次按库规模动态给。
+    #
+    # 固定 6 轮在几十张卡的库里会被 read 吃光（实测 `max_iterations=4` 时 4 轮
+    # 全用于读卡 → 第一轮作业就 `no_finalize`）。公式取 §3.2 的
+    # `min(ceil(卡数 / 6), 12)`；调用方显式指定时不动。
+    raw_budget = payload.get('budget') if isinstance(payload.get('budget'), dict) else {}
+    if raw_budget.get('max_iterations') is None:
+        card_total = max(1, int(catalog['stats']['total'] or 1))
+        budget['max_iterations'] = max(4, min(12, (card_total + 5) // 6))
+        ctx.log(
+            'info',
+            f'轮次按库规模自适应：{card_total} 张卡 → {budget["max_iterations"]} 轮',
+        )
+
     if not catalog['lines']:
         message = '卡片库里没有可分析的卡片'
         ctx.report(key, status='failed', error='empty_library',
@@ -1973,6 +2061,9 @@ def run_agent(ctx, *, api, store) -> None:
     finalize_data = None
     blocked_reason = ''
     stop_reason = ''
+    # 轮次用尽后是否补过一次 finalize 请求（C23）。与「循环轮次」分开记账，
+    # 否则「最多 N 轮」的语义会被悄悄改掉。
+    nudged = False
 
     ctx.set_message('Agent 正在规划…')
 
@@ -2152,6 +2243,59 @@ def run_agent(ctx, *, api, store) -> None:
         stop_reason = 'max_iterations'
         iterations = budget['max_iterations']
 
+    # ---- C23：轮次用尽仍未 finalize → 补一次「直接出提议」的请求 ----
+    #
+    # 实测最常见的失败是「轮次全花在 read 上」，而模型其实已经读够了。
+    # 补一次调用把它救回来，比整轮重跑（再读一遍卡）便宜得多。
+    # 与计划里的「轮次 ×1.5 重试」目标一致，但成本有界、不浪费读取配额。
+    if finalize_data is None and stop_reason == 'max_iterations' and not ctx.should_cancel():
+        ctx.log('warning', '轮次用尽仍未提交提议，追加一次 finalize 请求')
+        nudged = True
+        transcript.append({
+            'role': 'user',
+            'content': (
+                '【轮次已用尽】请不要再读卡，立刻基于已获得的信息输出：'
+                '{"action": "finalize", "categories": [...], "tag_merges": [...], '
+                '"rationale": "..."}'
+            ),
+        })
+        rendered = prompt_core.render_messages(profile, base_variables, task='agent')
+        messages = list(rendered['messages'])
+        for message in messages:
+            if message.get('role') == 'system':
+                message['content'] = message['content'] + '\n\n' + instruction
+                break
+        else:
+            messages.insert(0, {'role': 'system', 'content': instruction})
+        messages.extend(transcript)
+        try:
+            result = llm.chat(
+                messages,
+                provider=provider, api_key=api_key, extra_headers=extra_headers,
+                model=model_name,
+                temperature=profile.get('temperature'), top_p=profile.get('top_p'),
+                max_tokens=profile.get('max_tokens'), stop=profile.get('stop'),
+                extra_body=profile.get('extra_body'),
+                cancel_check=ctx.should_cancel,
+            )
+        except AiAssistantError as exc:
+            if exc.code in FATAL_CODES:
+                _abort(ctx, exc.code, exc.message, total)
+                return
+            logger.warning('补 finalize 的调用失败: %s', exc.code)
+        else:
+            usage = result.get('usage') or {}
+            usage_totals['prompt_tokens'] += int(usage.get('prompt_tokens') or 0)
+            usage_totals['completion_tokens'] += int(usage.get('completion_tokens') or 0)
+            try:
+                action = agent_core.parse_action(agent_core.extract_json(result.get('content')))
+            except agent_core.ProtocolError:
+                action = None
+            if action and action['kind'] == agent_core.ACTION_FINALIZE:
+                finalize_data = action['proposal']
+                stop_reason = 'finalize_after_nudge'
+                ctx.log('info', '补 finalize 成功')
+
     # ---- 落地 ----
     if finalize_data is None:
         message = (
@@ -2162,6 +2306,7 @@ def run_agent(ctx, *, api, store) -> None:
         ctx.report(key, status='failed', error='no_finalize',
                    result={'error': 'no_finalize', 'message': message,
                            'iterations': iterations,
+                           'finalize_nudge': nudged,
                            'cards_read': read_state['cards_read']})
         ctx.set_summary({
             'items': total, 'failed': 1, 'iterations': iterations,
@@ -2179,6 +2324,8 @@ def run_agent(ctx, *, api, store) -> None:
 
     proposal['agent_meta'] = {
         'iterations': iterations,
+        'max_iterations': budget['max_iterations'],
+        'finalize_nudge': nudged,
         'cards_read': read_state['cards_read'],
         'max_reads': budget['max_reads'],
         'catalog_total': catalog['stats']['total'],

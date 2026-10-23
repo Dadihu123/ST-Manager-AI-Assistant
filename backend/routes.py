@@ -649,6 +649,8 @@ def register_routes(api, store) -> None:
             'dry_run': bool(payload.get('dry_run')),
             'force': force,
             'apply_tags': bool(payload.get('apply_tags', config['apply_tags'])),
+            # C13：auto 模式下是否**真的删**标签。默认关（不可逆，保守）。
+            'apply_removals': bool(payload.get('apply_removals', False)),
             'strict': bool(payload.get('strict', config['validation_strict'])),
             'budget_tokens': int(payload.get('budget_tokens') or 0),
             'secret_ref': SECRET_REF_TEMPLATE.format(provider_id=provider['id']),
@@ -1267,6 +1269,14 @@ def register_routes(api, store) -> None:
         failed = 0
         details = []
 
+        # C13：用户在审批页勾选的删除项（默认一条都没有）。只删「这条结果里
+        # 明确建议删除、且卡片上确实存在」的标签——删标签不可逆。
+        selected_removals = {
+            str(item).strip()
+            for item in (payload.get('remove_tags') or [])
+            if str(item or '').strip()
+        }
+
         for item in items:
             if str(item.get('status') or '') != 'done':
                 continue
@@ -1311,15 +1321,39 @@ def register_routes(api, store) -> None:
                     details.append({'card_id': card_id,
                                     'warning': f'概览降级写入: {bridge_result.get("message", "")}'})
 
-            if tags and apply_tags_enabled:
+            if apply_tags_enabled:
                 tag_library = read_tag_library(api)
                 accepted, _suggested, _blocked = split_tags(tags, known_tag_set(tag_library))
-                if accepted:
-                    tag_result = api.cards.apply_tags([card_id], add=accepted, replace=False)
-                    if tag_result.get('failed'):
-                        failed += 1
-                        details.append({'card_id': card_id, 'error': 'write_failed'})
-                        continue
+            else:
+                accepted = []
+
+            wanted_removals = []
+            if selected_removals:
+                card_tags = {
+                    str(name).strip() for name in (card.get('tags') or [])
+                    if str(name or '').strip()
+                }
+                for entry in (result.get('tag_removals') or []):
+                    name = str(
+                        (entry or {}).get('name') if isinstance(entry, dict) else entry or '',
+                    ).strip()
+                    if name and name in selected_removals and name in card_tags:
+                        wanted_removals.append(name)
+
+            if accepted or wanted_removals:
+                tag_result = api.cards.apply_tags(
+                    [card_id], add=accepted, remove=wanted_removals, replace=False,
+                )
+                if tag_result.get('failed'):
+                    failed += 1
+                    details.append({'card_id': card_id, 'error': 'write_failed'})
+                    continue
+                if tag_result.get('added') or tag_result.get('removed'):
+                    details.append({
+                        'card_id': card_id,
+                        'added': list(tag_result.get('added') or []),
+                        'removed': list(tag_result.get('removed') or []),
+                    })
 
             applied_runs.append(run_id)
             store.update_card_meta(ui_key, {

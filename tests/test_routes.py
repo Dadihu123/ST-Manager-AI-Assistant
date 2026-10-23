@@ -802,6 +802,57 @@ def test_outbound_ack_endpoint(env):
     assert store.outbound_acknowledged() is True
 
 
+# ------------------------------------------------------------------ C13 删标签落地
+#
+# 「只加不减」：模型指出的 tag_removals 以前没有任何落地通道。
+
+
+def _removal_row():
+    return job_item_row(result_overrides={
+        'tag_removals': [{'name': '奇幻', 'reason': '与卡片无关'}],
+        'remove_tags': ['奇幻'],
+    })
+
+
+def test_apply_removes_selected_tags_only(tmp_path):
+    client, api, _store = build_app(
+        cards={'Alice.png': dict(CARD, tags=['奇幻', '冒险'])},
+        db_rows=[_removal_row()], tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+
+    payload = client.post('/jobs/run-1/apply', json={'remove_tags': ['奇幻']}).get_json()
+
+    assert payload['success'] is True
+    removes = [entry['remove'] for entry in api.applied_tags if entry['remove']]
+    assert removes == [['奇幻']], '勾选的标签要真的被移除'
+
+
+def test_apply_does_not_remove_unselected_tags(tmp_path):
+    client, api, _store = build_app(
+        cards={'Alice.png': dict(CARD, tags=['奇幻', '冒险'])},
+        db_rows=[_removal_row()], tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+
+    client.post('/jobs/run-1/apply', json={}).get_json()
+
+    assert all(not entry['remove'] for entry in api.applied_tags), '默认一条都不删'
+
+
+def test_apply_ignores_removals_the_card_does_not_have(tmp_path):
+    """只删「结果里建议过 + 卡片确实有」的标签，防止误删。"""
+    client, api, _store = build_app(
+        cards={'Alice.png': dict(CARD, tags=['冒险'])},
+        db_rows=[_removal_row()], tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+
+    client.post('/jobs/run-1/apply', json={'remove_tags': ['奇幻']}).get_json()
+
+    assert all(not entry['remove'] for entry in api.applied_tags)
+
+
 # ------------------------------------------------------------------ C4：改写格式已删除
 #
 # 「改写格式」这个用户可选项被删掉了（§2.2）。响应里不再回传它，作业 payload
