@@ -265,6 +265,19 @@ class _FakeCards:
             })
 
         total = len(rows)
+        if tags:
+            wanted = {str(item) for item in tags}
+            rows = [
+                row for row in rows
+                if wanted <= {str(item) for item in (row.get('tags') or [])}
+            ]
+        if exclude_tags:
+            banned = {str(item) for item in exclude_tags}
+            rows = [
+                row for row in rows
+                if not (banned & {str(item) for item in (row.get('tags') or [])})
+            ]
+        total = len(rows)
         start = max(0, int(offset or 0))
         end = start + int(limit) if int(limit or 0) > 0 else None
         return {'items': rows[start:end], 'total': total, 'index_ready': True}

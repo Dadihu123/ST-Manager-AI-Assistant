@@ -1714,6 +1714,18 @@ def _apply_propose(api, store, run_id: str, job, payload) -> dict:
         except Exception:  # noqa: BLE001
             logger.debug('清理待审批登记失败', exc_info=True)
 
+    # P1-5：执行用户勾选的标签合并（`from` → `to`）。
+    #
+    # 以前这里只回传建议、`requires_manual_review` 恒 true——「合并」根本没有落地
+    # 通道。宿主的 `/api/batch_tags` 早有 `remove`，所以「重命名」= 逐卡
+    # add(to) + remove(from)，不需要宿主新增动作。
+    # **只执行审批页显式勾选的那几条**：删标签不可逆。
+    merges_executed = []
+    raw_merges = payload.get('merges')
+    if isinstance(raw_merges, list) and raw_merges:
+        for merge in raw_merges:
+            merges_executed.append(_execute_tag_merge(api, merge))
+
     # 只要有分类没建出来，就不能报「成功」。
     #
     # 修之前这里恒返回 `success: true`：实测 9/9 分类全部建不出来（P0-5 嵌套分类
@@ -1742,10 +1754,57 @@ def _apply_propose(api, store, run_id: str, job, payload) -> dict:
         created_tags=created_tags,
         existing_tags=existing_tags,
         failed_tags=failed_tags,
-        # 合并建议只回传、不执行 —— 它会改卡片标签
+        # 合并建议：原样回传（未执行的）；执行结果单独给一份
         tag_merges=plan.get('tag_merges') or [],
-        requires_manual_review=bool(plan.get('tag_merges')),
+        merges_executed=merges_executed,
+        requires_manual_review=bool(plan.get('tag_merges')) and not merges_executed,
     )
+
+
+def _execute_tag_merge(api, merge) -> dict:
+    """把 `from` 标签下的卡片改挂 `to`，再删掉 `from`。
+
+    `from` 允许是字符串或字符串数组（propose 的 `tag_merges[].from` 是数组，
+    表示多个近义标签合并到一个规范名）。返回每个来源标签的移动条数。
+    """
+    data = merge if isinstance(merge, dict) else {}
+    target = str(data.get('to') or '').strip()
+    raw_from = data.get('from')
+    sources = raw_from if isinstance(raw_from, list) else [raw_from]
+    sources = [str(item or '').strip() for item in sources]
+    sources = [item for item in sources if item and item != target]
+
+    result = {'from': sources, 'to': target, 'moved': 0, 'failed': [], 'error': ''}
+    if not target or not sources:
+        result['error'] = 'invalid_merge'
+        return result
+
+    for source in sources:
+        try:
+            listing = api.cards.list(tags=[source], limit=0)
+        except Exception:  # noqa: BLE001 - 索引不可用不该炸掉整个落地
+            logger.warning('按标签列卡失败: %s', source, exc_info=True)
+            result['error'] = 'list_failed'
+            continue
+
+        card_ids = [
+            str(item.get('id') or '')
+            for item in (listing.get('items') or [])
+            if isinstance(item, dict) and str(item.get('id') or '').strip()
+        ]
+        for card_id in card_ids:
+            try:
+                outcome = api.cards.apply_tags([card_id], add=[target], remove=[source])
+            except Exception:  # noqa: BLE001
+                logger.warning('合并标签失败: %s → %s', source, target, exc_info=True)
+                result['failed'].append(card_id)
+                continue
+            if outcome.get('failed'):
+                result['failed'].append(card_id)
+            else:
+                result['moved'] += 1
+
+    return result
 
 
 def _injected_transport():

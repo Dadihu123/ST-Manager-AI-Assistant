@@ -886,12 +886,12 @@ def test_submit_wi_rewrite_ignores_target_format(tmp_path, monkeypatch):
 # 用户以为方案已经落地。
 
 
-def _propose_row(categories, tags=()):
+def _propose_row(categories, tags=(), merges=()):
     result = {
         'plan': {
             'create_categories': list(categories),
             'create_tags': list(tags),
-            'tag_merges': [],
+            'tag_merges': list(merges),
         },
     }
     return {
@@ -979,3 +979,63 @@ def test_categories_endpoint_passes_through_objects(tmp_path):
 
     payload = client.get('/categories').get_json()
     assert payload['items'] == [{'path': '同人/动漫', 'name': '动漫', 'count': 12}]
+
+
+# ------------------------------------------------------------------ P1-5 标签合并执行
+#
+# 修之前 `tag_merges` 只展示、`requires_manual_review` 恒 true —— 「合并」根本没有
+# 落地通道。宿主的 batch_tags 早有 remove，所以「重命名」= add(to) + remove(from)。
+
+
+def _card_row(card_id, tags):
+    return {'id': card_id, 'char_name': card_id, 'tags': list(tags)}
+
+
+def test_propose_apply_executes_selected_tag_merges(tmp_path):
+    merge = {'from': ['旧名', '别称'], 'to': '规范名'}
+    client, api, _store = build_app(
+        db_rows=[_card_row('a.png', ['旧名', '奇幻']), _card_row('b.png', ['别称'])],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.propose', 'status': 'completed'}
+    api.job_items = [_propose_row([], merges=[merge])]
+
+    payload = client.post('/jobs/run-1/apply', json={'merges': [merge]}).get_json()
+
+    assert payload['success'] is True
+    executed = payload['merges_executed'][0]
+    assert executed['to'] == '规范名'
+    assert executed['moved'] == 2
+    assert executed['failed'] == []
+    assert payload['requires_manual_review'] is False
+
+    moves = {(entry['card_ids'][0], tuple(entry['remove'])): entry['add'] for entry in api.applied_tags}
+    assert moves[('a.png', ('旧名',))] == ['规范名']
+    assert moves[('b.png', ('别称',))] == ['规范名']
+
+
+def test_propose_apply_does_not_merge_without_selection(tmp_path):
+    merge = {'from': ['旧名'], 'to': '规范名'}
+    client, api, _store = build_app(
+        db_rows=[_card_row('a.png', ['旧名'])], tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.propose', 'status': 'completed'}
+    api.job_items = [_propose_row([], merges=[merge])]
+
+    payload = client.post('/jobs/run-1/apply', json={}).get_json()
+
+    assert payload['merges_executed'] == []
+    assert payload['requires_manual_review'] is True, '没勾选就还是「需人工处理」'
+    assert all(not entry['remove'] for entry in api.applied_tags)
+
+
+def test_propose_apply_reports_invalid_merge(tmp_path):
+    client, api, _store = build_app(db_rows=[], tmp_path=tmp_path)
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.propose', 'status': 'completed'}
+    api.job_items = [_propose_row([], merges=[])]
+
+    payload = client.post(
+        '/jobs/run-1/apply', json={'merges': [{'from': ['x'], 'to': ''}]},
+    ).get_json()
+
+    assert payload['merges_executed'][0]['error'] == 'invalid_merge'

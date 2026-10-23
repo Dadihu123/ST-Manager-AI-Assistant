@@ -391,11 +391,24 @@ export function createReview(api, client, context) {
     if (jobType === 'ai.propose' || jobType === 'ai.agent') {
       const result = (state.items[0] || {}).result || {};
       const plan = result.plan || {};
-      return {
+      const payload = {
         items: accepted,
         categories: selectedOf('categories', plan.create_categories || []),
         tags: selectedOf('tags', plan.create_tags || []),
       };
+      // P1-5：勾选的合并建议才执行（默认全不勾 —— 合并会删掉来源标签）。
+      const allMerges = Array.isArray(plan.tag_merges) ? plan.tag_merges : [];
+      const picked = selectedOf('merge', null);
+      if (Array.isArray(picked) && picked.length) {
+        payload.merges = picked
+          .map((index) => allMerges[Number(index)])
+          .filter(Boolean)
+          .map((merge) => ({
+            from: Array.isArray(merge.from) ? merge.from : [merge.from].filter(Boolean),
+            to: String(merge.to || ''),
+          }));
+      }
+      return payload;
     }
     if (jobType === 'ai.analyze') {
       const payload = {
@@ -739,12 +752,25 @@ function renderProposeItem(result) {
 
   const merges = Array.isArray(plan.tag_merges) ? plan.tag_merges : [];
   if (merges.length) {
-    wrap.append(el('div', 'plugin-stm-ai-assistant-subtitle', '标签合并建议（需人工处理，不会自动执行）'));
+    wrap.append(el(
+      'div',
+      'plugin-stm-ai-assistant-subtitle',
+      '标签合并建议（勾选后点「确认写入」才执行：把来源标签下的卡改挂到目标标签，再删来源）',
+    ));
     const list = el('div', 'plugin-stm-ai-assistant-checks');
-    merges.forEach((merge) => {
-      const from = (merge && merge.from) || '';
-      const to = (merge && merge.to) || '';
-      list.append(el('div', 'plugin-stm-ai-assistant-note', `${from} → ${to}`));
+    merges.forEach((merge, index) => {
+      const rawFrom = (merge && merge.from) || '';
+      const from = Array.isArray(rawFrom) ? rawFrom.join('、') : String(rawFrom);
+      const to = String((merge && merge.to) || '');
+      const reason = merge && merge.reason ? `：${merge.reason}` : '';
+      const label = el('label', 'plugin-stm-ai-assistant-checkbox');
+      const box = el('input');
+      box.type = 'checkbox';
+      box.checked = false;              // 删标签不可逆，默认不勾
+      box.dataset.merge = String(index);
+      box.dataset.marqueeIgnore = 'true';
+      label.append(box, el('span', '', `${from} → ${to}${reason}`));
+      list.append(label);
     });
     wrap.append(list);
   }

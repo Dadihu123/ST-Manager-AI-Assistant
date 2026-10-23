@@ -561,6 +561,58 @@ async function main() {
     assert.equal(boxes.length >= 1, true, '没渲染出删除勾选框');
     assert.equal(boxes.every((node) => node.checked === false), true, '默认必须是未勾选');
   });
+
+  // P1-5：合并建议勾选后才执行（默认不勾 —— 合并会删掉来源标签）。
+  await check('提议的标签合并默认不勾选', async () => {
+    const base = createFakeApi({ pending: 1 });
+    const job = {
+      success: true,
+      job: {
+        run_id: 'run-merges', job_type: 'ai.propose', status: 'completed',
+        total: 1, completed: 1, failed: 0, skipped: 0,
+        summary: {}, counts: { total: 1, completed: 1 },
+      },
+      items: [{
+        key: 'proposal',
+        status: 'awaiting_review',
+        result: {
+          plan: {
+            create_categories: ['题材/奇幻'],
+            create_tags: [],
+            tag_merges: [{ from: ['旧名', '别称'], to: '规范名', reason: '近义' }],
+          },
+        },
+      }],
+    };
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (path.startsWith('/jobs/') && !path.includes('/apply') && !path.includes('/items/')) {
+          return job;
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
+    await review.refresh();
+    review.focusRun('run-merges');
+    review.applyContext({ runId: 'run-merges' });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const texts = allNodes.map((node) => String(node.textContent || '')).filter(Boolean);
+    assert.equal(
+      texts.some((text) => text.includes('勾选后点')),
+      true,
+      '要说明「勾选后才执行」',
+    );
+    const mergeBoxes = allNodes.filter((node) => node.dataset && node.dataset.merge === '0');
+    assert.equal(mergeBoxes.length >= 1, true, '没渲染出合并勾选框');
+    assert.equal(mergeBoxes.every((node) => node.checked === false), true, '默认必须未勾选');
+  });
+
   await check('「全部接受」跳过有 block 问题的条目', async () => {
     const { createFakeApi: makeFake } = { createFakeApi };
     void makeFake;
