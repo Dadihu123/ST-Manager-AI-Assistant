@@ -818,6 +818,12 @@ def register_routes(api, store) -> None:
         if apply_mode not in ('auto', 'review'):
             apply_mode = config['apply_mode']
 
+        # 检查器策略（§6.1）：与 apply_mode 正交。非法值静默回落到 advise
+        # （旧客户端不会传它；它本身不改语义，只决定「拦不拦」）。
+        checker = str(payload.get('checker') or jobs_module.CHECKER_ADVISE).strip().lower()
+        if checker not in jobs_module.CHECKERS:
+            checker = jobs_module.CHECKER_ADVISE
+
         wanted = set(entry_uids)
         items = []
         unreadable = []
@@ -871,6 +877,7 @@ def register_routes(api, store) -> None:
             'apply_mode': apply_mode,
             'dry_run': bool(payload.get('dry_run')),
             'force': bool(payload.get('force')),
+            'checker': checker,
             # `target_format` 不再读取：格式意图写在提示词里（§2.2）。
             # 旧客户端仍可以传，只是被忽略（不报错 = 兼容）。
             # 单本时沿用旧字段（回写链路按它聚合）；多本时每项自带 worldbook_source
@@ -898,6 +905,7 @@ def register_routes(api, store) -> None:
             profile={'id': profile.get('id'), 'name': profile.get('name')},
             provider={'id': provider.get('id'), 'model': model_name},
             apply_mode=apply_mode,
+            checker=checker,
         )
 
     # ---------------------------------------------------------- 自动归类

@@ -40,6 +40,21 @@ def strip_think(text) -> str:
     return result.strip()
 
 
+def has_think_tag(text) -> bool:
+    """文本里是否含「思考段」标签（`<think>` / `<reasoning>` / `<analysis>` 等）。
+
+    世界书正文里**真的可能**出现这些标签（例如 `[核心] 战斗系统` 用 `<Analysis>`
+    做小节标题）。这类条目的候选不能再当思考段剥掉——否则候选正文被截断，
+    下游的「标签不丢」闸还会把模型判成改坏了（实测 `[核心] 中央统合系统`
+    的 `<Analysis>` 在 4/4 配置里都「消失」，很可能就是这么来的）。
+    """
+    source = '' if text is None else str(text)
+    if not source:
+        return False
+    probe = re.compile(r'</?(?:think(?:ing)?|reasoning|analysis)\b', re.IGNORECASE)
+    return bool(probe.search(source))
+
+
 def strip_fences(text) -> tuple:
     """剥离 Markdown 代码块围栏。
 

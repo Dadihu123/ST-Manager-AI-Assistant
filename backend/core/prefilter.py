@@ -134,11 +134,12 @@ def _text(value) -> str:
     return '' if value is None else str(value)
 
 
-def _yaml_tree(text: str):
+def parse_tree(text: str):
     """尽量把文本解析成 YAML 树；解析不了（或没有 pyyaml）返回 `None`。
 
     这里**只用于判断「是不是结构化数据」**，不参与改写结果的校验——
     校验侧仍然坚持「不做 YAML 解析」（见 `wicheck` 模块 docstring）。
+    `wicheck` 的「结构同构」闸也复用本函数（它比的是**结构**，不是格式合法性）。
     """
     if not text or len(text) > MAX_STRUCTURED_SCAN:
         return None
@@ -160,7 +161,7 @@ def _has_nested(tree) -> bool:
 
 def is_structured(text: str) -> bool:
     """文本是否是一棵「大或嵌套」的结构化树。"""
-    tree = _yaml_tree(text)
+    tree = parse_tree(text)
     if not isinstance(tree, (dict, list)):
         return False
     if len(tree) >= STRUCTURED_MIN_KEYS:

@@ -3,10 +3,14 @@
 **核心立场**（设计文档 §6.3）：这是「让 AI 优先按 YAML 输出」的提示词约束，
 **不是**「产出程序可解析的 YAML」。所以：
 
-- 不引入 `pyyaml`，不做 `safe_load` 校验；
-- 只校验「内容有没有被破坏」：宏、HTML、压缩比、长度比、专有名词、调度字段。
+- 不做「格式合法性」校验（不要求输出一定是合法 YAML）；
+- 只校验「内容有没有被破坏」：宏、HTML、代码块、标签、数字、结构、INI 段、
+  语言、专有名词、调度字段。
 
-测试因此不测「YAML 合不合法」，只测「设定有没有丢、程序字段有没有被改」。
+结构同构（§12.2）会借 `yaml.safe_load` 把**原文**解析成树来比对形状——
+借的是「原文本来就是树」，不是要求候选是合法 YAML。
+
+两级判定的语义见 §6.3：`issues` = block（默认不落地），`warnings` = note（只显示）。
 """
 
 import pytest
@@ -198,6 +202,214 @@ def test_unchanged_schedule_fields_pass():
     assert not any('调度字段' in item for item in result['issues'])
 
 
+# ------------------------------------------------------------------ C15 代码/注释逐字
+#
+# 实测教训：EJS 块数 7→7 没变，但块内注释被改了 —— 只比块数量抓不到。
+
+
+def test_code_block_kept_verbatim_passes():
+    src = '<% /* 保留这条注释 */ if (x) { %>正文<% } %>' + '设定。' * 20
+    dst = '<% /* 保留这条注释 */ if (x) { %>正文<% } %>' + '设定。' * 10
+    assert wicheck.validate_rewrite(src, dst)['ok'] is True
+
+
+def test_code_block_edited_inside_is_an_issue():
+    """块数相同、块内被改写 → 必须拦。"""
+    src = '<% /* 原注释 */ %>正文' + '设定。' * 20
+    dst = '<% /* 新注释 */ %>正文' + '设定。' * 10
+    result = wicheck.validate_rewrite(src, dst)
+    assert result['ok'] is False
+    assert any('代码/注释被改动' in item for item in result['issues'])
+
+
+def test_comment_line_kept_verbatim():
+    """T5：`#` 注释行要逐字保留（`[核心] 战斗引擎` 这类条目靠它写规则）。"""
+    src = '# 暴击率上限 0.75\n战斗规则：' + '设定。' * 20
+    kept = '# 暴击率上限 0.75\n战斗规则：' + '设定。' * 10
+    dropped = '战斗规则：' + '设定。' * 10
+    assert wicheck.validate_rewrite(src, kept)['ok'] is True
+    assert wicheck.validate_rewrite(src, dropped)['ok'] is False
+
+
+def test_code_block_trailing_spaces_are_ignored():
+    src = 'def foo():   \n    return 1' + '设定。' * 20
+    dst = 'def foo():\n    return 1' + '设定。' * 10
+    result = wicheck.validate_rewrite(src, dst)
+    assert not any('代码/注释被改动' in item for item in result['issues'])
+
+
+# ------------------------------------------------------------------ C16 结构同构
+#
+# MVU 的 61 条变量路径被压成 14 个甚至一句话，结构已经坏了却判通过。
+
+
+SRC_TREE = """好感度:
+  初始: 0
+  上限: 100
+状态:
+  阶段: 初期"""
+
+
+def test_same_structure_passes():
+    assert wicheck.validate_rewrite(SRC_TREE, SRC_TREE)['ok'] is True
+
+
+def test_missing_path_is_an_issue():
+    dst = """好感度:
+  初始: 0
+状态:
+  阶段: 初期"""
+    result = wicheck.validate_rewrite(SRC_TREE, dst)
+    assert result['ok'] is False
+    assert any('结构被破坏' in item for item in result['issues'])
+
+
+def test_flattened_container_is_an_issue():
+    """容器被压成字符串（`好感度: "初始 0 上限 100"`）同样算破坏。"""
+    dst = """好感度: 初始 0 上限 100
+状态: 初期"""
+    result = wicheck.validate_rewrite(SRC_TREE, dst)
+    assert result['ok'] is False
+    assert any('结构被破坏' in item for item in result['issues'])
+
+
+def test_unparseable_original_skips_structure_gate():
+    """原文本来就不是树 → 不判结构（散文条目不该被这条误伤）。"""
+    src = '这是一段散文。' + '细节。' * 20
+    dst = '这是一段散文。' + '细节。' * 10
+    assert wicheck.validate_rewrite(src, dst)['ok'] is True
+
+
+def test_candidate_not_parseable_is_an_issue():
+    dst = '好感度 初始 0 上限 100 状态 阶段 初期'
+    result = wicheck.validate_rewrite(SRC_TREE, dst)
+    assert result['ok'] is False
+    assert any('不再是原来的层级结构' in item for item in result['issues'])
+
+
+# ------------------------------------------------------------------ C17 标签集合与大小写
+
+
+def test_all_tags_kept_passes():
+    src = '<analysis>主线</analysis><分支>' + '设定。' * 20 + '</分支>'
+    dst = '<analysis>主线</analysis><分支>' + '设定。' * 10 + '</分支>'
+    assert wicheck.validate_rewrite(src, dst)['ok'] is True
+
+
+def test_lost_tag_is_an_issue():
+    """`<Analysis>` 在 4/4 配置里都被删（§12.3）——提示词改不掉，只能靠闸。"""
+    src = '<Analysis>' + '设定。' * 20 + '</Analysis>'
+    dst = '设定。' * 10
+    result = wicheck.validate_rewrite(src, dst)
+    assert result['ok'] is False
+    assert any('标签消失' in item for item in result['issues'])
+
+
+def test_tag_case_change_is_an_issue():
+    src = '<Analysis>' + '设定。' * 20 + '</Analysis>'
+    dst = '<analysis>' + '设定。' * 10 + '</analysis>'
+    result = wicheck.validate_rewrite(src, dst)
+    assert result['ok'] is False
+    assert any('大小写被改' in item for item in result['issues'])
+
+
+def test_added_tag_is_not_an_issue():
+    """新增标签不算破坏（不禁止模型补结构）。"""
+    src = '正文' + '设定。' * 20
+    dst = '<note>正文' + '设定。' * 10 + '</note>'
+    assert wicheck.validate_rewrite(src, dst)['ok'] is True
+
+
+# ------------------------------------------------------------------ C18 数字集合
+
+
+def test_lost_number_is_an_issue():
+    src = '暴击率 0.75，上限 30 级。' + '设定。' * 20
+    dst = '暴击率很高，上限可观。' + '设定。' * 10
+    result = wicheck.validate_rewrite(src, dst)
+    assert result['ok'] is False
+    assert any('数字丢失' in item for item in result['issues'])
+
+
+def test_kept_numbers_pass_even_if_reordered():
+    src = '力量 30，敏捷 12。' + '设定。' * 20
+    dst = '敏捷 12，力量 30。' + '设定。' * 10
+    assert wicheck.validate_rewrite(src, dst)['ok'] is True
+
+
+def test_decimal_numbers_are_compared_as_is():
+    src = '上限 0.75。' + '设定。' * 20
+    dst = '上限 0.7。' + '设定。' * 10
+    result = wicheck.validate_rewrite(src, dst)
+    assert result['ok'] is False
+    assert any('数字丢失' in item for item in result['issues'])
+
+
+# ------------------------------------------------------------------ C19 INI 段完整
+
+
+SRC_INI = """[ROTOM_DEX]
+图鉴
+
+[ROTOM_MAP]
+地图
+
+[ROTOM_GEAR]
+道具"""
+
+
+def test_all_ini_sections_kept_passes():
+    assert wicheck.validate_rewrite(SRC_INI, SRC_INI)['ok'] is True
+
+
+def test_lost_ini_section_is_an_issue():
+    dst = """[ROTOM_DEX]
+图鉴
+
+[ROTOM_MAP]
+地图"""
+    result = wicheck.validate_rewrite(SRC_INI, dst)
+    assert result['ok'] is False
+    assert any('INI/状态栏段丢失' in item for item in result['issues'])
+
+
+def test_no_section_in_original_skips_ini_gate():
+    src = '纯散文' + '设定。' * 20
+    dst = '纯散文' + '设定。' * 10
+    assert wicheck.validate_rewrite(src, dst)['ok'] is True
+
+
+# ------------------------------------------------------------------ C20 整篇翻译
+
+
+SRC_EN = (
+    'The northern fortress stands on a frozen lake. Its walls are three meters thick '
+    'and the garrison numbers forty soldiers under Captain Aldric. '
+    'The gate opens at dawn and closes at dusk.'
+)
+
+
+def test_translated_entry_is_an_issue():
+    dst = '北方要塞建在冰封的湖面上。城墙厚三米，由奥尔德里克队长率领四十名士兵驻守。城门黎明开、黄昏闭。'
+    result = wicheck.validate_rewrite(SRC_EN, dst)
+    assert result['ok'] is False
+    assert any('整篇翻译' in item for item in result['issues'])
+
+
+def test_english_entry_staying_english_passes():
+    dst = (
+        'The northern fortress stands on a frozen lake. Its walls are three meters '
+        'thick and the garrison numbers forty soldiers under Captain Aldric.'
+    )
+    assert wicheck.validate_rewrite(SRC_EN, dst)['ok'] is True
+
+
+def test_chinese_entry_with_english_terms_is_not_translation():
+    src = '技能使用 Magic Missile 与 Fireball，冷却 3 秒。' + '设定。' * 20
+    dst = '技能使用 Magic Missile 与 Fireball，冷却 3 秒。' + '设定。' * 10
+    assert wicheck.validate_rewrite(src, dst)['ok'] is True
+
+
 # ------------------------------------------------------------------ 提示词
 #
 # 「改写格式」这个可选项已删除（C3/C4，设计文档 §2.2）：格式意图写在固定规则里。
@@ -317,37 +529,184 @@ def test_run_wi_rewrite_writes_back_after_validation(env, monkeypatch):
     assert '设定内容。' * 15 in writes[0]['data']['entries'][0]['content']
 
 
-def test_run_wi_rewrite_rejects_failed_validation(env, monkeypatch):
-    """校验不过就不写回，条目状态为 failed。
+# ------------------------------------------------------------------ C21 检查器策略
+#
+# §6.2 的判定矩阵。三条硬规则：
+#   ① 任何情况下都不删候选、不禁止采纳；
+#   ② `off` 不看 issue，按 apply_mode 落地；
+#   ③ `enforce` 有 block 级 issue 就进待审（auto 也不写）。
 
-    触发方式刻意用**自定义标签被改成不平衡**，而不是「压缩过度」：
-    后者现在只是 note（C1），测不出失败路径。
-    也不能用布局 HTML（`<div>`）或宏——那些会被前置过滤挡在批次外（C5）。
-    """
+BODY = '这是一段很长的世界观设定内容，包含大量细节。'
+
+
+def _blocked_rewrite(env, monkeypatch, *, checker=None, apply_mode='auto', clean=False):
+    """跑一次改写：`clean=True` 时候选干净，否则丢掉闭合标签 → block。"""
     api, store = env
-    body = '这是一段很长的世界观设定内容，包含大量细节。'
-    # 原文配平、候选丢掉闭合标签 → `block`
-    book = _book([{
-        'uid': '1', 'comment': 'X', 'keys': [],
-        'content': '<analysis>主线：魔法来自「元素之心」。</analysis>' + body * 20,
-    }])
+    src = '<analysis>主线：魔法来自「元素之心」。</analysis>' + BODY * 20
+    book = _book([{'uid': '1', 'comment': 'X', 'keys': [], 'content': src}])
     api.worldbook.read = lambda source: book
     writes = []
     api.worldbook.write = lambda *a, **k: writes.append(a) or {'success': True}
 
+    content = (
+        '<analysis>主线：魔法来自「元素之心」。</analysis>' + BODY * 10
+        if clean else
+        '<analysis>主线：魔法来自「元素之心」。' + BODY * 10
+    )
     monkeypatch.setattr(jobs.llm, 'chat', lambda messages, **kwargs: {
-        'content': '<analysis>主线：魔法来自「元素之心」。' + body * 10,
-        'usage': {'prompt_tokens': 10, 'completion_tokens': 5},
+        'content': content, 'usage': {'prompt_tokens': 10, 'completion_tokens': 5},
+    })
+
+    payload = {'provider_id': 'openai', 'apply_mode': apply_mode}
+    if checker:
+        payload['checker'] = checker
+    ctx = FakeCtx([{'key': '1', 'payload': {'card_id': 'Alice.png', 'entry_uid': '1'}}],
+                  payload=payload)
+    jobs.run_wi_rewrite(ctx, api=api, store=store)
+    return ctx, writes
+
+
+def test_advise_keeps_candidate_in_review_instead_of_failing(env, monkeypatch):
+    """T10：advise 下有条目问题也**不判失败**，进待审、候选留着、可手动采纳。"""
+    ctx, writes = _blocked_rewrite(env, monkeypatch, checker='advise', apply_mode='review')
+
+    assert ctx.summary['failed'] == 0, '校验问题不是「作业失败」'
+    assert ctx.summary['awaiting_review'] == 1
+    assert writes == []
+    report = ctx.reports[0]
+    assert report['status'] == 'awaiting_review'
+    assert report['result']['candidate'], '候选必须保留，否则用户没法手动采纳'
+    assert report['result']['issues'], '问题要标出来'
+    assert report['result']['block_count'] >= 1
+
+
+def test_enforce_holds_blocked_candidate(env, monkeypatch):
+    """T9：auto + enforce，被拦的那条进待审、不写盘，回执单独计数。"""
+    ctx, writes = _blocked_rewrite(env, monkeypatch, checker='enforce', apply_mode='auto')
+
+    assert writes == [], 'enforce 下有问题不得自动写回'
+    assert ctx.summary['held'] == 1
+    assert ctx.summary['applied'] == 0
+    assert ctx.summary['written'] == 0
+    report = ctx.reports[0]
+    assert report['status'] == 'awaiting_review'
+    assert report['result']['held_by_checker'] is True
+
+
+def test_enforce_writes_clean_candidate(env, monkeypatch):
+    """T9 的另一半：干净的照样自动落地。"""
+    ctx, writes = _blocked_rewrite(env, monkeypatch, checker='enforce', apply_mode='auto',
+                                   clean=True)
+
+    assert ctx.summary['held'] == 0
+    assert ctx.summary['applied'] == 1
+    assert ctx.summary['written'] == 1
+    assert len(writes) == 1
+
+
+def test_checker_off_writes_even_with_issues(env, monkeypatch):
+    """`off` = 全部落地不做检查：问题照旧回传，但不影响写入。"""
+    ctx, writes = _blocked_rewrite(env, monkeypatch, checker='off', apply_mode='auto')
+
+    assert ctx.summary['applied'] == 1
+    assert ctx.summary['written'] == 1
+    assert len(writes) == 1
+    assert ctx.reports[0]['result']['issues'], '问题仍然要回传（只是不拦）'
+
+
+def test_advise_in_auto_mode_still_writes(env, monkeypatch):
+    """advise 只是「标记」，不改落地决策（旧行为保持）。"""
+    ctx, writes = _blocked_rewrite(env, monkeypatch, checker='advise', apply_mode='auto')
+
+    assert len(writes) == 1
+    assert ctx.summary['applied'] == 1
+
+
+def test_identical_candidate_is_skipped_as_unchanged(env, monkeypatch):
+    """T7：逐字节相同 → `skipped: unchanged`，不写回、也不算失败。
+
+    实测 `[MVU] InitVar` 就是原样返回：写一次同样的内容只会让世界书版本+1，
+    用户什么都得不到。
+    """
+    api, store = env
+    src = BODY * 20
+    book = _book([{'uid': '1', 'comment': 'X', 'keys': [], 'content': src}])
+    api.worldbook.read = lambda source: book
+    writes = []
+    api.worldbook.write = lambda *a, **k: writes.append(a) or {'success': True}
+    monkeypatch.setattr(jobs.llm, 'chat', lambda messages, **kwargs: {
+        'content': src, 'usage': {'prompt_tokens': 10, 'completion_tokens': 5},
     })
 
     ctx = FakeCtx([{'key': '1', 'payload': {'card_id': 'Alice.png', 'entry_uid': '1'}}],
-                  payload={'provider_id': 'openai', 'apply_mode': 'auto'})
+                  payload={'provider_id': 'openai', 'apply_mode': 'auto', 'checker': 'enforce'})
     jobs.run_wi_rewrite(ctx, api=api, store=store)
 
-    assert ctx.summary['failed'] == 1
-    assert writes == [], '校验失败不得写回'
-    assert ctx.reports[0]['status'] == 'failed'
-    assert any('HTML 未配平' in item for item in ctx.reports[0]['result']['issues'])
+    report = ctx.reports[0]
+    assert report['result']['skipped'] == 'unchanged'
+    assert writes == [], '原样返回不得写回'
+    assert ctx.summary['written'] == 0
+    assert ctx.summary['skipped'] == 1, '算「无需处理」，不算失败'
+    assert ctx.summary['failed'] == 0
+
+
+def test_changed_but_longer_candidate_still_writes(env, monkeypatch):
+    """T8：有差异但变长 → 正常落地，只在 note 里说明。"""
+    api, store = env
+    src = BODY * 20
+    book = _book([{'uid': '1', 'comment': 'X', 'keys': [], 'content': src}])
+    api.worldbook.read = lambda source: book
+    writes = []
+    api.worldbook.write = lambda *a, **k: writes.append(a) or {'success': True}
+    longer = src + '补充：这一段是模型自己加的。'
+    monkeypatch.setattr(jobs.llm, 'chat', lambda messages, **kwargs: {
+        'content': longer, 'usage': {'prompt_tokens': 10, 'completion_tokens': 5},
+    })
+
+    ctx = FakeCtx([{'key': '1', 'payload': {'card_id': 'Alice.png', 'entry_uid': '1'}}],
+                  payload={'provider_id': 'openai', 'apply_mode': 'auto', 'checker': 'enforce'})
+    jobs.run_wi_rewrite(ctx, api=api, store=store)
+
+    report = ctx.reports[0]
+    assert report['status'] == 'done'
+    assert not report['result']['issues'], '变长不是 block'
+    assert any('精简不明显' in item for item in report['result']['warnings'])
+    assert len(writes) == 1, '变长仍可正常落地'
+
+
+def test_summary_has_four_part_receipt(env, monkeypatch):
+    """§6.4：自动落地 / 检查拦下 / 无需处理 / 失败 四项都能从 summary 读到。"""
+    ctx, _writes = _blocked_rewrite(env, monkeypatch, checker='enforce', apply_mode='auto')
+    for key in ('applied', 'held', 'skipped', 'failed', 'awaiting_review'):
+        assert key in ctx.summary, key
+    assert ctx.summary['checker'] == 'enforce'
+
+
+def test_think_like_tag_in_original_is_not_stripped(env, monkeypatch):
+    """原文含 `<analysis>` 时，候选不能被当成「思考段」剥掉。
+
+    否则候选正文被截断，「标签不丢」闸还会把模型判成改坏了 ——
+    §12.3 的「`<Analysis>` 在 4/4 配置里都被删」很可能就是这么来的。
+    """
+    api, store = env
+    src = '<analysis>主线：魔法来自「元素之心」。</analysis>' + BODY * 20
+    book = _book([{'uid': '1', 'comment': 'X', 'keys': [], 'content': src}])
+    api.worldbook.read = lambda source: book
+    api.worldbook.write = lambda *a, **k: {'success': True}
+    monkeypatch.setattr(jobs.llm, 'chat', lambda messages, **kwargs: {
+        'content': '<analysis>主线：魔法来自「元素之心」。</analysis>' + BODY * 10,
+        'usage': {},
+    })
+
+    ctx = FakeCtx([{'key': '1', 'payload': {'card_id': 'Alice.png', 'entry_uid': '1'}}],
+                  payload={'provider_id': 'openai', 'apply_mode': 'review'})
+    jobs.run_wi_rewrite(ctx, api=api, store=store)
+
+    result = ctx.reports[0]['result']
+    assert '</analysis>' in result['candidate'], '候选里的标签不能被剥掉'
+    assert not any('标签消失' in item for item in result['issues'])
+
+
 
 
 def test_run_wi_rewrite_review_mode_defers_writeback(env, monkeypatch):

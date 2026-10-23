@@ -4,6 +4,19 @@ import pytest
 
 from stm_ai_core import parsing
 
+
+def test_has_think_tag_detects_reasoning_tags():
+    """世界书正文里真的会出现这些标签，剥之前要先看原文有没有。"""
+    for text in ('<analysis>x</analysis>', '<Think>', '前文 <reasoning>后文', '<thinking a="1">'):
+        assert parsing.has_think_tag(text) is True, text
+
+
+def test_has_think_tag_ignores_normal_text():
+    assert parsing.has_think_tag('普通正文，含 <小遥> 与 <branch> 标签') is False
+    assert parsing.has_think_tag('') is False
+    assert parsing.has_think_tag(None) is False
+
+
 #: v2 task spec 里「生成约束 + 后置校验」共用的那份声明
 SCHEMA = {
     'json_only': True,

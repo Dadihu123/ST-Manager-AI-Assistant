@@ -50,6 +50,17 @@ function itemKeyOf(item) {
   return String(item.key || item.item_key || '');
 }
 
+/**
+ * 条目是否有 **block 级**问题（`result.issues`）。
+ *
+ * `warnings` 是 note 级（变长/没精简/删得偏多），永不拦；只有 `issues`
+ * 才影响「批量接受」的默认行为（§6.2 硬规则 2）。
+ */
+function hasBlockIssues(item) {
+  const issues = (item && item.result && item.result.issues) || [];
+  return Array.isArray(issues) && issues.length > 0;
+}
+
 export function createReview(api, client, context) {
   const root = el('div', 'plugin-stm-ai-assistant-view is-review');
   const state = {
@@ -217,11 +228,22 @@ export function createReview(api, client, context) {
       const result = item.result || {};
       const row = el('div', 'plugin-stm-ai-assistant-review-item');
       row.dataset.status = String(item.status || '');
+      // 有 block 级问题的条目单独标出来：批量「全部接受」不会带走它们（§6.2）。
+      if (hasBlockIssues(item)) {
+        row.classList.add('is-blocked');
+        row.dataset.blocked = 'true';
+      }
 
       const head = el('div', 'plugin-stm-ai-assistant-review-head');
       head.append(toneBadge(ITEM_STATUS_LABELS[item.status] || item.status, item.status));
       head.append(el('span', 'plugin-stm-ai-assistant-review-key',
         String(result.card_id || itemKeyOf(item))));
+      if (hasBlockIssues(item)) {
+        head.append(toneBadge(
+          result.held_by_checker ? '检查拦下 · 需单独确认' : '有问题 · 需单独确认',
+          'error',
+        ));
+      }
 
       const actions = el('div', 'plugin-stm-ai-assistant-review-actions');
       if (item.status === 'awaiting_review') {
@@ -463,9 +485,23 @@ export function createReview(api, client, context) {
 
   async function bulkReview(status) {
     if (!state.runId) return;
-    const targets = state.items.filter((item) => item.status === 'awaiting_review');
+    let targets = state.items.filter((item) => item.status === 'awaiting_review');
+    // §6.2 硬规则 2：「全部接受」只接受**没有问题**的条目。
+    // 有 block 级 issue 的必须单独点，避免 0.35 置信度的错误归类被一把带走。
+    let heldByChecker = 0;
+    if (status === 'done') {
+      const clean = targets.filter((item) => !hasBlockIssues(item));
+      heldByChecker = targets.length - clean.length;
+      targets = clean;
+    }
     if (!targets.length) {
-      api.host.toast('没有待审批条目', 2400, 'settings-help-entry');
+      api.host.toast(
+        heldByChecker
+          ? `${heldByChecker} 条有问题，需要逐条确认`
+          : '没有待审批条目',
+        3600,
+        'close',
+      );
       return;
     }
     state.busy = true;
@@ -479,7 +515,11 @@ export function createReview(api, client, context) {
       if (result.failed.length) {
         api.host.toast(`${result.total - result.failed.length} 条已更新，${result.failed.length} 条失败`, 3600, 'close');
       } else {
-        api.host.toast(`已批量标记 ${targets.length} 条`, 2400, 'check');
+        api.host.toast(
+          `已批量标记 ${targets.length} 条` + (heldByChecker ? `，跳过 ${heldByChecker} 条有问题的` : ''),
+          3000,
+          'check',
+        );
       }
     } catch (error) {
       api.host.toast(`批量审批失败：${error.message}`, 3600, 'close');
@@ -555,13 +595,19 @@ function renderPolishItem(result) {
 
   const original = String(result.original || result.source_text || '');
   const candidate = String(result.candidate || '');
-  const metrics = result.token_ratio || result.original_tokens
-    ? `token ${formatNumber(result.original_tokens || 0)} → 比 ${result.token_ratio || '-'}`
-    : '';
+  // §6.4 的指标行：原 → 后（±差值），不出现「失败」字样
+  const metrics = result.metrics || {};
+  const origTokens = Number(metrics.orig_tokens ?? result.original_tokens ?? 0);
+  const candTokens = Number(metrics.cand_tokens ?? result.candidate_tokens ?? 0);
+  const delta = Number.isFinite(Number(metrics.delta))
+    ? Number(metrics.delta)
+    : candTokens - origTokens;
+  const deltaText = delta === 0 ? '未改，已足够精炼' : (delta > 0 ? `+${delta}，变长` : String(delta));
 
   wrap.append(statsRow([
-    { label: '原 token', value: formatNumber(result.original_tokens || 0) },
-    { label: '压缩比', value: String(result.token_ratio != null ? result.token_ratio : '-') },
+    { label: '原 token', value: formatNumber(origTokens) },
+    { label: '改写后', value: formatNumber(candTokens) },
+    { label: '差值', value: deltaText },
   ]));
 
   const diff = el('div', 'plugin-stm-ai-assistant-diff');
@@ -581,11 +627,18 @@ function renderPolishItem(result) {
       'warn',
     ));
   }
+  // note 级：只显示，永不拦（§6.3）
+  const notes = Array.isArray(result.warnings) ? result.warnings : [];
+  if (notes.length) {
+    wrap.append(banner(`提示：${notes.join('；')}`, 'warn'));
+  }
   const issues = Array.isArray(result.issues) ? result.issues : [];
   if (issues.length) {
-    wrap.append(banner(`校验未通过：${issues.join('；')}`, 'error'));
+    wrap.append(banner(
+      `检查器拦下（${issues.length} 项，仍可手动接受）：${issues.join('；')}`,
+      'error',
+    ));
   }
-  if (metrics) wrap.append(el('p', 'plugin-stm-ai-assistant-note', metrics));
   return wrap;
 }
 

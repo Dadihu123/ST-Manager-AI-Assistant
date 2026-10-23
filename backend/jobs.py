@@ -55,6 +55,18 @@ MODE_SUMMARY = 'summary'
 MODE_TAGS = 'tags'
 VALID_MODES = (MODE_BOTH, MODE_SUMMARY, MODE_TAGS)
 
+#: 检查器策略（设计文档 §6.1）。与 `apply_mode` 正交，UI 上合成三选一：
+#:
+#: | UI 选项 | apply_mode | checker |
+#: |---|---|---|
+#: | 先看再落地（默认，少量） | review | advise |
+#: | 检查通过的自动落地（批量） | auto | enforce |
+#: | 全部落地，不做检查 | auto | off |
+CHECKER_ADVISE = 'advise'
+CHECKER_ENFORCE = 'enforce'
+CHECKER_OFF = 'off'
+CHECKERS = (CHECKER_ADVISE, CHECKER_ENFORCE, CHECKER_OFF)
+
 DEFAULT_CONTEXT_BUDGET = 8000
 MIN_WI_BUDGET = 200
 
@@ -713,6 +725,13 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
     budget_tokens = int(payload.get('budget_tokens') or 0)
     apply_mode = str(payload.get('apply_mode') or config['apply_mode'])
     dry_run = bool(payload.get('dry_run', False))
+    # 检查器策略（§6.1，与 apply_mode 正交）：
+    #   advise（默认）= 只标记，不改落地决策
+    #   enforce       = 有 block 级 issue 就一律进待审（auto 模式也不写）
+    #   off           = 不看 issue，按 apply_mode 落地
+    checker = str(payload.get('checker') or CHECKER_ADVISE).strip().lower()
+    if checker not in CHECKERS:
+        checker = CHECKER_ADVISE
     # `target_format` 已废弃：请求里带了也忽略（兼容旧客户端）。
     # 格式意图写进 `wicheck.REWRITE_OUTPUT_RULE`，不再让用户选容器（§2.2）。
     worldbook_source = payload.get('worldbook_source')
@@ -750,11 +769,13 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
     ctx.log(
         'info',
         f'开始世界书改写：{total} 条 · provider={provider["id"]} · model={model_name} · '
-        f'档案={profile["id"]} · 模式={apply_mode}'
+        f'档案={profile["id"]} · 模式={apply_mode} · 检查器={checker}'
         + ('（dry-run）' if dry_run else ''),
     )
 
-    counters = {'applied': 0, 'skipped': 0, 'failed': 0, 'review': 0}
+    # `held` = 被检查器拦下（待审的子集）。「自动落地 / 检查拦下 / 无需处理 / 失败」
+    # 就是 §6.4 那四项回执。
+    counters = {'applied': 0, 'skipped': 0, 'failed': 0, 'review': 0, 'held': 0}
     usage_totals = {'prompt_tokens': 0, 'completion_tokens': 0}
 
     # 按来源分组：同一来源只读一次、写一次（写回是整本写，不是逐条写）
@@ -779,7 +800,7 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
                 worldbook_source=worldbook_source or item_payload.get('worldbook_source'),
                 profile=profile, model_name=model_name,
                 provider=provider, api_key=api_key, extra_headers=extra_headers,
-                apply_mode=apply_mode,
+                apply_mode=apply_mode, checker=checker,
                 dry_run=dry_run, force=bool(payload.get('force')),
             )
         except AiAssistantError as exc:
@@ -806,8 +827,11 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
         status = outcome['status']
         if status == 'awaiting_review':
             counters['review'] += 1
+            # 「检查拦下」是待审的一个子集：它有 block 级 issue，enforce 下不进自动落地。
+            if (outcome.get('result') or {}).get('held_by_checker'):
+                counters['held'] += 1
         elif status == 'failed':
-            # 条目级校验失败（不是异常）也要计数，否则汇总里看不到
+            # 条目级异常（不是校验失败）也要计数，否则汇总里看不到
             counters['failed'] += 1
         elif status == 'done':
             counters['applied' if outcome.get('applied') else 'skipped'] += 1
@@ -850,6 +874,7 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
         'skipped': counters['skipped'],
         'failed': counters['failed'],
         'awaiting_review': counters['review'],
+        'held': counters['held'],
         'written': written,
         'write_errors': write_errors,
         'prompt_tokens': usage_totals['prompt_tokens'],
@@ -858,12 +883,15 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
         'model': model_name,
         'profile_id': profile['id'],
         'apply_mode': apply_mode,
+        'checker': checker,
         'dry_run': dry_run,
     }
     ctx.set_summary(summary)
+    # §6.4 的四项回执：自动落地 / 检查拦下 / 无需处理 / 失败
     ctx.set_message(
-        f'完成：改写 {counters["applied"]} · 待审批 {counters["review"]} · '
-        f'跳过 {counters["skipped"]} · 失败 {counters["failed"]} · 写入 {written} 条'
+        f'完成：自动落地 {counters["applied"]} · 检查拦下 {counters["held"]} · '
+        f'待审 {counters["review"]} · 无需处理 {counters["skipped"]} · '
+        f'失败 {counters["failed"]} · 写入 {written} 条'
     )
 
     try:
@@ -918,12 +946,16 @@ def _render_rewrite_prompt(profile, entry) -> dict:
 
 def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
                   profile, model_name, provider, api_key, extra_headers,
-                  apply_mode, dry_run, force=False) -> dict:
+                  apply_mode, checker=CHECKER_ADVISE, dry_run, force=False) -> dict:
     """处理单条世界书条目：读取 → 前置过滤 → 渲染 → 调用 → 校验 →（可选）准备写回。
 
     前置过滤（§7）在这一层做，因为**条目正文只有读出来才知道**：数据结构、
     INI 段、藏在正文里的 EJS/代码，都不写在条目名里。命中就直接 `skipped`，
     一次 LLM 调用都不发。`force=True` 可以绕过（面板里单独勾选强制处理）。
+
+    校验结果按 §6.2 的矩阵处理：`checker=advise` 只标记、`enforce` 有 block 级
+    问题就进待审（不写）、`off` 不看问题。**任何情况下候选都留在结果里**，
+    用户永远能在审批页手动采纳。
     """
     started = time.monotonic()
 
@@ -1017,7 +1049,13 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
     duration_ms = int((time.monotonic() - started) * 1000)
 
     # 世界书正文不是 JSON：直接取文本，不走 `parse_llm_result`
-    candidate = parsing.strip_think(str(result.get('content') or ''))
+    raw_content = str(result.get('content') or '')
+    # 原文里本来就含 `<analysis>` 这类标签时，不能把候选里的同名标签当「思考段」
+    # 剥掉——那会把正文截断，还会让「标签不丢」的闸把模型判成改坏了。
+    if parsing.has_think_tag(original_content):
+        candidate = raw_content
+    else:
+        candidate = parsing.strip_think(raw_content)
     candidate, _fenced = parsing.strip_fences(candidate)
     candidate = candidate.strip()
 
@@ -1062,14 +1100,37 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
         'applied': False,
     }
 
-    # 校验不过 → 不写回，结果标记失败（用户能看到原因）
-    if not checked['ok']:
-        result_payload['error'] = 'wi_validation_failed'
+    # ---- 原样返回 = 无需处理（T7 / C25）----
+    #
+    # 逐字节相同时不要写回：世界书整本写有版本号，写一次同样的内容只会让
+    # 版本+1、备份+1，用户什么都得不到。这也不是失败——「已经足够精炼」是
+    # 合法结果（实测 `[MVU] InitVar` 就是原样返回）。
+    if candidate == original_content:
+        result_payload['skipped'] = 'unchanged'
+        result_payload['skipped_label'] = '原文已足够精炼（模型原样返回）'
         return {
-            'status': 'failed',
+            'status': 'done',
             'result': result_payload,
             'usage': usage,
+            'applied': False,
         }
+
+    # ---- 落地决策（§6.2 的判定矩阵）----
+    #
+    # 三条硬规则：
+    # 1. **任何情况下都不删候选、不禁止采纳** —— 有 issue 也要把候选留在结果里，
+    #    用户可以在审批页手动接受（修之前这里直接判 failed，候选白跑一趟）。
+    # 2. `checker=off` 不看 issue，按 apply_mode 落地。
+    # 3. `checker=enforce` 下，有 block 级 issue 就进待审（auto 模式也不写），
+    #    并标记 `held_by_checker` 供回执分项统计。
+    has_issues = bool(checked['issues'])
+    result_payload['checker'] = checker
+    result_payload['block_count'] = len(checked['issues'])
+    result_payload['note_count'] = len(warnings)
+
+    if has_issues and checker == CHECKER_ENFORCE:
+        result_payload['held_by_checker'] = True
+        return {'status': 'awaiting_review', 'result': result_payload, 'usage': usage}
 
     if dry_run:
         result_payload['dry_run'] = True

@@ -30,12 +30,19 @@
 |---|---|
 | 宏保真 | `{{…}}` 是**程序**读的注入机制，丢了就是功能性破坏 |
 | HTML 配平（相对原文） | 卡片前端靠 HTML 渲染；但**原文本来就不配平**的条目，候选延续原状不算破坏 |
+| 代码/注释逐字保留 | §12.1：块数不变但**块内被改写**的情况实测出现过，只能逐字比 |
+| 标签集合 + 大小写 | §12.3：`<Analysis>` 在 4/4 配置里都被删，提示词改不掉，只能靠闸 |
+| 数字集合 | 数值设定丢了 AI 就读不到（`30 级` 变成 `很高`） |
+| 结构同构 | §12.2：原文是可解析树时，候选不能缺路径或把容器压平成字符串 |
+| INI 段完整 | 状态栏/MVU 模板靠 `[section]` 定位，少一段就整块失效 |
+| 整篇翻译 | §0.1：英文条目被整篇译成中文（实测占比 59%→8%） |
 | 专有名词覆盖 | 防止丢关键设定；缺失项进 `dropped_facts` 供人确认 |
 | 调度字段不变 | `constant`/`insertion_order` 等是**程序**读的，改了会变触发行为 |
 """
 
 import re
 
+from . import prefilter as prefilter_core
 from .tokens import estimate
 
 #: 宏：`{{user}}` / `{{char}}` / `{{getvar::x}}` 等
@@ -43,6 +50,32 @@ MACRO_PATTERN = re.compile(r'\{\{[^{}]{1,80}\}\}')
 
 #: HTML 标签
 HTML_TAG_PATTERN = re.compile(r'<(/?)([A-Za-z][A-Za-z0-9-]{0,20})\b[^>]{0,400}(/?)>')
+
+#: 标签名（用于「必留标签集合」与大小写判定，含下划线——`<ROTOM_DEX_START>` 这类）
+TAG_NAME_PATTERN = re.compile(r'</?([A-Za-z][A-Za-z0-9_]{1,40})\s*/?>')
+
+#: 任意数字（含小数）：数值设定丢了就是丢设定
+NUMBER_PATTERN = re.compile(r'\d+(?:\.\d+)?')
+
+#: INI / 状态栏段标记（独占一行的 `[section]`）
+INI_SECTION_PATTERN = re.compile(r'(?m)^\s*\[/?[A-Za-z_][\w-]*\]\s*$')
+
+#: 英文单词（≥2 字母）与汉字（用于「整篇翻译」判定）
+ASCII_WORD_PATTERN = re.compile(r'[A-Za-z]{2,}')
+CJK_PATTERN = re.compile(r'[\u4e00-\u9fa5]')
+
+#: 代码/注释/模板块（§12.1）。
+#:
+#: **逐字包含判断，不能只比块数量**：实测 EJS 块数 7→7 没变，但块内注释被改了。
+#: 宏不在此列——它由上面的「宏保真」按集合比对（更严：连新增宏都算提示）。
+CODE_BLOCK_PATTERNS = (
+    ('ejs', re.compile(r'<%.*?%>', re.S)),
+    ('script', re.compile(r'<script\b.*?</script>', re.S | re.I)),
+    ('code', re.compile(r'(?m)^\s*(?:def |class |async def |function )\S.*$')),
+    ('code', re.compile(r'(?m)^\s*(?:const|let|var)\s+\w+\s*=.*$')),
+    ('code', re.compile(r'(?m)^\s*z\.\w+\(.*$')),
+    ('comment', re.compile(r'(?m)^\s*(?://|#).*$')),
+)
 
 #: 空元素（不需要配平）
 VOID_TAGS = frozenset({
@@ -141,6 +174,45 @@ def _numbers(text) -> set:
     return {f'{m.group(1)}{m.group(2)}' for m in NUMBER_UNIT_PATTERN.finditer(source)}
 
 
+def _code_blocks(text) -> list:
+    """抽取需要逐字保留的代码/注释/模板块，返回 `[(kind, 原文片段)]`。"""
+    source = '' if text is None else str(text)
+    blocks = []
+    for kind, pattern in CODE_BLOCK_PATTERNS:
+        for match in pattern.finditer(source):
+            block = match.group(0).rstrip()
+            if block:
+                blocks.append((kind, block))
+    return blocks
+
+
+def _shape(node, prefix: str = '', out=None) -> dict:
+    """把结构树按路径展开成 `{路径: 容器类型}`（§12.2 的结构同构比对）。"""
+    if out is None:
+        out = {}
+    if isinstance(node, dict):
+        out[prefix or '<root>'] = 'dict'
+        for key, value in node.items():
+            _shape(value, f'{prefix}/{key}', out)
+    elif isinstance(node, list):
+        out[prefix or '<root>'] = 'list'
+        for index, value in enumerate(node):
+            _shape(value, f'{prefix}/{index}', out)
+    else:
+        out[prefix] = type(node).__name__
+    return out
+
+
+def _language_mix(text) -> tuple:
+    """返回 `(英文字母占比, 汉字占比)`，按字符计。"""
+    source = '' if text is None else str(text)
+    if not source:
+        return 0.0, 0.0
+    ascii_chars = sum(len(match) for match in ASCII_WORD_PATTERN.findall(source))
+    cjk_chars = len(CJK_PATTERN.findall(source))
+    return ascii_chars / len(source), cjk_chars / len(source)
+
+
 def validate_rewrite(original, candidate, *, original_entry=None, candidate_entry=None) -> dict:
     """校验一次世界书条目改写。
 
@@ -180,6 +252,75 @@ def validate_rewrite(original, candidate, *, original_entry=None, candidate_entr
         issues.append(f'HTML 未配平: {balance_message}')
     elif dst_balanced and not src_balanced:
         warnings.append('原文 HTML 本来就不配平，改写后已配平')
+
+    # ---- 2b. 代码/注释逐字保留（硬，§12.1）----
+    #
+    # 块数不变不代表没改：实测 EJS 块数 7→7，块内注释被改了。所以逐字比。
+    for kind, block in _code_blocks(src):
+        if block not in dst:
+            issues.append(f'代码/注释被改动（{kind}）: {block.strip()[:40]}')
+
+    # ---- 2c. 标签集合与大小写（硬，§12.3）----
+    #
+    # `<Analysis>` 在 4/4 配置里都被删——提示词改不掉，只能靠闸。
+    src_tags = set(TAG_NAME_PATTERN.findall(src))
+    dst_tags = set(TAG_NAME_PATTERN.findall(dst))
+    lost_tags = src_tags - dst_tags
+    if lost_tags:
+        lowered_dst = {name.lower() for name in dst_tags}
+        case_only = sorted(name for name in lost_tags if name.lower() in lowered_dst)
+        real_lost = sorted(name for name in lost_tags if name.lower() not in lowered_dst)
+        if real_lost:
+            issues.append(f'标签消失: {"、".join(real_lost[:5])}')
+        if case_only:
+            issues.append(f'标签名大小写被改: {"、".join(case_only[:5])}')
+
+    # ---- 2d. 数字集合（硬）----
+    lost_numbers = sorted(set(NUMBER_PATTERN.findall(src)) - set(NUMBER_PATTERN.findall(dst)))
+    if lost_numbers:
+        issues.append(
+            f'数字丢失 {len(lost_numbers)} 个: {"、".join(lost_numbers[:8])}',
+        )
+
+    # ---- 2e. 结构同构（硬，§12.2）----
+    #
+    # 原文能解析成 dict/list 时，候选不能缺路径、也不能把容器压平成字符串
+    # （MVU 的 61 条路径被压成 14 个变量就是这一类）。
+    src_tree = prefilter_core.parse_tree(src)
+    if isinstance(src_tree, (dict, list)) and src_tree:
+        dst_tree = prefilter_core.parse_tree(dst)
+        if not isinstance(dst_tree, (dict, list)):
+            issues.append('结构被破坏：候选不再是原来的层级结构')
+        else:
+            src_shape = _shape(src_tree)
+            dst_shape = _shape(dst_tree)
+            broken = [
+                path for path, kind in src_shape.items() if dst_shape.get(path) != kind
+            ]
+            if broken:
+                issues.append(
+                    f'结构被破坏 {len(broken)} 处: {"、".join(broken[:5])}',
+                )
+
+    # ---- 2f. INI / 状态栏段完整（硬）----
+    src_sections = INI_SECTION_PATTERN.findall(src)
+    if src_sections:
+        dst_sections = INI_SECTION_PATTERN.findall(dst)
+        missing = [item for item in src_sections if item not in dst_sections]
+        if missing:
+            issues.append(
+                f'INI/状态栏段丢失 {len(missing)} 个: {"、".join(s.strip() for s in missing[:5])}',
+            )
+
+    # ---- 2g. 整篇翻译（硬，§0.1）----
+    #
+    # 英文条目被整篇译成中文是实打实的破坏（实测英文占比 59% → 8%）。
+    src_ascii, _src_cjk = _language_mix(src)
+    dst_ascii, dst_cjk = _language_mix(dst)
+    if src_ascii > 0.25 and dst_ascii < src_ascii * 0.4 and dst_cjk > 0.15:
+        issues.append(
+            f'疑似整篇翻译（英文占比 {src_ascii:.0%} → {dst_ascii:.0%}）',
+        )
 
     # ---- 3. 指标：只算不判（不设压缩门限）----
     src_tokens = estimate(src)

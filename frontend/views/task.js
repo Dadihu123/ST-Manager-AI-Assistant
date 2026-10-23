@@ -685,7 +685,7 @@ export function createTaskPanel(api, client, context, taskId) {
 function buildTaskOptions(taskId, host, state, client, ui) {
   const { select } = ui;
   if (taskId === 'analyze') return buildAnalyzeOptions(host, state, client);
-  if (taskId === 'polish') return buildPolishOptions(host, state, client);
+  if (taskId === 'polish') return buildPolishOptions(host, state, client, select);
   if (taskId === 'classify') return buildClassifyOptions(host, state, client);
   if (taskId === 'propose') return buildProposeOptions(host, state, client, select);
   return { submit: () => Promise.reject(new Error(`未知任务：${taskId}`)) };
@@ -720,12 +720,40 @@ function buildAnalyzeOptions(host, state, client) {
   };
 }
 
-function buildPolishOptions(host, state, client) {
+//: 落地策略（§6.1）：UI 上只暴露三选一，底层是两个正交参数。
+const LANDING_POLICIES = [
+  { value: 'review', label: '先看再落地（少量条目推荐）' },
+  { value: 'enforce', label: '检查通过的自动落地（批量推荐）' },
+  { value: 'off', label: '全部落地，不做检查' },
+];
+
+const LANDING_PARAMS = {
+  review: { apply_mode: 'review', checker: 'advise' },
+  enforce: { apply_mode: 'auto', checker: 'enforce' },
+  off: { apply_mode: 'auto', checker: 'off' },
+};
+
+function buildPolishOptions(host, state, client, select) {
   // 「改写格式」（YAML / 纯文本）下拉已删除（§2.2）。
   // 这个选择对用户没有可预期收益：选 YAML 只会让模型给正文套上
   // `名称/关键词/原文: |-` 的外壳，而外壳**没有任何地方会拆**——
   // 它会被原样写进世界书条目正文，同时把 token 全算在压缩率上。
   // 格式意图现在写在提示词里（`wicheck.REWRITE_OUTPUT_RULE`），用户不用理解这个开关。
+
+  // 落地策略（C21 / §6.1）：把 apply_mode + checker 合成一个用户看得懂的三选一。
+  // 默认按作用域大小自动切 —— 批量没人愿意逐条点，单条则要保留手动裁决。
+  const policySelect = select(LANDING_POLICIES, 'review', () => {
+    state.policy = policySelect.value;
+    state.policyTouched = true;
+  });
+  state.policy = 'review';
+  state.policyTouched = false;
+  host.append(field(
+    '落地策略',
+    policySelect,
+    '「检查通过的自动落地」只写没有问题的条目；「全部落地」不检查，出问题自己负责。'
+      + '批量时默认自动、少量时默认先看。',
+  ));
 
   // 前置过滤（§7）默认把数据/代码类条目挡在批次外。含双花括号宏的散文条目
   // 也会命中（宏是程序注入用的，实测占全库四成多），所以必须给一个「强制处理」
@@ -814,8 +842,17 @@ function buildPolishOptions(host, state, client) {
           card_id: book.card_id || '',
         }));
 
+      // 落地策略：用户动过就以用户为准；没动过则按待处理条目数自动切
+      // （批量默认「检查通过的自动落地」，单条/少量默认「先看再落地」）。
+      const policyValue = state.policyTouched
+        ? policySelect.value
+        : (wantedUids.size > 5 ? 'enforce' : 'review');
+      const policyParams = LANDING_PARAMS[policyValue] || LANDING_PARAMS.review;
+
       return client.submitWiRewrite({
         ...base,
+        apply_mode: policyParams.apply_mode,
+        checker: policyParams.checker,
         card_id: books.length === 1 ? (books[0].card_id || '') : '',
         worldbook_source: sources,
         entry_uids: Array.from(wantedUids),

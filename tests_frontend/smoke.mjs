@@ -533,6 +533,80 @@ async function main() {
       true,
       '缺少「强制处理被过滤条目」开关',
     );
+    // C21：落地策略三选一（apply_mode + checker 合成）
+    assert.equal(
+      texts.some((text) => text.includes('落地策略')),
+      true,
+      '缺少「落地策略」三选一',
+    );
+  });
+
+  // §6.2 硬规则 2：批量「全部接受」只接受没有 block 级问题的条目，
+  // 有问题的要单独点（避免低置信度/被改坏的候选被一把带走）。
+  await check('「全部接受」跳过有 block 问题的条目', async () => {
+    const { createFakeApi: makeFake } = { createFakeApi };
+    void makeFake;
+    const base = createFakeApi({ pending: 1 });
+    const jobWithIssue = {
+      success: true,
+      job: {
+        run_id: 'run-issues', job_type: 'ai.wi_rewrite', status: 'completed',
+        total: 1, completed: 1, failed: 0, skipped: 0,
+        summary: {}, counts: { total: 1, completed: 1 },
+      },
+      items: [{
+        key: 'a.json',
+        status: 'awaiting_review',
+        result: {
+          card_id: 'a.json',
+          original: '<analysis>原文</analysis>',
+          candidate: '<analysis>候选',
+          issues: ['标签消失: analysis'],
+          warnings: ['删得偏多：只剩原文的 40%'],
+          metrics: { orig_tokens: 100, cand_tokens: 90, delta: -10 },
+        },
+      }],
+    };
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (path.startsWith('/jobs/') && !path.includes('/apply') && !path.includes('/items/')) {
+          return jobWithIssue;
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
+    await review.refresh();
+    review.focusRun('run-issues');
+    review.applyContext({ runId: 'run-issues' });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const texts = allNodes.map((node) => String(node.textContent || '')).filter(Boolean);
+    assert.equal(texts.some((text) => text.includes('需单独确认')), true,
+      '有问题的条目必须被标出来');
+    assert.equal(
+      texts.some((text) => text.includes('检查器拦下')),
+      true,
+      'block 级问题要以「检查器拦下」提示',
+    );
+
+    // 没有「干净」的条目 → 批量接受应该一条都不发
+    const bulk = allNodes
+      .filter((node) => node.tagName === 'BUTTON' && node.textContent === '全部接受')
+      .pop();
+    assert.ok(bulk, '没渲染出「全部接受」按钮');
+    const before = base.calls.length;
+    bulk.click();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const reviewCalls = base.calls
+      .slice(before)
+      .map((entry) => String(entry[1] || ''))
+      .filter((path) => path.includes('/review'));
+    assert.deepEqual(reviewCalls, [], '有问题的条目不能被「全部接受」带走');
   });
 
   await check('坞打开不继承上次作用域', async () => {
