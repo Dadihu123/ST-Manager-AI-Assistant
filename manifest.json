@@ -378,6 +378,35 @@
         "description": "逗号分隔；条目名命中这些词的 content 优先进入提示词。",
         "default": "世界观,设定,背景,叙事要求,元数据,规则"
       },
+      "context_length": {
+        "type": "integer",
+        "title": "上下文长度（token）",
+        "description": "模型的上下文窗口。用于 Agent 上下文预算与请求预算上限；默认 256K。",
+        "default": 262144,
+        "minimum": 8192,
+        "maximum": 4000000
+      },
+      "max_output_tokens": {
+        "type": "integer",
+        "title": "输出长度上限（token）",
+        "description": "单次调用的最大输出。档案里把 max_tokens 设为 0 即跟随此值；默认 32K。",
+        "default": 32768,
+        "minimum": 256,
+        "maximum": 262144
+      },
+      "reasoning_enabled": {
+        "type": "boolean",
+        "title": "启用推理（思考）",
+        "description": "关闭后请求里带 reasoning_effort=none（仅 OpenAI 风格协议）。",
+        "default": true
+      },
+      "reasoning_effort": {
+        "type": "enum",
+        "title": "思考等级",
+        "description": "auto 表示不显式传，用供应商默认；仅在启用推理时生效。",
+        "enum": ["auto", "low", "medium", "high"],
+        "default": "auto"
+      },
       "price_per_1k_prompt": {
         "type": "number",
         "title": "每千 prompt token 单价",

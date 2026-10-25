@@ -288,7 +288,9 @@ def test_classify_output_schema_is_small_and_focused():
     assert set(profile['output_schema']['properties']) == {
         'category', 'confidence', 'reason',
     }
-    assert profile['max_tokens'] == 256, '归类输出很短，不该给大额度'
+    # 归类输出很短：档案不再写死小额度，而是 0 = 跟随「设置 → 模型能力 → 输出长度上限」
+    # （默认 32K）。真正发出去的额度由 core/modelcap.resolve_max_tokens 决定。
+    assert profile['max_tokens'] == 0
     assert 'category' not in profile['output_schema']['required'], (
         'category 不能是 required：模型自认不确定时的合法表达就是留空'
     )

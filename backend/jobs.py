@@ -20,6 +20,7 @@ from . import summary_bridge
 from .core import agent as agent_core
 from .core import classify as classify_core
 from .core import hashing
+from .core import modelcap
 from .core import parsing
 from .core import prefilter as prefilter_core
 from .core import proposal as proposal_core
@@ -270,7 +271,10 @@ def run_analyze(ctx, *, api, store) -> None:
     dry_run = bool(payload.get('dry_run'))
     force = bool(payload.get('force'))
     strict = bool(payload.get('strict', config['validation_strict']))
-    budget_tokens = int(payload.get('budget_tokens') or 0)
+    # 提示词预算夹在「模型能力 → 上下文长度」里：用户把上下文调小时不能超发
+    budget_tokens = modelcap.resolve_prompt_budget(
+        config, int(payload.get('budget_tokens') or 0),
+    )
     apply_tags_enabled = bool(payload.get('apply_tags', config['apply_tags']))
     # C13：auto 模式下是否真的删标签（默认关：删标签不可逆，保守）
     apply_removals_enabled = bool(payload.get('apply_removals', False))
@@ -523,8 +527,8 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         provider=provider, api_key=api_key, extra_headers=extra_headers,
         model=model_name,
         temperature=profile.get('temperature'), top_p=profile.get('top_p'),
-        max_tokens=profile.get('max_tokens'), stop=profile.get('stop'),
-        extra_body=profile.get('extra_body'),
+        max_tokens=modelcap.resolve_max_tokens(profile, config), stop=profile.get('stop'),
+        extra_body=modelcap.resolve_extra_body(profile, config, provider.get('api_style')),
         cancel_check=ctx.should_cancel,
     )
 
@@ -1106,8 +1110,8 @@ def rewrite_entry(*, api, config, ctx, card_id, entry_uid, worldbook_source,
         provider=provider, api_key=api_key, extra_headers=extra_headers,
         model=model_name,
         temperature=profile.get('temperature'), top_p=profile.get('top_p'),
-        max_tokens=profile.get('max_tokens'), stop=profile.get('stop'),
-        extra_body=profile.get('extra_body'),
+        max_tokens=modelcap.resolve_max_tokens(profile, config), stop=profile.get('stop'),
+        extra_body=modelcap.resolve_extra_body(profile, config, provider.get('api_style')),
         cancel_check=ctx.should_cancel,
     )
 
@@ -1507,8 +1511,8 @@ def classify_one(*, api, store, config, ctx, card_id, ui_key, current_category,
         provider=provider, api_key=api_key, extra_headers=extra_headers,
         model=model_name,
         temperature=profile.get('temperature'), top_p=profile.get('top_p'),
-        max_tokens=profile.get('max_tokens'), stop=profile.get('stop'),
-        extra_body=profile.get('extra_body'),
+        max_tokens=modelcap.resolve_max_tokens(profile, config), stop=profile.get('stop'),
+        extra_body=modelcap.resolve_extra_body(profile, config, provider.get('api_style')),
         cancel_check=ctx.should_cancel,
     )
 
@@ -1655,6 +1659,11 @@ def collect_sample_rows(api, *, options=None, max_scan: int = 2000) -> dict:
 def build_proposal_messages(api, store, profile, config, *, options=None) -> dict:
     """构造「让 AI 提结构方案」的 messages（同时回传采样统计，供 UI 展示）。"""
     spec = proposal_core.normalize_options(options)
+    # 采样预算是提示词预算的一种：不能超过「上下文 − 输出 − 余量」
+    spec['sample_budget_tokens'] = min(
+        spec['sample_budget_tokens'],
+        modelcap.resolve_prompt_budget(config, spec['sample_budget_tokens']),
+    )
 
     scan = collect_sample_rows(api, options=spec)
     sample = proposal_core.stratified_sample(
@@ -1788,8 +1797,8 @@ def run_propose(ctx, *, api, store) -> None:
             provider=provider, api_key=api_key, extra_headers=extra_headers,
             model=model_name,
             temperature=profile.get('temperature'), top_p=profile.get('top_p'),
-            max_tokens=profile.get('max_tokens'), stop=profile.get('stop'),
-            extra_body=profile.get('extra_body'),
+            max_tokens=modelcap.resolve_max_tokens(profile, config), stop=profile.get('stop'),
+            extra_body=modelcap.resolve_extra_body(profile, config, provider.get('api_style')),
             cancel_check=ctx.should_cancel,
         )
     except AiAssistantError as exc:

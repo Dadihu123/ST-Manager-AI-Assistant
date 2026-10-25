@@ -4,6 +4,7 @@
 这里只做「默认值兜底 + 类型/区间收敛」，避免坏配置把作业带进不可预期状态。
 """
 
+from .core import modelcap as modelcap_core
 from .core import selector as selector_core
 from .core import tagpool as tagpool_core
 
@@ -20,6 +21,11 @@ DEFAULT_CONFIG = {
     'validation_strict': False,
     'wi_excerpt_ratio': 0.3,
     'wi_keywords': '世界观,设定,背景,叙事要求,元数据,规则',
+    # ---- 模型能力（用户可调；默认按当前主流大模型给）----
+    'context_length': modelcap_core.DEFAULT_CONTEXT_LENGTH,
+    'max_output_tokens': modelcap_core.DEFAULT_MAX_OUTPUT_TOKENS,
+    'reasoning_enabled': True,
+    'reasoning_effort': modelcap_core.DEFAULT_REASONING_EFFORT,
     'price_per_1k_prompt': 0.0,
     'price_per_1k_completion': 0.0,
     'currency': 'CNY',
@@ -86,6 +92,8 @@ def normalize_config(raw) -> dict:
     if apply_mode not in APPLY_MODES:
         apply_mode = DEFAULT_CONFIG['apply_mode']
 
+    caps = modelcap_core.normalize_capabilities(data)
+
     return {
         'default_profile_id': _to_text(data.get('default_profile_id'), '').strip(),
         'max_tags': _to_int(data.get('max_tags'), DEFAULT_CONFIG['max_tags'], minimum=1, maximum=20),
@@ -102,6 +110,8 @@ def normalize_config(raw) -> dict:
         'wi_excerpt_ratio': _to_float(data.get('wi_excerpt_ratio'),
                                       DEFAULT_CONFIG['wi_excerpt_ratio'], minimum=0.0, maximum=1.0),
         'wi_keywords': _to_text(data.get('wi_keywords'), DEFAULT_CONFIG['wi_keywords']),
+        # ---- 模型能力：context_length / max_output_tokens / reasoning_* ----
+        **caps,
         'price_per_1k_prompt': _to_float(data.get('price_per_1k_prompt'), 0.0, minimum=0.0),
         'price_per_1k_completion': _to_float(data.get('price_per_1k_completion'), 0.0, minimum=0.0),
         'currency': _to_text(data.get('currency'), DEFAULT_CONFIG['currency']).strip() or 'CNY',

@@ -102,7 +102,9 @@ DEFAULT_GENERATION = {
     'stop': [],
     'temperature': 0.6,
     'top_p': 1.0,
-    'max_tokens': 2048,
+    # 0 = 跟随「设置 → 模型能力 → 输出长度上限」（默认 32K）。
+    # 写死 2048 曾把 Agent 的 finalize JSON 截断成空响应，见 core/modelcap.py。
+    'max_tokens': 0,
     'extra_body': {},
 }
 
@@ -245,7 +247,7 @@ WI_REWRITE_SPEC = {
     # 写回由 `run_wi_rewrite` 自己处理（世界书是整本写，不是卡片级动作）
     'apply_actions': [],
     'temperature': 0.3,
-    'max_tokens': 4096,
+    'max_tokens': 0,
 }
 
 
@@ -316,7 +318,7 @@ CLASSIFY_SPEC = {
     # 写回由 `run_classify` 批量调用 `api.cards.move`
     'apply_actions': [],
     'temperature': 0.2,
-    'max_tokens': 256,
+    'max_tokens': 0,
 }
 
 
@@ -385,7 +387,7 @@ PROPOSE_SPEC = {
     },
     'apply_actions': [],
     'temperature': 0.4,
-    'max_tokens': 4096,
+    'max_tokens': 0,
 }
 
 
@@ -449,7 +451,7 @@ AGENT_SPEC = {
     },
     'apply_actions': [],
     'temperature': 0.4,
-    'max_tokens': 2048,
+    'max_tokens': 0,
 }
 
 
@@ -795,8 +797,9 @@ def validate_profile(profile, *, known=None) -> list:
         errors.append('temperature 必须在 [0, 2] 区间')
     if not 0 < data['top_p'] <= 1:
         errors.append('top_p 必须在 (0, 1] 区间')
-    if not 64 <= data['max_tokens'] <= 32768:
-        errors.append('max_tokens 必须在 [64, 32768] 区间')
+    # 0 = 跟随「设置 → 模型能力 → 输出长度上限」（默认 32K）；否则是显式上限
+    if data['max_tokens'] and not 64 <= data['max_tokens'] <= 262144:
+        errors.append('max_tokens 必须是 0（跟随全局）或 [64, 262144] 区间')
 
     for item in data['stop']:
         if len(item) > 64:

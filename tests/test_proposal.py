@@ -292,8 +292,12 @@ def test_propose_profile_does_not_hijack_model_matching():
 
 def test_propose_profile_has_room_for_large_output():
     """提议要输出几十个分类 + 标签，额度不能小。"""
+    from stm_ai_core import modelcap
+
     profile = profiles.builtin_profile('builtin-propose')
-    assert profile['max_tokens'] >= 2048
+    # 档案写 0（跟随全局），实际额度由模型能力解析：默认 32K，远大于旧硬编码
+    assert profile['max_tokens'] == 0
+    assert modelcap.resolve_max_tokens(profile, {}) >= 2048
     assert 'categories' in profile['output_schema']['required']
 
 

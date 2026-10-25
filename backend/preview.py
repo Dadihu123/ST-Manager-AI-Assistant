@@ -7,6 +7,7 @@
 import logging
 
 from .core import hashing
+from .core import modelcap as modelcap_core
 from .core import prompt as prompt_core
 from .core import selector as selector_core
 from .core import tagpool as tagpool_core
@@ -39,8 +40,10 @@ def embedded_entries(card) -> list:
 
 
 def worldbook_budget(config, budget_tokens: int = 0) -> int:
-    """世界书部分的 token 预算。"""
-    base = int(budget_tokens or DEFAULT_CONTEXT_BUDGET)
+    """世界书部分的 token 预算（受「模型能力 → 上下文长度」约束）。"""
+    base = modelcap_core.resolve_prompt_budget(
+        config, budget_tokens, default=DEFAULT_CONTEXT_BUDGET,
+    )
     ratio = float((config or {}).get('wi_excerpt_ratio') or 0.3)
     return max(MIN_WI_BUDGET, int(base * ratio))
 
@@ -154,7 +157,7 @@ def build_preview(*, api, store, config, card_id: str, profile_id: str = '',
         usage['hits'], bundle['variables'], total_tokens=prompt_tokens['total'],
     )
 
-    completion_budget = int(profile.get('max_tokens') or 0)
+    completion_budget = modelcap_core.resolve_max_tokens(profile, config)
     cost = tokens.estimate_cost(
         prompt_tokens['total'], completion_budget,
         price_per_1k_prompt=config.get('price_per_1k_prompt'),
@@ -236,7 +239,7 @@ def estimate_run(*, api, config, cards, profile, total: int, budget_tokens: int 
 
     sampled = len(samples)
     average_prompt = int(prompt_total / sampled)
-    completion_budget = int(profile.get('max_tokens') or 0)
+    completion_budget = modelcap_core.resolve_max_tokens(profile, config)
 
     prompt_tokens = average_prompt * total
     completion_tokens = min(completion_budget, 512) * total
