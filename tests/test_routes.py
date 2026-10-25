@@ -1062,6 +1062,42 @@ def test_propose_apply_reports_invalid_merge(tmp_path):
     assert payload['merges_executed'][0]['error'] == 'invalid_merge'
 
 
+# ------------------------------------------------------------------ 模型能力设置
+
+
+def test_settings_returns_model_capability_defaults(env):
+    client, _api, _store = env
+    payload = client.get('/settings').get_json()
+
+    assert payload['success'] is True
+    caps = payload['model_capabilities']
+    assert caps['context_length'] == 262144, '默认上下文 256K'
+    assert caps['max_output_tokens'] == 32768, '默认输出 32K'
+    assert caps['reasoning_enabled'] is True
+    assert caps['reasoning_effort'] == 'auto'
+
+
+def test_settings_saves_and_normalizes_model_capabilities(env):
+    client, api, _store = env
+
+    payload = client.post('/settings', json={
+        'model_capabilities': {
+            'context_length': 65536,
+            'max_output_tokens': 999999,   # 超过上限 → 收敛到 262144 且不超过上下文
+            'reasoning_enabled': False,
+            'reasoning_effort': 'bogus',   # 非法值 → auto
+        },
+    }).get_json()
+
+    assert payload['success'] is True
+    caps = payload['model_capabilities']
+    assert caps['context_length'] == 65536
+    assert caps['max_output_tokens'] == 65536, '输出上限不得超过上下文'
+    assert caps['reasoning_enabled'] is False
+    assert caps['reasoning_effort'] == 'auto'
+    assert api._config['context_length'] == 65536
+
+
 # ------------------------------------------------------------------ 归类落地：弃权不得移动
 
 

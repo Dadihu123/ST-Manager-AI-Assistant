@@ -368,6 +368,27 @@ function createFakeApi({ providers = 1, pending = 0 } = {}) {
           books_truncated: false,
         },
         '/proposal/sample': { success: true, sample: { count: 5, tokens: 100 } },
+        // 模型能力设置（默认 256K / 32K / 推理开 / auto）
+        '/settings': {
+          success: true,
+          model_capabilities: {
+            context_length: 262144,
+            max_output_tokens: 32768,
+            reasoning_enabled: true,
+            reasoning_effort: 'auto',
+          },
+          defaults: {
+            context_length: 262144,
+            max_output_tokens: 32768,
+            reasoning_enabled: true,
+            reasoning_effort: 'auto',
+          },
+          limits: {
+            context_length: { min: 8192, max: 4000000 },
+            max_output_tokens: { min: 256, max: 262144 },
+            reasoning_effort: ['auto', 'low', 'medium', 'high'],
+          },
+        },
       };
       if (path.startsWith('/jobs/') && path.endsWith('/apply')) return { success: true, applied: 2, skipped: 0, stale: 0, failed: 0, details: [] };
       if (path.startsWith('/jobs/') && path.includes('/items/')) return { success: true };
@@ -449,6 +470,20 @@ async function main() {
     const ids = new Set(badges.map(([id]) => id));
     assert.ok(ids.has('workbench'), `角标未写 workbench: ${[...ids]}`);
     assert.ok(ids.has('open-review'), `角标未写 open-review: ${[...ids]}`);
+  });
+
+  await check('设置面板读取模型能力', async () => {
+    const { createSettings } = await import('../frontend/views/settings.js');
+    const { createClient } = await import('../frontend/api.js');
+    const before = calls.length;
+    const settings = createSettings(api, createClient(api), {});
+    await settings.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const paths = calls.slice(before).map((entry) => String(entry[1] || ''));
+    assert.equal(paths.includes('/settings'), true,
+      `设置面板要读取 /settings（实际：${paths.join(', ')}）`);
+    assert.equal(settings.element.hidden, false);
   });
 
   await check('右键分类 → analyze 面板解析作用域', async () => {

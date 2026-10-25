@@ -1967,7 +1967,7 @@ def run_agent(ctx, *, api, store) -> None:
     provider_id = str(payload.get('provider_id') or '')
     requested_model = str(payload.get('model') or '')
     profile_id = str(payload.get('profile_id') or '')
-    budget = agent_core.normalize_budget(payload.get('budget'))
+    # budget 的解析要等目录扫描拿到「卡数」之后（自适应轮次依赖它），见下方
 
     total = len(ctx.items) or 1
     ctx.set_total(total)
@@ -2003,6 +2003,19 @@ def run_agent(ctx, *, api, store) -> None:
     scan = collect_sample_rows(api, options={'sample_size': 1})
     rows = scan['rows']
 
+    # 预算在拿到卡数之后解析：`max_iterations` 缺省时按库规模自适应，
+    # `context_budget` 缺省时按「设置 → 模型能力 → 上下文长度」算。
+    raw_budget = payload.get('budget') if isinstance(payload.get('budget'), dict) else {}
+    budget = modelcap.resolve_agent_budget(
+        raw_budget, scan.get('total') or len(rows), config,
+    )
+    if raw_budget.get('max_iterations') is None:
+        ctx.log(
+            'info',
+            f'轮次按库规模自适应：{max(1, int(scan.get("total") or len(rows) or 1))} 张卡 '
+            f'→ {budget["max_iterations"]} 轮',
+        )
+
     categories, tags = [], []
     try:
         # 宿主新旧两种返回形状都归一（字符串数组 / 对象数组）
@@ -2017,20 +2030,6 @@ def run_agent(ctx, *, api, store) -> None:
 
     catalog = agent_core.build_catalog(rows, budget=budget)
     existing_context = proposal_core.format_existing_context(categories, tags)
-
-    # C23：默认轮次按库规模动态给。
-    #
-    # 固定 6 轮在几十张卡的库里会被 read 吃光（实测 `max_iterations=4` 时 4 轮
-    # 全用于读卡 → 第一轮作业就 `no_finalize`）。公式取 §3.2 的
-    # `min(ceil(卡数 / 6), 12)`；调用方显式指定时不动。
-    raw_budget = payload.get('budget') if isinstance(payload.get('budget'), dict) else {}
-    if raw_budget.get('max_iterations') is None:
-        card_total = max(1, int(catalog['stats']['total'] or 1))
-        budget['max_iterations'] = max(4, min(12, (card_total + 5) // 6))
-        ctx.log(
-            'info',
-            f'轮次按库规模自适应：{card_total} 张卡 → {budget["max_iterations"]} 轮',
-        )
 
     if not catalog['lines']:
         message = '卡片库里没有可分析的卡片'

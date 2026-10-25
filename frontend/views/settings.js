@@ -48,10 +48,20 @@ const BLANK_PROVIDER = {
 export function createSettings(api, client, context) {
   const { badge, button, numberInput, section, select } = createUi(api);
   const root = el('div', 'plugin-stm-ai-assistant-view');
-  const state = { providers: [], usage: null, status: null, suggestions: [], editing: null };
+  const state = {
+    providers: [], usage: null, status: null, suggestions: [], editing: null,
+    settings: null,
+  };
 
   const overviewSection = section('概览');
   const overviewBox = el('div', 'plugin-stm-ai-assistant-row');
+
+  const capabilitySection = section(
+    '模型能力',
+    '上下文长度与输出长度上限是全局口径：档案里 max_tokens 写 0 时跟随这里；'
+    + '推理开关与思考等级只对 OpenAI 风格协议注入（Anthropic 的 thinking 语义不同，暂不注入）。',
+  );
+  const capabilityBox = el('div', 'plugin-stm-ai-assistant-capability');
 
   const providerSection = section('Provider', '每个供应商可配置独立的地址、模型与密钥；密钥存在主程序的 secrets.json（不回显）。');
   const providerList = el('div', 'plugin-stm-ai-assistant-provider-list');
@@ -78,8 +88,9 @@ export function createSettings(api, client, context) {
 
   providerSection.append(providerList, addProviderRow, providerEditor);
 
-  root.append(overviewSection, providerSection, usageSection, suggestionSection);
+  root.append(overviewSection, capabilitySection, providerSection, usageSection, suggestionSection);
   overviewSection.append(overviewBox);
+  capabilitySection.append(capabilityBox);
 
   // ---------------------------------------------------------------- 渲染
 
@@ -92,6 +103,79 @@ export function createSettings(api, client, context) {
       badge(`Provider ${(status.providers && status.providers.count) || 0}`),
       badge(`待审批标签 ${status.suggestions || 0}`, (status.suggestions ? 'is-warn' : 'is-muted')),
     );
+  }
+
+  function renderCapabilities() {
+    clear(capabilityBox);
+    const data = state.settings || {};
+    const caps = data.model_capabilities || {};
+    const limits = data.limits || {};
+    const effortOptions = [
+      { value: 'auto', label: 'auto（供应商默认）' },
+      { value: 'low', label: 'low（低）' },
+      { value: 'medium', label: 'medium（中）' },
+      { value: 'high', label: 'high（高）' },
+    ];
+
+    const fields = {};
+    fields.context_length = numberInput(
+      caps.context_length || (data.defaults || {}).context_length || 262144,
+      { min: (limits.context_length || {}).min || 8192, step: 1 },
+    );
+    fields.max_output_tokens = numberInput(
+      caps.max_output_tokens || (data.defaults || {}).max_output_tokens || 32768,
+      { min: (limits.max_output_tokens || {}).min || 256, step: 1 },
+    );
+    fields.reasoning_enabled = checkbox(
+      caps.reasoning_enabled !== false, '启用推理（关闭后请求带 reasoning_effort=none）',
+    );
+    fields.reasoning_effort = select(effortOptions, caps.reasoning_effort || 'auto');
+
+    const grid = el('div', 'plugin-stm-ai-assistant-grid');
+    grid.append(
+      field('上下文长度（token）',
+        fields.context_length,
+        `模型窗口；默认 ${formatNumber((data.defaults || {}).context_length || 262144)}`),
+      field('输出长度上限（token）',
+        fields.max_output_tokens,
+        `单次调用的最大输出；默认 ${formatNumber((data.defaults || {}).max_output_tokens || 32768)}。`
+        + '档案 max_tokens 写 0 表示跟随此值'),
+      field('思考等级', fields.reasoning_effort, '仅「启用推理」时生效'),
+    );
+
+    const actions = el('div', 'plugin-stm-ai-assistant-row');
+    actions.append(
+      fields.reasoning_enabled,
+      button('保存模型能力', 'is-primary', () => saveCapabilities(fields)),
+      button('恢复默认', 'is-secondary', () => resetCapabilities(fields)),
+    );
+
+    capabilityBox.append(grid, actions);
+  }
+
+  async function saveCapabilities(fields) {
+    const payload = {
+      context_length: Number(fields.context_length.querySelector('input').value) || 0,
+      max_output_tokens: Number(fields.max_output_tokens.querySelector('input').value) || 0,
+      reasoning_enabled: fields.reasoning_enabled.querySelector('input').checked,
+      reasoning_effort: fields.reasoning_effort.value,
+    };
+    try {
+      const data = await client.saveSettings(payload);
+      state.settings = Object.assign({}, state.settings, { model_capabilities: data.model_capabilities });
+      renderCapabilities();
+      api.host.toast('模型能力已保存', 2400, 'check');
+    } catch (error) {
+      api.host.toast(`保存失败：${error.message}`, 4200, 'close');
+    }
+  }
+
+  function resetCapabilities(fields) {
+    const defaults = (state.settings && state.settings.defaults) || {};
+    fields.context_length.querySelector('input').value = defaults.context_length || 262144;
+    fields.max_output_tokens.querySelector('input').value = defaults.max_output_tokens || 32768;
+    fields.reasoning_enabled.querySelector('input').checked = true;
+    fields.reasoning_effort.value = defaults.reasoning_effort || 'auto';
   }
 
   function renderProviders() {
@@ -426,18 +510,21 @@ export function createSettings(api, client, context) {
 
   async function load() {
     try {
-      const [status, providers, usage, suggestions] = await Promise.all([
+      const [status, providers, usage, suggestions, settings] = await Promise.all([
         client.status(), client.providers(), client.usage(), client.suggestions(),
+        client.settings(),
       ]);
       state.status = status;
       state.providers = providers.items || [];
       state.usage = usage;
       state.suggestions = suggestions.items || [];
+      state.settings = settings;
     } catch (error) {
       api.host.toast(`读取设置失败：${error.message}`, 3600, 'close');
     }
 
     renderOverview();
+    renderCapabilities();
     renderProviders();
     renderEditor();
     renderUsage();

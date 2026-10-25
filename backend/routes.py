@@ -22,6 +22,7 @@ from . import summary_bridge
 from .core import agent as agent_core
 from .core import classify as classify_core
 from .core import hashing
+from .core import modelcap as modelcap_core
 from .core import prefilter as prefilter_core
 from .core import proposal as proposal_core
 from .core import prompt as prompt_core
@@ -316,6 +317,55 @@ def register_routes(api, store) -> None:
                 'api_key': {'ok': key_ready},
             },
         )
+
+    # ---------------------------------------------------------- 模型能力设置
+
+    @api.http.route('/settings', ['GET'])
+    @_handle_errors
+    def get_settings():
+        """模型能力（上下文/输出长度/推理）当前值与可选范围。"""
+        config = config_module.load_config(api)
+        caps = modelcap_core.normalize_capabilities(config)
+        return _ok(
+            model_capabilities=caps,
+            defaults={
+                'context_length': modelcap_core.DEFAULT_CONTEXT_LENGTH,
+                'max_output_tokens': modelcap_core.DEFAULT_MAX_OUTPUT_TOKENS,
+                'reasoning_enabled': True,
+                'reasoning_effort': modelcap_core.DEFAULT_REASONING_EFFORT,
+            },
+            limits={
+                'context_length': {'min': modelcap_core.MIN_CONTEXT_LENGTH,
+                                   'max': modelcap_core.MAX_CONTEXT_LENGTH},
+                'max_output_tokens': {'min': modelcap_core.MIN_OUTPUT_TOKENS,
+                                      'max': modelcap_core.MAX_OUTPUT_TOKENS},
+                'reasoning_effort': list(modelcap_core.REASONING_EFFORTS),
+            },
+        )
+
+    @api.http.route('/settings', ['POST'])
+    @_handle_errors
+    def save_settings():
+        """保存模型能力（只写声明过的键，其余配置不动）。"""
+        payload = _body()
+        incoming = payload.get('model_capabilities')
+        if not isinstance(incoming, dict):
+            incoming = {key: payload[key] for key in (
+                'context_length', 'max_output_tokens',
+                'reasoning_enabled', 'reasoning_effort',
+            ) if key in payload}
+        caps = modelcap_core.normalize_capabilities(
+            dict(config_module.load_config(api), **incoming),
+        )
+        try:
+            saved = bool(api.config.set(caps))
+        except Exception:  # noqa: BLE001 - 配置写入失败不该 500
+            logger.warning('保存模型能力失败', exc_info=True)
+            saved = False
+        if not saved:
+            return _fail(CODE_INVALID_PAYLOAD, '配置未写入（主程序拒绝了本次保存）',
+                         http_status=400)
+        return _ok(model_capabilities=caps)
 
     @api.http.route('/cards', ['GET'])
     @_handle_errors

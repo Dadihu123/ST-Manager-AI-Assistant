@@ -24,6 +24,9 @@ export function createClient(api) {
 
     status: () => call('/status'),
     health: () => call('/health'),
+    settings: () => call('/settings'),
+    saveSettings: (modelCapabilities) =>
+      call('/settings', { method: 'POST', body: { model_capabilities: modelCapabilities } }),
     cards: (query = '') => call(`/cards${query ? `?q=${encodeURIComponent(query)}` : ''}`),
 
     profiles: () => call('/profiles'),
