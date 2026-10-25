@@ -1,5 +1,38 @@
 # CHANGELOG
 
+## 未发布（2026-10-24，模型能力设置 + H 轮真机验证修复）
+
+### 新增
+
+- **模型能力设置**（设置面板「模型能力」+ `GET/POST /settings`）：
+  上下文长度（默认 **256K**）、输出长度上限（默认 **32K**）、
+  推理开关、思考等级（`auto/low/medium/high`）；四项都写进 `config_schema`，
+  默认值见 `backend/core/modelcap.py`。
+- 档案的 `max_tokens` 支持写 **0 = 跟随全局输出长度上限**；内置档案全部改为 0
+  （`builtin-agent` 从 2048 → 32K，修掉 finalize JSON 被截断成空响应的问题）。
+- 推理设置按协议注入：OpenAI Chat/Responses 发 `reasoning_effort`（关推理 → `none`）；
+  Anthropic 不注入（它的思考是 `thinking`，语义不同）。
+- 提示词/世界书预算按「上下文 − 输出 − 余量」夹紧（`modelcap.resolve_prompt_budget`）。
+
+### 修复
+
+- **归类弃权被判失败（C4）**：`CLASSIFY_OUTPUT_SCHEMA.required` 去掉 `category`
+  —— 模型留空 `category` 是合法弃权，原来会被 schema 判成「缺少必需字段」，
+  作业直接 `failed`，`undecided` 分支成了死代码。弃权时 `confidence` 一并置空。
+- **弃权条目被当成根目录移动**：`_apply_classify` 跳过 `category==""` /
+  `skipped=undecided` 的条目，即使被「接受」也不会移出分类。
+- **Agent 轮次自适应不生效（P5）**：提交时保留**原始** budget 给作业层，
+  缺省 `max_iterations` 才按 `max(4, min(12, ceil(卡数/6)))` 计算；
+  `context_budget` 缺省按上下文长度推导。UI 改发 `max_iterations`（原来发
+  `max_rounds`，后端不读，等于死控件），留空 = 自适应。
+- **多书世界书作业静默丢条目**：宿主按 item key 去重，多书同 uid 会丢第二条；
+  多书作业的 key 改为 `uid@文件名#短hash`（单书仍是裸 uid，兼容旧链路）。
+
+### 测试
+
+- 新增 `tests/test_modelcap.py`；补 C4/弃权落地/多书 key/设置路由/Agent 原始 budget
+  的回归用例。`pytest` **885 passed**，前端冒烟 **28/28**。
+
 ## 未发布（2026-10-22，迁移到插件契约 v3）
 
 ### 变更
