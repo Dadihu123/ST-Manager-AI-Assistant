@@ -7,6 +7,7 @@
 「已设置 / 未设置 + 掩码」（掩码由主程序 `list_secrets()` 提供）。
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -147,6 +148,25 @@ def _normalize_card_ids(raw) -> list:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _wi_item_key(uid: str, source: dict, *, multiple: bool) -> str:
+    """世界书改写作业项的 key。
+
+    单书沿用 uid（兼容既有链路）；多书必须唯一——宿主的作业条目按 key 去重，
+    两本书都从 0 编号时，同 uid 的第二条会被静默丢掉。
+    """
+    if not multiple:
+        return str(uid)
+    identity = str(
+        (source or {}).get('card_id')
+        or (source or {}).get('file_path')
+        or (source or {}).get('source_type')
+        or ''
+    )
+    label = identity.replace('\\', '/').rstrip('/').rsplit('/', 1)[-1] or 'book'
+    digest = hashlib.sha1(identity.encode('utf-8')).hexdigest()[:6]
+    return f'{uid}@{label}#{digest}'
 
 
 #: 草稿型模型列表允许请求体覆盖的 provider 字段（其余字段沿用已保存值/默认值）。
@@ -839,6 +859,10 @@ def register_routes(api, store) -> None:
         wanted = set(entry_uids)
         items = []
         unreadable = []
+        # 多书作业里 uid 会重复（每个世界书都从 0 开始编号）；宿主的作业条目
+        # 按 `key` 去重，同 uid 的第二条会被**静默丢弃**。单书沿用 uid（兼容旧链路），
+        # 多书给 key 加上来源标识。
+        multiple_books = len(sources) > 1
         for source in sources:
             book = api.worldbook.read(source)
             if not isinstance(book, dict):
@@ -867,7 +891,7 @@ def register_routes(api, store) -> None:
                 if not content.strip():
                     continue
                 items.append({
-                    'key': uid,
+                    'key': _wi_item_key(uid, source, multiple=multiple_books),
                     'card_id': source_card_id,
                     'entry_uid': uid,
                     'entry_name': str(entry.get('comment') or entry.get('name') or ''),

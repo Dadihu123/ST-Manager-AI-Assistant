@@ -331,3 +331,51 @@ def test_submit_single_book_keeps_job_level_source(workdir, monkeypatch):
         'source_type': 'global', 'file_path': 'lorebooks/a.json',
     }
     assert all(item['worldbook_source'] for item in captured['items'])
+
+
+def test_submit_multi_book_makes_item_keys_unique(workdir, monkeypatch):
+    """多书作业的 item key 必须唯一：宿主按 key 去重，同 uid 的第二本会被静默丢掉。"""
+    client, api, store, _written = build_client(workdir, BOOKS)
+    captured = {}
+
+    def fake_submit(_job_type, *, items, payload=None):
+        captured['items'] = items
+        return 'run-multi-keys'
+
+    monkeypatch.setattr(api.jobs, 'submit', fake_submit)
+
+    response = client.post('/jobs/wi-rewrite', json={
+        'worldbook_source': [
+            {'source_type': 'global', 'file_path': 'lorebooks/a.json'},
+            {'source_type': 'global', 'file_path': 'lorebooks/b.json'},
+        ],
+        'entry_uids': ['1'],
+        'provider_id': 'p1',
+    })
+
+    assert response.get_json()['success'] is True
+    keys = [item['key'] for item in captured['items']]
+    assert len(keys) == 2, '两本书的同 uid 条目都要提交'
+    assert len(set(keys)) == 2, f'item key 必须唯一，实际 {keys}'
+    # entry_uid 仍是原始 uid（落地按它找回条目）
+    assert [item['entry_uid'] for item in captured['items']] == ['1', '1']
+
+
+def test_submit_single_book_keeps_bare_uid_key(workdir, monkeypatch):
+    """单书不改 key 形态：仍用 uid（不破坏既有审批链路与历史作业）。"""
+    client, api, store, _written = build_client(workdir, BOOKS)
+    captured = {}
+
+    def fake_submit(_job_type, *, items, payload=None):
+        captured['items'] = items
+        return 'run-single-key'
+
+    monkeypatch.setattr(api.jobs, 'submit', fake_submit)
+
+    client.post('/jobs/wi-rewrite', json={
+        'worldbook_source': {'source_type': 'global', 'file_path': 'lorebooks/a.json'},
+        'entry_uids': ['1'],
+        'provider_id': 'p1',
+    })
+
+    assert [item['key'] for item in captured['items']] == ['1']
