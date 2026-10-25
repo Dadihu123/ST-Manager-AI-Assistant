@@ -2120,8 +2120,8 @@ def run_agent(ctx, *, api, store) -> None:
                 provider=provider, api_key=api_key, extra_headers=extra_headers,
                 model=model_name,
                 temperature=profile.get('temperature'), top_p=profile.get('top_p'),
-                max_tokens=profile.get('max_tokens'), stop=profile.get('stop'),
-                extra_body=profile.get('extra_body'),
+                max_tokens=modelcap.resolve_max_tokens(profile, config), stop=profile.get('stop'),
+                extra_body=modelcap.resolve_extra_body(profile, config, provider.get('api_style')),
                 cancel_check=ctx.should_cancel,
             )
         except AiAssistantError as exc:
@@ -2281,8 +2281,8 @@ def run_agent(ctx, *, api, store) -> None:
                 provider=provider, api_key=api_key, extra_headers=extra_headers,
                 model=model_name,
                 temperature=profile.get('temperature'), top_p=profile.get('top_p'),
-                max_tokens=profile.get('max_tokens'), stop=profile.get('stop'),
-                extra_body=profile.get('extra_body'),
+                max_tokens=modelcap.resolve_max_tokens(profile, config), stop=profile.get('stop'),
+                extra_body=modelcap.resolve_extra_body(profile, config, provider.get('api_style')),
                 cancel_check=ctx.should_cancel,
             )
         except AiAssistantError as exc:

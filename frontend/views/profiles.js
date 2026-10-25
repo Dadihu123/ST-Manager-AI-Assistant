@@ -151,7 +151,7 @@ export function createProfiles(api, client, context) {
       stop: [],
       temperature: 0.6,
       top_p: 1.0,
-      max_tokens: 2048,
+      max_tokens: 0,
       extra_body: {},
     };
     renderList();
@@ -247,7 +247,7 @@ export function createProfiles(api, client, context) {
     fields.confidence = numberInput(tagsProp.min_confidence || 0, { min: 0, max: 1, step: 0.05 });
     fields.temperature = numberInput(profile.temperature, { min: 0, max: 2, step: 0.05 });
     fields.top_p = numberInput(profile.top_p, { min: 0, max: 1, step: 0.05 });
-    fields.max_tokens = numberInput(profile.max_tokens, { min: 1, step: 1 });
+    fields.max_tokens = numberInput(profile.max_tokens, { min: 0, step: 1 });
     fields.stop = textarea((profile.stop || []).join('\n'), 3);
     fields.extra_body = textarea(JSON.stringify(profile.extra_body || {}, null, 2), 4);
     fields.output_schema = textarea(JSON.stringify(schema, null, 2), 14);
@@ -260,7 +260,7 @@ export function createProfiles(api, client, context) {
       field('置信度下限', fields.confidence),
       field('temperature', fields.temperature),
       field('top_p', fields.top_p),
-      field('max_tokens', fields.max_tokens),
+      field('max_tokens', fields.max_tokens, '0 = 跟随「设置 → 模型能力 → 输出长度上限」'),
     );
     editorControls = editorControls.concat([
       fields.priority, fields.summary_min, fields.summary_max, fields.tags_min,
@@ -650,7 +650,7 @@ export function createProfiles(api, client, context) {
 
     profile.temperature = Number(fields.temperature.querySelector('input').value);
     profile.top_p = Number(fields.top_p.querySelector('input').value);
-    profile.max_tokens = Number(fields.max_tokens.querySelector('input').value) || 2048;
+    profile.max_tokens = Math.max(0, Number(fields.max_tokens.querySelector('input').value) || 0);
     profile.stop = fields.stop.value.split('\n').map((item) => item.trim()).filter(Boolean);
 
     try {
