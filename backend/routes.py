@@ -1222,13 +1222,16 @@ def register_routes(api, store) -> None:
             )
 
         model_name = str(payload.get('model') or provider.get('model') or '')
-        budget = agent_core.normalize_budget(payload.get('budget'))
+        # 保留**原始** budget 交给作业层解析：归一化会把缺省的 max_iterations 填成
+        # 默认 6，作业层就再也分不清「用户没给」和「用户给了 6」，
+        # 按库规模自适应的公式于是永远不生效（实测 bug，P5）。
+        raw_budget = payload.get('budget') if isinstance(payload.get('budget'), dict) else {}
 
         job_payload = {
             'provider_id': provider['id'],
             'model': model_name,
             'profile_id': str(payload.get('profile_id') or 'builtin-agent'),
-            'budget': budget,
+            'budget': dict(raw_budget),
             'secret_ref': SECRET_REF_TEMPLATE.format(provider_id=provider['id']),
         }
 
@@ -1249,11 +1252,17 @@ def register_routes(api, store) -> None:
             total=1, extra={'provider_id': provider['id'], 'model': model_name},
         )
 
+        preview_budget = agent_core.normalize_budget(raw_budget)
+        if raw_budget.get('max_iterations') is None:
+            # 不传就是「按库规模自适应」，回执里不能谎报成 6
+            preview_budget['max_iterations'] = None
+
         return _ok(
             run_id=run_id,
             total=1,
             provider={'id': provider.get('id'), 'model': model_name},
-            budget=budget,
+            budget=preview_budget,
+            budget_adaptive=raw_budget.get('max_iterations') is None,
         )
 
     # ---------------------------------------------------------- 审批与结果

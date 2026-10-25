@@ -947,7 +947,9 @@ function buildProposeOptions(host, state, client, select) {
 
   const sampleSize = field('采样张数', input('30', 'number', '30'));
   const sampleBudget = field('采样 token 预算', input('4000', 'number', '4000'));
-  const agentRounds = field('Agent 最多轮次', input('6', 'number', '6'));
+  // 留空 = 按库规模自适应（后端 max(4, min(12, ceil(卡数/6)))）。
+  // 旧版发的是 `max_rounds`，后端只读 `max_iterations`，等于永远拿不到用户设置。
+  const agentRounds = field('Agent 最多轮次', input('', 'number', '留空 = 按库规模自适应'));
   const agentReads = field('Agent 读取配额', input('40', 'number', '40'));
 
   host.append(field('分析方式', modeSelect, ''), sampleSize, sampleBudget, agentRounds, agentReads);
@@ -968,13 +970,11 @@ function buildProposeOptions(host, state, client, select) {
     }),
     submit: (current, base) => {
       if (state.proposeMode === 'agent') {
-        return client.submitAgent({
-          ...base,
-          budget: {
-            max_rounds: Number(agentRounds.querySelector('input').value) || 6,
-            max_reads: Number(agentReads.querySelector('input').value) || 40,
-          },
-        });
+        const rounds = Number(agentRounds.querySelector('input').value);
+        const budget = { max_reads: Number(agentReads.querySelector('input').value) || 40 };
+        // 只在用户真的填了轮次时才带上；留空交给后端按库规模自适应
+        if (Number.isFinite(rounds) && rounds > 0) budget.max_iterations = rounds;
+        return client.submitAgent({ ...base, budget });
       }
       return client.submitProposal({
         ...base,

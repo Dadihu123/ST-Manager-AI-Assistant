@@ -1125,3 +1125,19 @@ def test_apply_classify_never_moves_undecided_to_root(tmp_path):
     assert payload['details'][0]['error'] == 'undecided'
 
 
+# ------------------------------------------------------------------ Agent 预算透传
+
+
+def test_submit_agent_keeps_raw_budget_for_adaptive_iterations(tmp_path):
+    """提交时不能把 budget 归一化掉：作业层要靠「有没有 max_iterations」决定是否自适应。"""
+    client, api, _store = build_app(tmp_path=tmp_path)
+
+    payload = client.post('/jobs/agent', json={'budget': {'max_reads': 12}}).get_json()
+
+    assert payload['success'] is True
+    assert payload['budget_adaptive'] is True
+    assert payload['budget']['max_iterations'] is None, '自适应时回执不能谎报成默认 6'
+    submitted = api.submitted
+    assert submitted['payload']['budget'] == {'max_reads': 12}, (
+        '作业 payload 里必须是用户原始 budget，不能预先填 max_iterations=6'
+    )
