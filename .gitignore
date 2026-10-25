@@ -30,3 +30,8 @@ tmp_*.png
 
 # 测试用临时数据目录（mkdtemp 落在仓库根，形如 tmpc23wv1zz/）
 /tmp*/
+
+# 设计类文档（本地设计稿，不入库；docs/agents/ 例外，见下）
+# 注意写 `docs/*` 而不是 `docs/`：父目录整个被忽略时无法再用 `!` 放行子目录
+docs/*
+!docs/agents/

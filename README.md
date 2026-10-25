@@ -88,7 +88,6 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 > 与 `ctx.entryId`（本次点了哪个贡献项）。插件用 `api.cards.list` /
 > `api.worldbook.sources` **自己解析**——宿主不在点击瞬间拉全量卡片，
 > 解析失败也能如实报错（而不是显示「0 张」）。
-> 详见 [宿主补丁清单](docs/2026-10-19-host-patch.md)。
 >
 > **作用域是面板的局部状态**：从右键进入再关掉、再从坞打开，看到的一定是干净的
 > 空作用域（旧版曾把右键的 12 张残留到下一次坞打开）。
@@ -123,7 +122,7 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 >
 > 不可用的入口**可见但置灰**，点击会跳到对应的配置位置，不会无反应。
 
-> ⚠️ 两个**已知缺口**（见 [宿主补丁清单](docs/2026-10-19-host-patch.md)）：
+> ⚠️ 两个**已知缺口**：
 > - 批量菜单项**不渲染角标**（右键菜单渲染了），所以「有几条待审批」只在右键菜单可见；
 > - 批量菜单**没有移动端渲染**，手机上无法从选中栏触发打标 / 归类 / 精简。
 > 插件侧已把角标写到对应贡献项上（`api.contributions.update(id, {badge})`），
@@ -774,4 +773,5 @@ python scripts/stm_plugin_check.py .
   `core/plugins/contract.py` 交叉验证，并用 `scripts/stm_plugin_check.py`（与主程序同源、
   独立可运行）做严格自检。
 
-设计文档：[`docs/2026-10-08-stm-ai-assistant-design.md`](docs/2026-10-08-stm-ai-assistant-design.md)（本仓库的唯一事实来源；实现与文档冲突时先改文档）。
+设计文档：`docs/2026-10-08-stm-ai-assistant-design.md`（本仓库的唯一事实来源；实现与文档冲突时先改文档）。
+该目录是本地设计稿，已通过 `.gitignore` 排除、不入库。
