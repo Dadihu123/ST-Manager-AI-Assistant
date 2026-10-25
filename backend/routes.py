@@ -1613,6 +1613,14 @@ def _apply_classify(api, store, run_id: str, job, payload) -> dict:
                             'issues': result['issues']})
             continue
 
+        # 弃权（category 留空 / skipped=undecided）**绝不落地**：
+        # 空路径会被主程序当成「根目录」，点一次「接受」就把卡移出所有分类。
+        # 这是 C4 的配套修复 —— 结果本身应该进待审，让人指定目标。
+        if not category or str(result.get('skipped') or '') == 'undecided':
+            skipped += 1
+            details.append({'card_id': card_id, 'error': 'undecided'})
+            continue
+
         plan.setdefault(category, []).append(card_id)
 
     applied = 0

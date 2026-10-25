@@ -284,7 +284,11 @@ CLASSIFY_OUTPUT_SCHEMA = {
     'strip_think': True,
     'json_only': True,
     'forbidden_wrappers': ['```json', '```'],
-    'required': ['category'],
+    # `category` **不能**放进 required：模型「自认不确定」的合法表达就是留空
+    # （见 core/classify.py 的 undecided 分支与 build_classify_instruction 第 4 条）。
+    # 一旦 required，空串会先被 schema 判成「缺少必需字段」，作业直接 failed，
+    # 永远走不到「进待审、等人指定」的路径（实测 bug，C4）。
+    'required': [],
     'properties': {
         'category': {'type': 'string', 'max_chars': 64},
         'confidence': {'type': 'number', 'min': 0, 'max': 1},

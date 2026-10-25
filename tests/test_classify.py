@@ -289,6 +289,9 @@ def test_classify_output_schema_is_small_and_focused():
         'category', 'confidence', 'reason',
     }
     assert profile['max_tokens'] == 256, '归类输出很短，不该给大额度'
+    assert 'category' not in profile['output_schema']['required'], (
+        'category 不能是 required：模型自认不确定时的合法表达就是留空'
+    )
 
 
 # ------------------------------------------------------------------ 作业链路
@@ -446,6 +449,48 @@ def test_run_classify_surfaces_move_failures(env, monkeypatch):
 
     assert ctx.summary['move_errors']
     assert any('A.png' in item for item in ctx.summary['move_errors'])
+
+
+def test_run_classify_undecided_goes_to_review_not_failed(env, monkeypatch):
+    """模型留空 category → 进待审（skipped=undecided），不是 failed，也不移动。
+
+    回归 C4：默认档案的 schema 曾把空 category 判成「缺少必需字段」，
+    作业直接 failed，`undecided` 分支成了死代码。
+    """
+    api, store = env
+    moves = []
+    api.cards.move = lambda ids, target: moves.append(target) or {'count': 0}
+    api.cards.create_category = lambda name, parent='': True
+
+    monkeypatch.setattr(jobs.llm, 'chat', lambda *a, **k: {
+        'content': _reply('', confidence=0.2), 'usage': {},
+    })
+
+    ctx = FakeCtx([{'key': 'A.png', 'payload': {'card_id': 'A.png'}}],
+                  payload={'provider_id': 'openai', 'apply_mode': 'auto', 'scheme': SCHEME})
+    jobs.run_classify(ctx, api=api, store=store)
+
+    result = ctx.reports[0]['result']
+    assert ctx.reports[0]['status'] == 'awaiting_review'
+    assert result['skipped'] == 'undecided'
+    assert result['low_confidence'] is True
+    # 弃权时不再保留一个自相矛盾的 confidence（0.95 + 低置信度）
+    assert result['confidence'] is None
+    assert ctx.summary['failed'] == 0
+    assert moves == [], '弃权不得落地（空分类会被当成根目录）'
+
+
+def test_parse_llm_result_allows_empty_category_with_builtin_schema():
+    """内置归类 schema 必须放行 `category: ""`（弃权是合法输出）。"""
+    parsing = load_backend_submodule('core.parsing')
+    profile = profiles.builtin_profile('builtin-classify')
+
+    outcome = parsing.parse_llm_result(
+        '{"category": "", "confidence": 0.2, "reason": "都不像"}',
+        profile['output_schema'],
+    )
+    assert outcome['ok'] is True, outcome['issues']
+    assert outcome['result']['category'] == ''
 
 
 def test_manifest_declares_classify_job():

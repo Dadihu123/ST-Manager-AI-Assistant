@@ -258,8 +258,13 @@ def normalize_result_category(data, scheme, *, allow_new: bool = False,
         issues.append(error)
 
     low = bool(score is not None and score < float(confidence_min or 0))
+    score_provided = score is not None
     if undecided:
+        # 留空 = 明确弃权，不是「低置信度」。两者语义不同：
+        # - 弃权：confidence 置空，避免出现「置信度 0.95 + 低置信度」的自相矛盾；
+        # - 低分：保留数字，让审批页按阈值提示。
         low = True
+        score = None
         warnings.append(
             '模型认为这张卡不属于任何候选分类（category 留空），需要人工指定',
         )
@@ -267,7 +272,7 @@ def normalize_result_category(data, scheme, *, allow_new: bool = False,
         warnings.append(
             f'置信度 {score:.2f} 低于 {confidence_min:.2f}，建议人工确认后再移动',
         )
-    if score is None:
+    if score is None and not score_provided:
         warnings.append('模型未给出置信度')
 
     return {

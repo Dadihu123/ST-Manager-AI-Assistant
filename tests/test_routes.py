@@ -1060,3 +1060,32 @@ def test_propose_apply_reports_invalid_merge(tmp_path):
     ).get_json()
 
     assert payload['merges_executed'][0]['error'] == 'invalid_merge'
+
+
+# ------------------------------------------------------------------ 归类落地：弃权不得移动
+
+
+def test_apply_classify_never_moves_undecided_to_root(tmp_path):
+    """弃权（category 留空）的条目即使被「接受」，也不能被当成根目录移动。"""
+    client, api, store = build_app(tmp_path=tmp_path)
+    moves = []
+    api.cards.move = lambda ids, target: (
+        moves.append((list(ids), target)) or {'count': len(ids), 'failed': []}
+    )
+    api.cards.create_category = lambda name, parent='': True
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.classify', 'status': 'completed'}
+    api.job_items = [
+        {'key': 'A.png', 'status': 'done',
+         'result': {'card_id': 'A.png', 'category': '', 'skipped': 'undecided'}},
+        {'key': 'B.png', 'status': 'done',
+         'result': {'card_id': 'B.png', 'category': '奇幻'}},
+    ]
+
+    payload = client.post('/jobs/run-1/apply', json={}).get_json()
+
+    assert payload['applied'] == 1
+    assert payload['skipped'] == 1
+    assert moves == [(['B.png'], '奇幻')], '弃权条目绝不能移动（空分类=根目录）'
+    assert payload['details'][0]['error'] == 'undecided'
+
+
