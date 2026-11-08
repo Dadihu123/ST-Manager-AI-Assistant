@@ -302,3 +302,59 @@ def test_prefill_boundary_with_brace_array():
     # 拼接后为 `[{"summary": ...}]`，取首项
     assert outcome['ok'] is True
     assert outcome['result']['summary'] == 'S'
+
+# ------------------------------------------------------------------ 每分类标签规则
+
+
+def test_parse_llm_result_applies_category_thresholds_and_quotas():
+    """新系统：按「分类阈值 → 分类配额 → 总上限」过滤，不再用 schema 的单一门槛。"""
+    import json
+
+    schema_spec = {
+        'json_only': True,
+        'properties': {
+            'summary': {'type': 'string', 'max_chars': 0},
+            'tags': {'type': 'array', 'max_items': 3, 'min_confidence': 0.5},
+        },
+    }
+    reply = json.dumps({
+        'summary': 'x',
+        'tags': [
+            {'name': '奇幻', 'confidence': 0.9},   # 题材（阈值 0.8）→ 留
+            {'name': '冒险', 'confidence': 0.7},   # 题材（阈值 0.8）→ 门槛挡
+            {'name': '校园', 'confidence': 0.6},   # 场景（默认 0.5）→ 留
+            {'name': '恋爱', 'confidence': 0.55},  # 场景（默认 0.5）→ 配额外
+        ],
+    }, ensure_ascii=False)
+
+    outcome = parsing.parse_llm_result(
+        reply, schema_spec,
+        tag_rules={'题材': {'confidence_min': 0.8}, '场景': {'max_tags': 1}},
+        tag_to_category={'奇幻': '题材', '冒险': '题材', '校园': '场景', '恋爱': '场景'},
+    )
+
+    assert outcome['ok'] is True
+    assert [item['name'] for item in outcome['result']['tags']] == ['奇幻', '校园']
+    joined = '\n'.join(outcome['warnings'])
+    assert '冒险' in joined and '0.70 < 0.80' in joined
+    assert '恋爱' in joined and '超过 1 个' in joined
+
+
+def test_parse_llm_result_without_rules_keeps_old_single_threshold():
+    """没给规则（归类/世界书等任务）时，仍按 schema 的 min_confidence 过滤。"""
+    import json
+
+    schema_spec = {
+        'properties': {
+            'summary': {'type': 'string', 'max_chars': 0},
+            'tags': {'type': 'array', 'max_items': 5, 'min_confidence': 0.8},
+        },
+    }
+    reply = json.dumps({'summary': 'x', 'tags': [
+        {'name': '奇幻', 'confidence': 0.9},
+        {'name': '冒险', 'confidence': 0.7},
+    ]}, ensure_ascii=False)
+
+    outcome = parsing.parse_llm_result(reply, schema_spec)
+
+    assert [item['name'] for item in outcome['result']['tags']] == ['奇幻']

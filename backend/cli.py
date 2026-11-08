@@ -233,6 +233,8 @@ def cmd_analyze(api, store, namespace) -> int:
 
     apply_to_disk = bool(options.get('apply'))
     limits = prompt_core.build_limits(config, profile)
+    # 与 HTTP / 作业链路同口径：生效上限回写进档案的 output_schema
+    profile = prompt_core.apply_limits(profile, limits)
     tag_library = read_tag_library(api)
     known_tags = known_tag_set(tag_library)
     usage_map = tag_usage(api)

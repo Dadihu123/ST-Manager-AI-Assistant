@@ -347,12 +347,18 @@ def truncate_text(text, limit: int) -> str:
     return window.rstrip()[:max(1, limit - 1)].rstrip() + '…'
 
 
-def validate_result(result, output_schema=None, *, strict: bool = False) -> dict:
+def validate_result(result, output_schema=None, *, strict: bool = False,
+                    tag_rules=None, tag_to_category=None,
+                    default_confidence: float = 0.5) -> dict:
     """对归一化结果做后置校验与挽救。
 
     规则来自 task spec 的 `output_schema`（设计文档 §8.5）：
     「生成约束」由 `schema.describe_constraints` 拼进 system，
     「后置校验」由本函数逐条核对 —— 两者读同一份声明，不会漂移。
+
+    `tag_rules` 给了就按「每分类置信度 + 每分类数量 + 总上限」过滤标签
+    （`tagpool.apply_rules`），不再使用 schema 里的单一 `min_confidence` 门槛；
+    没给则保持旧的单一门槛行为（归类 / 世界书等任务）。
 
     Returns:
         `{'result', 'issues', 'warnings', 'ok'}` —— `ok=False` 表示 strict 模式下判失败。
@@ -384,8 +390,29 @@ def validate_result(result, output_schema=None, *, strict: bool = False) -> dict
         if name not in normalized and name in data:
             normalized[name] = data[name]
 
-    # ---- 置信度下限：先筛掉低分的（在数量截断之前，否则会把低分项也算进上限）----
+    # ---- 置信度与数量 ----
+    # 新系统（给了 tag_rules）：按「每分类阈值 → 每分类配额 → 总数上限」过滤。
+    # 旧路径（没给）：保持 schema 的单一 `min_confidence` 门槛。
     confidence_min = schema_core.confidence_floor(spec, 'tags')
+    if tag_rules is not None:
+        from . import tagpool as tagpool_core  # noqa: PLC0415 - 避免模块级循环导入
+
+        limit = schema_core.item_limits(spec, 'tags')[1]
+        filtered = tagpool_core.apply_rules(
+            normalized['tags'],
+            tag_to_category=tag_to_category or {},
+            rules=tag_rules,
+            max_total=limit,
+            default_confidence=default_confidence,
+        )
+        normalized['tags'] = [
+            {'name': item['name'], 'confidence': item['confidence']}
+            for item in filtered['kept']
+        ]
+        for item in filtered['dropped']:
+            warnings.append(f'标签「{item["name"]}」已跳过：{item["reason"]}')
+        # 阈值/配额已经处理过，下面的旧门槛不能再筛一遍
+        confidence_min = 0
     if confidence_min:
         kept = []
         dropped_low = []
@@ -447,12 +474,16 @@ def validate_result(result, output_schema=None, *, strict: bool = False) -> dict
 
 
 def parse_llm_result(text, output_schema=None, *, strict: bool = False,
-                     prefill: str = '') -> dict:
+                     prefill: str = '', tag_rules=None, tag_to_category=None,
+                     default_confidence: float = 0.5) -> dict:
     """完整解析链路：清洗 →（拼回预填充）→ 解析 → 归一化 → 校验。
 
     Args:
         text: 模型返回的 `content`。
         prefill: 本次请求使用的 `assistant_prefill`。
+        tag_rules: 每分类标签规则（`tagpool.normalize_rules()` 的结果）。
+            给了就按新系统过滤标签；`None` = 保持旧的单一门槛。
+        tag_to_category: 标签 → 分类映射（用于查每分类阈值/配额）。
 
     **为什么需要 `prefill`**：预填充的语义是「模型从这里续写」，所以返回的
     `content` **不含**预填充那一段。例如发出 `{role:'assistant', content:'{'}`，
@@ -532,7 +563,11 @@ def parse_llm_result(text, output_schema=None, *, strict: bool = False,
         warnings.append('模型响应续写了预填充，已在解析前拼回')
 
     normalized = normalize_result(data, rules)
-    validation = validate_result(normalized, output_schema, strict=strict)
+    validation = validate_result(
+        normalized, output_schema, strict=strict,
+        tag_rules=tag_rules, tag_to_category=tag_to_category,
+        default_confidence=default_confidence,
+    )
 
     return {
         'ok': bool(validation['ok']),

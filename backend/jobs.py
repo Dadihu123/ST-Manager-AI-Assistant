@@ -237,6 +237,49 @@ def split_tags(tags, known: set, *, blocked=None) -> tuple:
     return accepted, suggested, blocked_names
 
 
+def filter_new_suggestions(suggestions, known: set, *, blocked=None, aliases=None) -> tuple:
+    """过滤「新标签建议」，返回 `(kept, dropped)`。
+
+    为什么必须拿**标签库**核对：模型只看得到预算内被列出的标签
+    （`listed ⊆ allowed`，标签池按 token 预算截断），预算外的真实标签它没见过，
+    就会当成新标签提出来；模型也可能把「标签库里已有、但它没写进 tags」的名字
+    直接塞进 `suggested_new_tags`。不挡掉的话，「建议新增标签」里会出现你早就有的标签。
+
+    别名先还原再判断：`情感纠葛 → 恋爱`，若「恋爱」已在库里，就不该再建议「情感纠葛」。
+    """
+    blocked_set = {str(name).strip() for name in (blocked or []) if str(name).strip()}
+    restored, alias_info = tagpool_core.restore_aliases(suggestions or [], aliases or [])
+    # 别名还原后的名字 → 模型原本写的名字（给警告用：「情感纠葛→恋爱」）
+    alias_back = {}
+    for entry in (alias_info or {}).get('applied') or []:
+        alias_back[str(entry.get('to') or '').strip()] = str(entry.get('from') or '').strip()
+
+    kept = []
+    dropped = []
+    seen = set()
+    for item in restored:
+        if isinstance(item, dict):
+            name = str(item.get('name') or '').strip()
+            reason = str(item.get('reason') or '')
+        else:
+            name = str(item or '').strip()
+            reason = ''
+        if not name or name in seen:
+            continue
+        original = alias_back.get(name, '')
+        if name in blocked_set:
+            dropped.append({'name': name, 'original': original,
+                            'reason': '属于排除/隔离的分类'})
+            continue
+        if name in known:
+            dropped.append({'name': name, 'original': original,
+                            'reason': '标签库里已存在'})
+            continue
+        seen.add(name)
+        kept.append({'name': name, 'reason': reason})
+    return kept, dropped
+
+
 def merge_suggestions(primary, secondary) -> list:
     """合并两批新标签建议（按 name 去重）。"""
     result = []
@@ -308,6 +351,10 @@ def run_analyze(ctx, *, api, store) -> None:
         return
 
     limits = prompt_core.build_limits(config, profile)
+    # 生效值回写进档案的 output_schema：生成约束 / 事后校验 / 超量截断读的都是它。
+    # 不回写就会出现「提示词说最多 20 个、模型返回 12 个却被档案里的 8 截掉」
+    # —— 配置页改了也等于没改。
+    profile = prompt_core.apply_limits(profile, limits)
     if not model_name:
         model_name = str(profile.get('model_match') or '').replace('*', '').strip() or 'unknown'
 
@@ -521,9 +568,21 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
             detail={'variables': rendered['missing_required']},
         )
 
+    # ---- 每分类标签规则（置信度门槛 / 分类数量 / 总数上限）----
+    # 规则要在**两处**用同一份：① 拼进 system 让模型知道该给几个、置信度要多高；
+    # ② 解析后用 `tagpool.apply_rules()` 确定性地执行（模型不听话也能兜住）。
+    tag_to_category = tagpool_core.classify_tags(tag_library)['tag_to_category']
+    tag_rules = config.get('tag_category_rules')
+    if not isinstance(tag_rules, dict):
+        tag_rules = {}
+    messages = prompt_core.append_system_note(
+        rendered['messages'],
+        tagpool_core.rules_text(tag_rules, limits.get('max_tags')),
+    )
+
     # ---- 调用 ----
     result = llm.chat(
-        rendered['messages'],
+        messages,
         provider=provider, api_key=api_key, extra_headers=extra_headers,
         model=model_name,
         temperature=profile.get('temperature'), top_p=profile.get('top_p'),
@@ -539,6 +598,7 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
     outcome = parsing.parse_llm_result(
         result.get('content'), profile.get('output_schema'), strict=strict,
         prefill=str(profile.get('assistant_prefill') or ''),
+        tag_rules=tag_rules, tag_to_category=tag_to_category,
     )
 
     if not outcome['ok']:
@@ -576,6 +636,22 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         )
 
     suggestions = merge_suggestions(parsed.get('suggested_new_tags'), suggested_from_tags)
+    # 模型很少完整看到标签库（预算会截断），它嘴里的「新标签」可能你早就有了。
+    # 这里拿真实标签库（+ 排除分类 + 别名）再核一遍，别把已有标签塞进建议队列。
+    suggestions, dropped_suggestions = filter_new_suggestions(
+        suggestions, known_tags,
+        blocked=blocked_tags_set,
+        aliases=profile.get('tag_aliases') or [],
+    )
+    if dropped_suggestions:
+        dropped_names = '、'.join(
+            (f'{item["original"]}→{item["name"]}' if item.get('original') else item['name'])
+            for item in dropped_suggestions[:8]
+        )
+        warnings.append(
+            f'「新标签建议」里有 {len(dropped_suggestions)} 个标签在标签库里已经存在'
+            f'（或属于排除分类），已忽略：{dropped_names}',
+        )
     if not pool_spec['allow_new_tags']:
         if suggestions:
             warnings.append(f'标签池不允许新标签，已丢弃 {len(suggestions)} 条建议')
@@ -634,8 +710,12 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
     card_tags = {
         str(item).strip() for item in (card.get('tags') or []) if str(item or '').strip()
     }
+    # 冻结分类（「排除」或「隔离」）里的标签是用户手写并已固定的内容：
+    # 连「建议删除」都不给，免得审批页出现「要不要删掉你自己写的那条」。
+    frozen_tags = tagpool_core.protected_tags(tag_library, pool_spec)
     removals = []
     ignored_removals = []
+    frozen_removals = []
     for entry in (parsed.get('tag_removals') or []):
         name = str(
             (entry or {}).get('name') if isinstance(entry, dict) else entry or '',
@@ -644,6 +724,9 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
             continue
         if name not in card_tags:
             ignored_removals.append(name)
+            continue
+        if name in frozen_tags:
+            frozen_removals.append(name)
             continue
         if name in [item['name'] for item in removals]:
             continue
@@ -657,6 +740,11 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
     if ignored_removals:
         warnings.append(
             'tag_removals 里有卡片没有的标签，已忽略: ' + '、'.join(ignored_removals[:5]),
+        )
+    if frozen_removals:
+        warnings.append(
+            'tag_removals 里有属于「排除/隔离分类」的标签，已跳过（这些分类你自己维护，'
+            '插件不会建议删除）: ' + '、'.join(frozen_removals[:5]),
         )
     result_payload['tag_removals'] = removals
     result_payload['remove_tags'] = [item['name'] for item in removals]
@@ -1303,6 +1391,10 @@ def run_classify(ctx, *, api, store) -> None:
     # 先按任务挑档案，兜底反而会覆盖用户自己匹配到的通用档案，故删除（C6/P1-3）。
 
     limits = prompt_core.build_limits(config, profile)
+    # 生效值回写进档案的 output_schema：生成约束 / 事后校验 / 超量截断读的都是它。
+    # 不回写就会出现「提示词说最多 20 个、模型返回 12 个却被档案里的 8 截掉」
+    # —— 配置页改了也等于没改。
+    profile = prompt_core.apply_limits(profile, limits)
     if not model_name:
         model_name = str(profile.get('model_match') or '').replace('*', '').strip() or 'unknown'
 

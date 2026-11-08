@@ -148,7 +148,18 @@ def build_preview(*, api, store, config, card_id: str, profile_id: str = '',
         api=api, config=config, card=card, profile=profile,
         model_name=model_name, budget_tokens=budget_tokens, card_id=identifier,
     )
+    # 预览必须和真实作业同口径：把生效上限回写进 output_schema，否则预览显示了
+    # 模型能力设置里的值、真正跑起来又按档案旧值校验/截断。
+    profile = prompt_core.apply_limits(profile, bundle['limits'])
     rendered = prompt_core.render_messages(profile, bundle['variables'], task='analyze')
+    # 与真实作业同口径：把「每分类置信度 / 数量」规则也拼进 system，预览里看得见
+    tag_rules = config.get('tag_category_rules')
+    if not isinstance(tag_rules, dict):
+        tag_rules = {}
+    rendered['messages'] = prompt_core.append_system_note(
+        rendered['messages'],
+        tagpool_core.rules_text(tag_rules, bundle['limits'].get('max_tags')),
+    )
     prompt_tokens = tokens.estimate_messages(rendered['messages'])
 
     # 按变量拆解 token：让用户看清钱花在哪个字段上
@@ -228,14 +239,22 @@ def estimate_run(*, api, config, cards, profile, total: int, budget_tokens: int 
     if not samples or total <= 0:
         return {'sampled': 0, 'prompt_tokens': 0, 'completion_tokens': 0, 'cost': None}
 
+    tag_rules = config.get('tag_category_rules')
+    if not isinstance(tag_rules, dict):
+        tag_rules = {}
     prompt_total = 0
     for card in samples:
         bundle = build_variables(
             api=api, config=config, card=card, profile=profile,
             model_name='', budget_tokens=budget_tokens,
         )
+        profile = prompt_core.apply_limits(profile, bundle['limits'])
         rendered = prompt_core.render_messages(profile, bundle['variables'], task='analyze')
-        prompt_total += tokens.estimate_messages(rendered['messages'])['total']
+        messages = prompt_core.append_system_note(
+            rendered['messages'],
+            tagpool_core.rules_text(tag_rules, bundle['limits'].get('max_tags')),
+        )
+        prompt_total += tokens.estimate_messages(messages)['total']
 
     sampled = len(samples)
     average_prompt = int(prompt_total / sampled)

@@ -184,6 +184,44 @@ def test_auto_mode_writes_summary_and_merges_tags(api, store, stub_llm, stub_bri
     ]
 
 
+def test_saved_limits_reach_prompt_and_truncation(api, store, monkeypatch, stub_bridge):
+    """回归：配置页的「最大标签数 / 概览字数上限」必须真的进作业。
+
+    修前内置档案写死 `max_items=8` / `max_chars=300`，`build_limits` 取更严格者，
+    于是配置 12 / 600 被压回 8 / 300 —— 用户「保存并应用」后看到的行为完全没变。
+    """
+    api._config.update({'max_tags': 12, 'summary_max_chars': 600, 'apply_mode': 'auto'})
+    reply = json.dumps({
+        'summary': '概' * 500,
+        'tags': [{'name': f'标签{i}', 'confidence': 0.9} for i in range(12)],
+        'suggested_new_tags': [],
+    }, ensure_ascii=False)
+    sent = []
+
+    def fake_chat(messages, **kwargs):
+        sent.append(list(messages))
+        return {
+            'content': reply,
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5},
+            'usage_estimated': False,
+            'model': 'test-model',
+            'latency_ms': 1,
+            'attempts': 1,
+        }
+
+    monkeypatch.setattr(jobs_module.llm, 'chat', fake_chat)
+    ctx = run_job(api, store, payload={})
+
+    body = '\n'.join(str(message.get('content') or '') for message in sent[0])
+    assert '最多 12 个' in body, '模板里的 {{ limits.max_tags }} 必须用配置值'
+    assert '不超过 600 字' in body
+    assert '最多 12 项' in body, 'schema 描述的生成约束也必须用配置值'
+
+    result = ctx.reports[0]['result']
+    assert len(result['tags']) == 12, '配置 12 就该保留 12 个，不能被档案里的 8 截断'
+    assert len(result['summary']) == 500, '概览 500 字在 600 字上限内，不得被截'
+
+
 def test_auto_mode_records_card_meta(api, store, stub_llm, stub_bridge):
     run_job(api, store, payload={'apply_mode': 'auto'})
     meta = store.get_card_meta('Alice.png')
@@ -535,6 +573,138 @@ def _reply_with(**extra):
     return payload
 
 
+def test_analyze_applies_per_category_rules(api, store, stub_llm, stub_bridge,
+                                            monkeypatch):
+    """新置信度系统：按分类阈值 + 分类配额 + 总数上限过滤，提示词里也带上规则。"""
+    api._tag_library = {
+        'tags': ['奇幻', '冒险', '校园', '恋爱'],
+        'taxonomy': {
+            'tag_to_category': {
+                '奇幻': '题材', '冒险': '题材', '校园': '场景', '恋爱': '场景',
+            },
+            'categories': {'题材': [], '场景': []},
+        },
+        'prefs': {},
+    }
+    api._cards['Alice.png'] = dict(CARD, tags=['奇幻'])
+    api._config.update({
+        'max_tags': 3,
+        'tag_category_rules': json.dumps({
+            '题材': {'confidence_min': 0.8, 'max_tags': 1},
+            '场景': {'max_tags': 1},
+        }, ensure_ascii=False),
+    })
+
+    reply = _reply_with(tags=[
+        {'name': '奇幻', 'confidence': 0.9},   # 题材 → 留（配额外？不，最高分）
+        {'name': '冒险', 'confidence': 0.7},   # 题材 → 低于 0.8
+        {'name': '校园', 'confidence': 0.6},   # 场景 → 留（场景配额 1）
+        {'name': '恋爱', 'confidence': 0.55},  # 场景 → 超过配额 1
+    ])
+    sent = []
+
+    def fake_chat(messages, **kwargs):
+        sent.append(messages)
+        return {'content': json.dumps(reply, ensure_ascii=False), 'usage': {}}
+
+    monkeypatch.setattr(jobs_module.llm, 'chat', fake_chat)
+
+    ctx = run_job(api, store, payload={'apply_mode': 'review'})
+    result = ctx.reports[0]['result']
+
+    assert [item['name'] for item in result['tags']] == ['奇幻', '校园']
+    joined = '\n'.join(result['warnings'])
+    assert '冒险' in joined and '0.70 < 0.80' in joined
+    assert '恋爱' in joined and '超过 1 个' in joined
+
+    # 规则必须进提示词，否则模型只能靠猜、配额变成纯事后截断
+    system = '\n'.join(
+        str(message.get('content') or '') for message in sent[0]
+        if message.get('role') == 'system'
+    )
+    assert '标签总数最多 3 个' in system
+    assert '题材' in system and '0.80' in system and '最多 1 个' in system
+
+
+def test_analyze_without_rules_uses_default_confidence(api, store, stub_llm, stub_bridge,
+                                                       monkeypatch):
+    """没设置规则的分类：默认置信度 0.5、数量不限（只受总上限）。"""
+    api._tag_library = {
+        'tags': ['奇幻', '冒险'],
+        'taxonomy': {'tag_to_category': {'奇幻': '题材', '冒险': '题材'},
+                     'categories': {'题材': []}},
+        'prefs': {},
+    }
+    api._config.update({'max_tags': 8})
+
+    reply = _reply_with(tags=[
+        {'name': '奇幻', 'confidence': 0.9},
+        {'name': '冒险', 'confidence': 0.4},   # < 0.5 → 丢
+    ])
+    monkeypatch.setattr(jobs_module.llm, 'chat', lambda *a, **k: {
+        'content': json.dumps(reply, ensure_ascii=False), 'usage': {},
+    })
+
+    ctx = run_job(api, store, payload={'apply_mode': 'review'})
+    result = ctx.reports[0]['result']
+
+    assert [item['name'] for item in result['tags']] == ['奇幻']
+
+
+def test_filter_new_suggestions_checks_library_and_aliases():
+    """建议过滤：别名还原后再查库；已在库里的丢掉。"""
+    kept, dropped = jobs_module.filter_new_suggestions(
+        [
+            {'name': '情感纠葛', 'reason': 'r'},   # 别名 → 恋爱（已有）
+            {'name': '全新标签', 'reason': 'r'},
+            {'name': '成人向', 'reason': 'r'},     # 属于排除分类
+        ],
+        {'恋爱'},
+        blocked={'成人向'},
+        aliases=[{'alias': '情感纠葛', 'canonical': '恋爱'}],
+    )
+    assert [item['name'] for item in kept] == ['全新标签']
+    reasons = {item['name']: item['reason'] for item in dropped}
+    assert reasons['恋爱'] == '标签库里已存在'
+    assert dropped[0]['original'] == '情感纠葛', '警告里要能显示「原名→规范名」'
+    assert '排除' in reasons['成人向']
+
+
+def test_new_tag_suggestions_never_include_existing_tags(api, store, stub_llm, stub_bridge,
+                                                         monkeypatch):
+    """回归：模型把「你已经有的标签」写进 suggested_new_tags，不能进建议队列。
+
+    模型看不到预算外的标签（标签池按 token 截断），所以它口中的「新标签」
+    必须拿真实标签库再核一遍，否则「建议新增标签」里会出现你早就有的标签。
+    """
+    api._tag_library = {
+        'tags': ['奇幻', '冒险'],
+        'taxonomy': {
+            'tag_to_category': {'奇幻': '题材', '冒险': '题材'},
+            'categories': {'题材': []},
+        },
+        'prefs': {},
+    }
+    api._cards['Alice.png'] = dict(CARD, tags=[])
+    reply = _reply_with(
+        tags=[{'name': '奇幻', 'confidence': 0.9}],
+        suggested_new_tags=[
+            {'name': '冒险', 'reason': '标签库中不存在'},   # 其实库里已经有了
+            {'name': '真实新标签', 'reason': '确实没有'},
+        ],
+    )
+    monkeypatch.setattr(jobs_module.llm, 'chat', lambda *a, **k: {
+        'content': json.dumps(reply, ensure_ascii=False), 'usage': {},
+    })
+
+    ctx = run_job(api, store, payload={'apply_mode': 'review'})
+    result = ctx.reports[0]['result']
+
+    assert [item['name'] for item in result['new_tags']] == ['真实新标签']
+    assert result['tags_suggested'] == ['真实新标签']
+    assert any('已经存在' in text and '冒险' in text for text in result['warnings'])
+
+
 def test_custom_schema_field_flows_into_result(api, store, stub_llm, stub_bridge,
                                                monkeypatch):
     profile = profiles_core.normalize_profile({
@@ -579,6 +749,40 @@ def test_tag_removals_are_limited_to_existing_tags(api, store, stub_llm, stub_br
     assert [item['name'] for item in result['tag_removals']] == ['奇幻']
     assert result['remove_tags'] == ['奇幻']
     assert any('已忽略' in item for item in result['warnings'])
+
+
+def test_tag_removals_skip_frozen_categories(api, store, stub_llm, stub_bridge, monkeypatch):
+    """「排除 / 隔离」分类是用户手写并固定的内容：连「建议删除」都不给。
+
+    否则审批页会冒出「要不要删掉你自己写的那条标签」，自动模式开删标签时
+    还可能真的删掉。冻结分类只认**明确排除 / 隔离**，不含「不在白名单」。
+    """
+    api._tag_library = {
+        'tags': ['奇幻', '关系标签', 'R18'],
+        'taxonomy': {
+            'tag_to_category': {'奇幻': '题材', '关系标签': '关系', 'R18': '成人'},
+            'categories': {'题材': [], '关系': [], '成人': []},
+        },
+        'prefs': {'isolated_categories': ['成人']},
+    }
+    api._cards['Alice.png'] = dict(CARD, tags=['奇幻', '关系标签', 'R18'])
+    api._config.update({'tag_pool_categories_exclude': '关系'})
+
+    reply = _reply_with(tag_removals=[
+        {'name': '奇幻', 'reason': '与卡片无关'},
+        {'name': '关系标签', 'reason': '被排除的分类'},
+        {'name': 'R18', 'reason': '隔离分类'},
+    ])
+    monkeypatch.setattr(jobs_module.llm, 'chat', lambda *a, **k: {
+        'content': json.dumps(reply, ensure_ascii=False), 'usage': {},
+    })
+
+    ctx = run_job(api, store, payload={'apply_mode': 'review'})
+    result = ctx.reports[0]['result']
+
+    assert [item['name'] for item in result['tag_removals']] == ['奇幻']
+    assert result['remove_tags'] == ['奇幻']
+    assert any('排除/隔离分类' in text for text in result['warnings']), result['warnings']
 
 
 def test_tag_removals_are_capped_at_three(api, store, stub_llm, stub_bridge, monkeypatch):

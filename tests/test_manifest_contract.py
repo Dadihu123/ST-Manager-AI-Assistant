@@ -622,6 +622,27 @@ def test_secret_schema_uses_supported_subset(manifest):
     _assert_schema_subset(manifest.get('secret_schema'), where='secret_schema')
 
 
+def test_tag_pool_categories_are_declared_as_strings(manifest):
+    """标签池的分类白/黑名单与每分类规则必须是**声明过的字符串键**。
+
+    宿主的 `api.config.set()` 只接受 `config_schema` 里声明过的键：写内部结构
+    `tag_pool`（dict）会被拒绝，表现为「保存并应用后并没有保存」。
+    """
+    properties = manifest['config_schema']['properties']
+    for key in ('tag_pool_categories_include', 'tag_pool_categories_exclude',
+                'tag_category_rules'):
+        spec = properties[key]
+        assert spec['type'] == 'string', f'{key} 必须是 string（宿主表单只支持标量）'
+        assert str(spec.get('title') or '').strip(), f'{key} 需要中文标题'
+        assert str(spec.get('description') or '').strip(), f'{key} 需要填写说明'
+
+
+def test_legacy_global_confidence_is_gone(manifest):
+    """全局「标签置信度下限」已被「每分类置信度」取代，不应再出现在配置表单里。"""
+    properties = manifest['config_schema']['properties']
+    assert 'confidence_min' not in properties
+
+
 # --------------------------------------------------------------- 模块边界
 
 

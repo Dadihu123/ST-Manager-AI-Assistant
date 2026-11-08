@@ -94,6 +94,169 @@ def test_categories_include_limits_candidates():
     assert set(result['allowed']) == {'校园', '恋爱'}
 
 
+def test_unmapped_tags_belong_to_default_category():
+    """没有分类映射的标签归入 `default_category`（宿主界面里的「未整理」）。
+
+    否则「未整理」只统计显式映射的那部分（实测宿主 287、插件 12），
+    「排除 未整理」也挡不住它们。
+    """
+    library = {
+        'tags': ['奇幻', '散装标签'],
+        'taxonomy': {
+            'default_category': '未整理',
+            'tag_to_category': {'奇幻': '题材'},
+            'categories': {'题材': []},
+        },
+        'prefs': {},
+    }
+
+    index = tagpool.classify_tags(library)
+    assert index['tag_to_category']['散装标签'] == '未整理'
+    assert index['default_category'] == '未整理'
+    assert '未整理' in index['categories']
+
+    pool = dict(tagpool.default_pool(), categories_exclude=['未整理'])
+    result = tagpool.resolve_candidates(library, pool)
+    assert result['allowed'] == ['奇幻']
+    assert result['excluded']['散装标签'] == '排除分类 未整理'
+    assert '散装标签' in tagpool.protected_tags(library, pool), '默认分类被排除时也算冻结'
+
+
+# ------------------------------------------------------------------ 每分类规则
+#
+# 用户要的新系统：去掉全局置信度，改成「每个分类一个阈值 + 一个数量」，
+# 外加一个最大总数量；未设置的分类默认阈值 0.5、数量不限；数量 0 = 不选。
+
+
+def test_normalize_rules_accepts_dict_and_json():
+    rules = tagpool.normalize_rules({
+        '人设': {'confidence_min': 0.6, 'max_tags': 3},
+        '关系': {'max_tags': 0},
+        '未设置数量': {'confidence_min': 0.4},
+        '坏的': 'x',
+        '超范围': {'confidence_min': 3, 'max_tags': -5},
+    })
+    assert rules['人设'] == {'confidence_min': 0.6, 'max_tags': 3}
+    assert rules['关系'] == {'max_tags': 0}, '0 = 不选，必须保留'
+    assert rules['未设置数量'] == {'confidence_min': 0.4}, '数量缺省 = 不限'
+    assert '坏的' not in rules
+    assert rules['超范围'] == {'confidence_min': 1.0, 'max_tags': 0}, '越界值被钳位'
+
+    assert tagpool.normalize_rules('{"人设": {"max_tags": 2}}') == {'人设': {'max_tags': 2}}
+    assert tagpool.normalize_rules('不是 JSON') == {}
+    assert tagpool.normalize_rules(None) == {}
+
+
+def test_rule_for_uses_default_confidence_and_unlimited_quota():
+    rule = tagpool.rule_for({}, '人设')
+    assert rule['confidence_min'] == 0.5
+    assert rule['max_tags'] is None, '没设置 = 不限'
+
+    rule = tagpool.rule_for({'人设': {'max_tags': 2}}, '人设')
+    assert rule['confidence_min'] == 0.5
+    assert rule['max_tags'] == 2
+
+
+def test_rules_text_mentions_total_thresholds_and_quotas():
+    text = tagpool.rules_text(
+        {'人设': {'confidence_min': 0.6, 'max_tags': 3}, '关系': {'max_tags': 0}}, 8,
+    )
+    assert '最多 8 个' in text
+    assert '人设' in text and '0.60' in text and '最多 3 个' in text
+    assert '关系' in text and '不要输出任何标签' in text
+    assert '其余分类' in text and '0.50' in text
+    assert tagpool.rules_text({}, 0) == ''
+
+
+def test_apply_rules_filters_by_category_threshold():
+    tags = [
+        {'name': '奇幻', 'confidence': 0.9},   # 题材
+        {'name': '冒险', 'confidence': 0.6},   # 题材
+        {'name': '校园', 'confidence': 0.4},   # 场景
+    ]
+    mapping = {'奇幻': '题材', '冒险': '题材', '校园': '场景'}
+    result = tagpool.apply_rules(
+        tags, tag_to_category=mapping,
+        rules={'题材': {'confidence_min': 0.8}}, max_total=10,
+    )
+    assert [item['name'] for item in result['kept']] == ['奇幻']
+    dropped = {item['name']: item['reason'] for item in result['dropped']}
+    assert '0.60 < 0.80' in dropped['冒险']
+    assert '0.40 < 0.50' in dropped['校园'], '未设置的分类用默认 0.5'
+
+
+def test_apply_rules_quota_zero_disables_category_and_total_cap():
+    tags = [
+        {'name': '奇幻', 'confidence': 0.9}, {'name': '冒险', 'confidence': 0.8},
+        {'name': '校园', 'confidence': 0.95}, {'name': '恋爱', 'confidence': 0.7},
+    ]
+    mapping = {'奇幻': '题材', '冒险': '题材', '校园': '场景', '恋爱': '场景'}
+
+    # 题材限 1 个、场景 0 个（禁用）→ 只剩题材里置信度最高的
+    result = tagpool.apply_rules(
+        tags, tag_to_category=mapping,
+        rules={'题材': {'max_tags': 1}, '场景': {'max_tags': 0}}, max_total=5,
+    )
+    assert [item['name'] for item in result['kept']] == ['奇幻']
+    dropped = {item['name']: item['reason'] for item in result['dropped']}
+    assert '超过 1 个' in dropped['冒险']
+    assert '设为不选' in dropped['校园'] and '设为不选' in dropped['恋爱']
+
+    # 总数上限再把结果砍到 1 个
+    kept = tagpool.apply_rules(
+        tags, tag_to_category=mapping, rules={}, max_total=1,
+    )
+    assert len(kept['kept']) == 1
+    assert kept['kept'][0]['name'] == '校园', '按置信度从高到低截断'
+
+
+def test_apply_rules_drops_tags_without_confidence():
+    result = tagpool.apply_rules(
+        [{'name': '奇幻', 'confidence': None}],
+        tag_to_category={'奇幻': '题材'}, rules={}, max_total=5,
+    )
+    assert result['kept'] == []
+    assert result['dropped'][0]['reason'] == '缺少置信度'
+
+
+def test_protected_tags_only_covers_excluded_or_isolated_categories():
+    """冻结标签 = 明确「排除」或「隔离」的分类下的标签。
+
+    只收窄「只取」白名单不等于冻结：那只是「这次不参与挑词」，
+    用户并没有说那些标签固定不变。
+    """
+    frozen = tagpool.protected_tags(
+        LIBRARY,
+        dict(tagpool.default_pool(), categories_exclude=['题材'], categories_include=['成人']),
+    )
+    assert frozen == {'奇幻', '冒险', 'R18', '血腥'}, '题材被排除 + 成人是隔离分类'
+    assert '校园' not in frozen, '场景只是不在白名单，不算冻结'
+
+    off = dict(tagpool.default_pool(), categories_exclude=['题材'], respect_isolated=False)
+    assert tagpool.protected_tags(LIBRARY, off) == {'奇幻', '冒险'}, '关掉隔离后不算冻结'
+
+    # 隔离分类即使没写进「排除」也算冻结（respect_isolated 默认开）
+    assert tagpool.protected_tags(LIBRARY, tagpool.default_pool()) == {'R18', '血腥'}
+
+
+def test_categories_include_also_drops_uncategorized_tags():
+    """设了「只取这些分类」后，没有分类的标签也必须被排除。
+
+    否则未分类标签会漏进候选集，用户的观感就是「设了跟没设一样」。
+    """
+    library = {
+        'tags': ['奇幻', '散装标签'],
+        'taxonomy': {'tag_to_category': {'奇幻': '题材'}, 'categories': {'题材': []}},
+        'prefs': {},
+    }
+    pool = dict(tagpool.default_pool(), categories_include=['题材'])
+    result = tagpool.resolve_candidates(library, pool)
+
+    assert result['allowed'] == ['奇幻']
+    assert result['excluded']['散装标签'] == '无分类'
+    assert '散装标签' in result['blocked']
+
+
 def test_categories_exclude_removes_candidates():
     pool = dict(tagpool.default_pool(), categories_exclude=['题材'])
     result = tagpool.resolve_candidates(LIBRARY, pool)

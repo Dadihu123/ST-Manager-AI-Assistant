@@ -132,7 +132,11 @@ def test_normalize_profile_fills_defaults():
     assert data['missing_policy'] == 'error'
     assert data['schema_version'] == 2, 'v2 一步到位，不做 v1 迁移'
     assert data['output_schema']['json_only'] is True
-    assert data['output_schema']['properties']['summary']['max_chars'] == 300
+    # 0 = 跟随全局配置（设置页的「概览字数上限 / 最大标签数 / 标签置信度下限」）。
+    # 写死 300 / 8 / 0.5 会让配置页只能调小、无法调大。
+    assert data['output_schema']['properties']['summary']['max_chars'] == 0
+    assert data['output_schema']['properties']['tags']['max_items'] == 0
+    assert data['output_schema']['properties']['tags']['min_confidence'] == 0
     assert data['apply_actions'], '默认带三个动作'
     assert data['stop'] == []
 

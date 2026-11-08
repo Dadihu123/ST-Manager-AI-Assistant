@@ -1,6 +1,10 @@
 # AI 角色卡分析助手（stm-ai-assistant）
 
-ST-Manager 的官方 AI 插件。批量把角色卡变成「一句话概览 + 结构化标签」，并把这件事做得可审计、可回滚、不重复扣费：
+> **本副本是「非官方修改版」（版本 0.4.0）**，基于上游 v0.3.0 修改，按 **Apache-2.0** 分发。
+> 主要差异：每分类置信度/数量、标签池可视化设置、可调 token 预算、标签写入失败修复等，
+> 详见 **[FORK.md](FORK.md)** 与 `CHANGELOG.md`。上游版权归原作者；本副本未获官方背书。
+
+ST-Manager 的 AI 插件。批量把角色卡变成「一句话概览 + 结构化标签」，并把这件事做得可审计、可回滚、不重复扣费：
 
 - **服务端调用 LLM**：API Key 只存在服务端 `secrets.json`，永不下发浏览器。
 - **按模型分档的提示词工程**：档案（Profile）带 `model_match` / 优先级 / 破限段 / 格式与字数规则；模板变量保存时校验，预览先看再跑。
@@ -381,6 +385,26 @@ notes            → 丢弃（主程序保留目录）
 }
 ```
 
+### 设置页（推荐）：每分类置信度 / 数量 / 预算
+
+本副本把最常调的三件事搬到了 **设置 → AI 助手设置 → 标签池**：
+
+| 控件 | 作用 |
+|---|---|
+| **最大总数量** | 一次分析最多打几个标签（硬上限，1–20） |
+| **每个分类的「标签置信度」** | 低于它的标签不打；未单独设置的分类默认 **0.5** |
+| **每个分类的「设置数量」** | 该分类最多保留几个（按置信度降序）；**0 = 一个都不选**；留空 = 不限 |
+| **标签池 token 预算** | 列多少标签给模型看（默认 1200，约 60–100 个；200–20000，受上下文夹取） |
+
+- 各分类「设置数量」之和 **超过** 总上限时：保存会**弹窗提醒**（列出超了多少），确认后仍可保存；
+  实际打标时按总上限按置信度截断，分类配额只作参考。
+- 规则会同时写进 system 提示词（模型知道该给几个、置信度要多高）并在解析后**确定性执行**
+  （分类阈值 → 分类配额 → 总数截断），被跳过的标签会写进作业警告。
+- 存储为 `config_schema` 里声明过的键：`max_tags`、`tag_pool_categories_include/exclude`、
+  `tag_category_rules`（JSON）、`tag_pool_budget_tokens`。
+- 旧版的**全局「标签置信度下限」（`confidence_min`）已删除**；档案里自己写的
+  `output_schema.tags.min_confidence` 仍然生效（作为该档案的额外门槛）。
+
 **两层注入**（学世界书取样的做法）：
 
 1. 分类概览 —— 只有分类名 + 该类标签数量，成本极低但让模型知道「有哪些维度」；
@@ -519,9 +543,12 @@ tokens.by_block = {
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `default_profile_id` | string | `""` | 未显式指定时使用的档案 id；留空表示按模型自动匹配 |
-| `max_tags` | integer | `8` | 最大标签数（全局上限，与档案规则取更严格者） |
+| `max_tags` | integer | `8` | 最大标签数（总上限）。各分类「设置数量」之和不应超过它；未单独设置的分类只受它约束 |
 | `summary_max_chars` | integer | `300` | 概览字数上限 |
-| `confidence_min` | number | `0.5` | 标签置信度下限（低于此值丢弃） |
+| `tag_pool_categories_include` | string | `""` | 只取这些**标签分类**（逗号分隔）。留空 = 不限制 |
+| `tag_pool_categories_exclude` | string | `""` | 排除这些标签分类（逗号分隔）。被排除的分类是「冻结」的：不给 AI 看、不会建议删除、落地也不会删 |
+| `tag_category_rules` | string(JSON) | `""` | 每分类规则：`{"分类": {"confidence_min": 0.6, "max_tags": 3}}`；由设置页维护，一般不用手填 |
+| `tag_pool_budget_tokens` | integer | `1200` | 标签池 token 预算（列多少标签给模型看）；受上下文长度夹取 |
 | `batch_size` | integer | `5` | 每批张数 |
 | `concurrency` | integer | `1` | 并发数（过大易触发限流） |
 | `apply_mode` | enum | `review` | `auto` 直接写入 / `review` 逐条审批 |
@@ -533,6 +560,10 @@ tokens.by_block = {
 | `price_per_1k_prompt` | number | `0` | 每千 prompt token 单价（用于成本预估，0 表示不估算） |
 | `price_per_1k_completion` | number | `0` | 每千 completion token 单价 |
 | `currency` | string | `CNY` | 计价货币符号 |
+
+> `confidence_min`（全局标签置信度下限）在本副本中**已删除**，改用每分类规则；
+> 内置档案的 `output_schema` 里 `max_items` / `max_chars` / `min_confidence` 写 **0**
+> 表示「跟随全局配置」。
 
 ---
 

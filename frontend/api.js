@@ -27,6 +27,11 @@ export function createClient(api) {
     settings: () => call('/settings'),
     saveSettings: (modelCapabilities) =>
       call('/settings', { method: 'POST', body: { model_capabilities: modelCapabilities } }),
+
+    // 标签池（分类白/黑名单）：GET 同时返回可选的标签分类清单
+    tagPool: () => call('/tag-pool'),
+    saveTagPool: (payload) =>
+      call('/tag-pool', { method: 'POST', body: payload }),
     cards: (query = '') => call(`/cards${query ? `?q=${encodeURIComponent(query)}` : ''}`),
 
     profiles: () => call('/profiles'),

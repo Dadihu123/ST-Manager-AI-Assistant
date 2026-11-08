@@ -23,6 +23,7 @@
 **不回写主程序**（避免插件篡改用户的标签治理配置）。
 """
 
+import json
 import re
 
 from .tokens import estimate
@@ -128,6 +129,31 @@ def profile_pool(profile, config=None) -> dict:
     return normalize_pool(merged)
 
 
+def protected_tags(tag_library, pool) -> set:
+    """「冻结分类」下的标签名集合：所属分类被排除，或该分类是隔离分类。
+
+    这些分类是用户**手写并已固定**的内容（「排除」的语义就是「别动我这些」），
+    因此它们不只是「不给 AI 看」，连 AI 的「建议删除标签」也不该指向它们。
+
+    与 `blocked` 的区别：`blocked` 还包含「不在 include 白名单里」的标签
+    （那是「这次不参与挑词」，不代表用户冻结了它们）；这里只认**明确排除 /
+    隔离**的分类。
+    """
+    spec = normalize_pool(pool)
+    index = classify_tags(tag_library)
+
+    frozen = set(spec['categories_exclude'])
+    if spec['respect_isolated']:
+        frozen |= set(index['isolated'])
+    if not frozen:
+        return set()
+
+    return {
+        tag for tag, category in index['tag_to_category'].items()
+        if category in frozen
+    }
+
+
 # ------------------------------------------------------------------ 词面重叠
 
 
@@ -226,6 +252,16 @@ def classify_tags(tag_library) -> dict:
     categories = _to_str_list(taxonomy.get('categories').keys()
                               if isinstance(taxonomy.get('categories'), dict) else [])
 
+    # 没有显式分类映射的标签归入 `default_category`（宿主标签页显示为「未整理」）。
+    # 不做这一步，「未整理」只统计显式映射的那部分，数量和宿主界面对不上
+    # （实测：宿主显示 287，插件只数到 12）。同时让「排除 未整理」真的能挡住它们。
+    default_category = str(taxonomy.get('default_category') or '').strip()
+    if default_category:
+        for tag in tags:
+            tag_to_category.setdefault(tag, default_category)
+        if default_category not in categories:
+            categories.append(default_category)
+
     prefs = data.get('prefs') if isinstance(data.get('prefs'), dict) else {}
 
     isolated = data.get('isolated_categories') or prefs.get('isolated_categories') or []
@@ -242,6 +278,7 @@ def classify_tags(tag_library) -> dict:
         'tags': tags,
         'tag_to_category': tag_to_category,
         'categories': categories,
+        'default_category': default_category,
         'isolated': isolated,
         'usage': data.get('usage') if isinstance(data.get('usage'), dict) else {},
         'blacklist': blacklist,
@@ -290,9 +327,16 @@ def resolve_candidates(tag_library, pool, *, card=None) -> dict:
                 excluded[tag] = f'排除分类 {category}'
             continue
 
-        if include_categories and category and category not in include_categories:
-            excluded[tag] = f'不在指定分类 {category}'
-            continue
+        # 「只取这些分类」= 白名单：**没有分类的标签同样不算数**。
+        # 不这么判，用户设了「只取 题材」之后，未分类标签仍会漏进候选集，
+        # 表现就是「设了跟没设一样」（用户报过的同一类问题）。
+        if include_categories:
+            if not category:
+                excluded[tag] = '无分类'
+                continue
+            if category not in include_categories:
+                excluded[tag] = f'不在指定分类 {category}'
+                continue
 
         if spec['source'] == SOURCE_CATEGORIES:
             if not category:
@@ -329,6 +373,222 @@ def resolve_candidates(tag_library, pool, *, card=None) -> dict:
         'excluded': excluded,
         'isolated_categories': sorted(isolated_categories),
         'known': known,
+    }
+
+
+# ------------------------------------------------------------------ 每分类规则（置信度 / 数量）
+
+#: 没有单独设置的分类，默认置信度门槛（用户定的：未展开 = 0.5）
+DEFAULT_CATEGORY_CONFIDENCE = 0.5
+
+#: 一次最多接受多少个分类规则（防脏数据）
+MAX_RULE_CATEGORIES = 100
+
+
+def _to_confidence(value):
+    """把置信度收敛到 0–1；无法解析返回 None（= 用默认值）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return max(0.0, min(1.0, number))
+
+
+def _to_quota(value):
+    """把「设置数量」收敛为非负整数；None / 空 = 不限（返回 None）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return max(0, number)
+
+
+def normalize_rules(raw) -> dict:
+    """把「每个标签分类的规则」收敛为 `{分类: {'confidence_min': float, 'max_tags': int|None}}`。
+
+    输入既接受 dict，也接受 JSON 字符串（配置里只能存字符串）。
+
+    语义（与设置页一致）：
+    - `confidence_min` 缺省 → 用 `DEFAULT_CATEGORY_CONFIDENCE`；
+    - `max_tags` 缺省 / `None` → **不限**；`0` → 该分类**一个都不选**。
+    """
+    data = raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(data, dict):
+        return {}
+
+    rules = {}
+    for index, (raw_name, raw_rule) in enumerate(data.items()):
+        if index >= MAX_RULE_CATEGORIES:
+            break
+        name = str(raw_name or '').strip()
+        if not name or len(name) > 64:
+            continue
+        if not isinstance(raw_rule, dict):
+            continue
+        confidence = _to_confidence(raw_rule.get('confidence_min'))
+        quota = _to_quota(raw_rule.get('max_tags'))
+        rule = {}
+        if confidence is not None:
+            rule['confidence_min'] = confidence
+        if quota is not None:
+            rule['max_tags'] = quota
+        if rule:
+            rules[name] = rule
+    return rules
+
+
+def rule_for(rules, category, *, default_confidence=DEFAULT_CATEGORY_CONFIDENCE) -> dict:
+    """取某个分类的生效规则：阈值缺省为 `default_confidence`，数量缺省为「不限」。"""
+    source = rules if isinstance(rules, dict) else {}
+    rule = source.get(str(category or '')) or {}
+    confidence = _to_confidence(rule.get('confidence_min'))
+    quota = _to_quota(rule.get('max_tags'))
+    return {
+        'confidence_min': default_confidence if confidence is None else confidence,
+        'max_tags': quota,
+    }
+
+
+def _fmt_confidence(value) -> str:
+    return f'{float(value):.2f}'
+
+
+def rules_text(rules, max_total, *, default_confidence=DEFAULT_CATEGORY_CONFIDENCE) -> str:
+    """把规则写成给模型看的「标签配额」段落（空规则返回空串）。"""
+    source = normalize_rules(rules)
+    total = _to_quota(max_total)
+    if not source and not total:
+        return ''
+
+    lines = []
+    if total:
+        lines.append(f'标签总数最多 {total} 个。')
+    else:
+        lines.append('标签总数不限。')
+    if source:
+        lines.append('按分类的额外要求：')
+        for name in sorted(source, key=lambda item: (-(source[item].get('max_tags') or 0), item)):
+            rule = rule_for(source, name, default_confidence=default_confidence)
+            parts = [f'置信度不低于 {_fmt_confidence(rule["confidence_min"])}']
+            quota = rule['max_tags']
+            if quota == 0:
+                parts.append('这个分类不要输出任何标签')
+            elif quota is None:
+                parts.append('数量不单独限制')
+            else:
+                parts.append(f'最多 {quota} 个')
+            lines.append(f'- {name}：' + '，'.join(parts))
+        lines.append(
+            f'- 其余分类：置信度不低于 {_fmt_confidence(default_confidence)}，数量不单独限制。',
+        )
+    return '\n'.join(lines)
+
+
+def apply_rules(tags, *, tag_to_category, rules, max_total,
+                default_confidence=DEFAULT_CATEGORY_CONFIDENCE) -> dict:
+    """按「分类置信度门槛 + 分类数量配额 + 总数上限」过滤 AI 给的标签。
+
+    Args:
+        tags: `[{'name': str, 'confidence': float|None}, ...]`（已做别名还原）。
+        tag_to_category: 标签 → 分类（`classify_tags()` 的映射；未登记的标签为空串）。
+        rules: `normalize_rules()` 的结果。
+        max_total: 总上限（0/None = 不限）。
+
+    Returns:
+        `{'kept': [...], 'dropped': [{'name','reason','category'}], 'per_category': {...}}`
+    """
+    source = normalize_rules(rules)
+    total_limit = _to_quota(max_total)
+    # 总上限 0 / 缺省 = 不限（分类配额才是「0 = 不选」）
+    if total_limit is None or total_limit <= 0:
+        total_limit = None
+
+    kept = []
+    dropped = []
+    for item in tags or []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get('name') or '').strip()
+        if not name:
+            continue
+        category = str(tag_to_category.get(name) or '') if isinstance(tag_to_category, dict) else ''
+        rule = rule_for(source, category, default_confidence=default_confidence)
+        confidence = _to_confidence(item.get('confidence'))
+        if confidence is None:
+            dropped.append({'name': name, 'category': category, 'reason': '缺少置信度'})
+            continue
+        if confidence < rule['confidence_min']:
+            dropped.append({
+                'name': name,
+                'category': category,
+                'reason': f'置信度 {confidence:.2f} < {rule["confidence_min"]:.2f}',
+            })
+            continue
+        kept.append({'name': name, 'confidence': confidence, 'category': category})
+
+    # ---- 每个分类的数量配额（按置信度从高到低保留）----
+    by_category = {}
+    for item in kept:
+        by_category.setdefault(item['category'], []).append(item)
+
+    after_quota = []
+    for category, items in by_category.items():
+        rule = rule_for(source, category, default_confidence=default_confidence)
+        ordered = sorted(items, key=lambda entry: (-float(entry.get('confidence') or 0), entry['name']))
+        quota = rule['max_tags']
+        if quota is None:
+            after_quota.extend(ordered)
+            continue
+        if quota <= 0:
+            for entry in ordered:
+                dropped.append({
+                    'name': entry['name'], 'category': category,
+                    'reason': f'分类「{category or "未分类"}」设为不选',
+                })
+            continue
+        after_quota.extend(ordered[:quota])
+        for entry in ordered[quota:]:
+            dropped.append({
+                'name': entry['name'], 'category': category,
+                'reason': f'分类「{category or "未分类"}」超过 {quota} 个',
+            })
+
+    # ---- 总数上限（全局，按置信度从高到低）----
+    ordered_all = sorted(
+        after_quota, key=lambda entry: (-float(entry.get('confidence') or 0), entry['name']),
+    )
+    if total_limit is not None and len(ordered_all) > total_limit:
+        final = ordered_all[:total_limit]
+        for entry in ordered_all[total_limit:]:
+            dropped.append({'name': entry['name'], 'category': entry['category'],
+                            'reason': f'超过总上限 {total_limit} 个'})
+    else:
+        final = ordered_all
+
+    per_category = {}
+    for entry in final:
+        per_category[entry['category']] = per_category.get(entry['category'], 0) + 1
+
+    return {
+        'kept': [{'name': entry['name'], 'confidence': entry['confidence']} for entry in final],
+        'dropped': dropped,
+        'per_category': per_category,
     }
 
 

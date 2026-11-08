@@ -413,6 +413,24 @@ def render_messages(profile, variables, *, task: str = 'analyze') -> dict:
     }
 
 
+def append_system_note(messages, note) -> list:
+    """把一段补充说明追加到 system 消息末尾（没有 system 就插一条）。
+
+    用于「每分类标签配额」这类**运行期才知道**的约束：它不属于档案模板，
+    但必须让模型看到，否则模型只能猜，配额就成了纯事后截断。
+    """
+    text = str(note or '').strip()
+    result = [dict(message) for message in (messages or []) if isinstance(message, dict)]
+    if not text:
+        return result
+    for message in result:
+        if str(message.get('role') or '') == 'system':
+            message['content'] = str(message.get('content') or '').rstrip() + '\n\n' + text
+            return result
+    result.insert(0, {'role': 'system', 'content': text})
+    return result
+
+
 def profile_selector(profile, config=None) -> dict:
     """解析最终生效的选择器。
 
@@ -525,16 +543,40 @@ def selector_gaps(selector, profile, variables=None) -> list:
 # ------------------------------------------------------------------ 变量构建
 
 
+#: `output_schema` 里写 0 = 「未声明，跟随全局配置」。
+#:
+#: 与 `generation.max_tokens = 0 → 跟随「输出长度上限」` 是同一约定。没有这条，
+#: 内置档案里写死的 `max_items: 8` / `max_chars: 300` 会把配置页改成更大的值
+#: **永远压回去**（实测：配置 20 / 600，实际仍是 8 / 300）。
+ZERO_MEANS_FOLLOW_GLOBAL = 0
+
+
+def _declared_limit(value):
+    """schema 里的上限值；`0` / 缺失 / 非法值一律视为「未声明」（返回 None）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number == ZERO_MEANS_FOLLOW_GLOBAL else value
+
+
 def build_limits(config, profile) -> dict:
     """合并「全局配置」与「任务规格的 output_schema」，取更严格的一侧。
 
     配置是全局上限，schema 是该任务的具体值；这样 `limits.*` 变量、生成约束与
     后置校验三者始终同源（设计文档 §5.5 / §8.5）。
 
+    **schema 写 0 = 未声明**（`ZERO_MEANS_FOLLOW_GLOBAL`）：内置档案用 0 表示
+    「跟随配置页」，用户自建档案写具体数字才额外收紧。否则内置档案里那组
+    默认值（8 / 300 / 0.5）会让配置页**只能调小、无法调大**。
+
     输出仍是扁平 dict —— 它同时要喂给模板变量 `{{ limits.* }}` 与调用方，
     扁平比嵌套更好用。
     """
     from . import schema as schema_core  # noqa: PLC0415 - 循环导入
+    from . import tagpool as tagpool_core  # noqa: PLC0415 - 默认置信度常量
 
     conf = config if isinstance(config, dict) else {}
     spec = profile if isinstance(profile, dict) else {}
@@ -571,18 +613,73 @@ def build_limits(config, profile) -> dict:
         return max(candidates)
 
     return {
-        'max_tags': _pick_int('max_tags', tags_prop.get('max_items'), 8),
+        'max_tags': _pick_int(
+            'max_tags', _declared_limit(tags_prop.get('max_items')), 8,
+        ),
         'summary_max_chars': _pick_int(
-            'summary_max_chars', summary_prop.get('max_chars'), 300,
+            'summary_max_chars', _declared_limit(summary_prop.get('max_chars')), 300,
         ),
         'summary_min_chars': _pick_int(
-            'summary_min_chars', summary_prop.get('min_chars'), 0,
+            'summary_min_chars', _declared_limit(summary_prop.get('min_chars')), 0,
         ),
-        'tags_min': _pick_int('tags_min', tags_prop.get('min_items'), 0),
+        'tags_min': _pick_int('tags_min', _declared_limit(tags_prop.get('min_items')), 0),
+        # 这一项只给 `{{ limits.confidence_min }}` 变量与旧模板用。真正的门槛已经
+        # 按分类配置（`tagpool.DEFAULT_CATEGORY_CONFIDENCE` 是未设置分类的默认值），
+        # 全局「标签置信度下限」配置项已删除。
         'confidence_min': _pick_float_max(
-            'confidence_min', tags_prop.get('min_confidence'), 0.5,
+            None, _declared_limit(tags_prop.get('min_confidence')),
+            tagpool_core.DEFAULT_CATEGORY_CONFIDENCE,
         ),
     }
+
+
+def apply_limits(profile, limits) -> dict:
+    """把 `build_limits()` 算出的**生效值**写回档案的 `output_schema`。
+
+    为什么必须有这一步：`limits.*` 只喂给模板变量，而「生成约束」
+    （`schema.describe_constraints`）、事后校验与超量截断（`parsing`）读的是
+    档案自己的 `output_schema`。不回写的话，配置页把上限调到 20，提示词里的
+    `{{ limits.max_tags }}` 是 20、模型却被 `max_items: 8` 判超量截回 8 个 ——
+    两处口径分叉，用户看到的就是「保存并应用后并未生效」。
+
+    返回浅拷贝，不改调用方手里的档案对象。
+    """
+    if not isinstance(profile, dict):
+        return profile
+
+    source = profile.get('output_schema')
+    if not isinstance(source, dict):
+        return dict(profile)
+
+    properties = source.get('properties')
+    if not isinstance(properties, dict):
+        return dict(profile)
+
+    resolved_limits = limits if isinstance(limits, dict) else {}
+    patched = dict(properties)
+
+    tags = properties.get('tags')
+    if isinstance(tags, dict):
+        tags = dict(tags)
+        max_tags = int(resolved_limits.get('max_tags') or 0)
+        if max_tags > 0:
+            tags['max_items'] = max_tags
+        # 注意：不再从 limits 注入 `min_confidence`。标签门槛已改为「按分类配置」，
+        # 由 `tagpool.apply_rules()` 在解析阶段执行；这里注入一个全局值会让
+        # 低阈值分类的标签被提前筛掉。
+        patched['tags'] = tags
+
+    summary = properties.get('summary')
+    if isinstance(summary, dict):
+        summary = dict(summary)
+        max_chars = int(resolved_limits.get('summary_max_chars') or 0)
+        if max_chars > 0:
+            summary['max_chars'] = max_chars
+        patched['summary'] = summary
+
+    result = dict(profile)
+    result['output_schema'] = dict(source, properties=patched)
+    return result
 
 
 def alternate_greetings_text(block, selector=None) -> str:

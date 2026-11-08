@@ -91,6 +91,69 @@ def test_list_models_client_hits_the_draft_endpoint():
     )
 
 
+def test_tag_pool_section_has_help_button_and_category_pickers():
+    """标签池：两个输入框 + 标题旁 `?` 说明 + 「点一下就填」的分类按钮。
+
+    用户原话：「在插件配置中做一个输入框，并在输入框外弄一个 ?，告诉我怎么填写，
+    我不懂程序」。所以这几样都是**用户可见的契约**，缺一个就等于没交付。
+    """
+    source = _strip_comments(_read(SETTINGS_PATH))
+
+    assert "'标签池'" in source, '设置页必须有「标签池」区块'
+    assert '只取这些分类' in source and '排除这些分类' in source
+    assert 'categories_include' in source and 'categories_exclude' in source
+
+    # `?` 帮助：按钮 + 内联说明面板（不能用绝对定位浮层，面板滚动区会裁掉）
+    assert 'plugin-stm-ai-assistant-help-btn' in source
+    assert 'function helpNote(' in source
+    assert "'?'" in source
+    # 分类按钮：把名字填进输入框，且两边互斥
+    assert 'function moveCategory(' in source
+    assert 'saveTagPool(' in source
+
+    assert 'client.tagPool()' in source, '进入设置页要读取当前标签池与分类清单'
+
+    # 「现有标签分类」旁必须提醒：数量含角色卡「隔离区」里的标签，可能与管理器显示不一致
+    assert '隔离区' in source, '分类清单旁必须提示「数量包含隔离区标签」'
+    assert 'plugin-stm-ai-assistant-tagpool-picker-note' in source
+
+
+def test_tag_pool_has_per_category_confidence_and_quota():
+    """新置信度系统：每个分类可展开设置「置信度 + 设置数量」，外加最大总数量。
+
+    用户要求：全局置信度不要了；每个分类一个阈值、一个数量；
+    分类数量之和不能超过最大总数量，保存超限要弹窗拦下。
+    """
+    source = _strip_comments(_read(SETTINGS_PATH))
+
+    assert '最大总数量' in source, '设置页要有「最大总数量」输入'
+    assert '标签池 token 预算' in source, '设置页要有「标签池 token 预算」'
+    assert 'budget_tokens: budgetTokens' in source
+    assert '标签置信度' in source and '设置数量' in source
+    assert 'function formatRuleSummary(' in source, '折叠态要显示规则摘要'
+    assert 'tagpool-rule-panel' in source, '分类要能展开规则面板'
+    # 保存时把规则与总数量一起发出去
+    assert 'max_tags: maxTags' in source
+    assert 'rules,' in source
+    # 超限：**提醒但仍允许保存**（用户选定），实际执行按总上限截断
+    assert 'quotaTotal > maxTags' in source
+    assert '仍要保存吗' in source
+    assert '按总上限' in source and '只作参考' in source
+    # 旧的全局置信度控件不应再出现
+    assert '置信度下限' not in source
+
+
+def test_tag_pool_client_hits_backend_endpoints():
+    source = _strip_comments(_read(API_PATH))
+
+    assert re.search(r"tagPool:\s*\(\)\s*=>\s*call\('/tag-pool'\)", source), (
+        'tagPool 必须读 GET /tag-pool'
+    )
+    assert re.search(r"saveTagPool:\s*\(payload\)\s*=>[\s\S]{0,80}call\('/tag-pool'", source), (
+        'saveTagPool 必须写 POST /tag-pool'
+    )
+
+
 def test_styled_select_fits_inside_the_scroll_container():
     """下拉菜单必须按滚动区可用空间翻向/钳高，否则会被面板滚动区裁掉。
 
