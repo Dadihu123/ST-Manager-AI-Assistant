@@ -1329,7 +1329,10 @@ def test_tag_pool_counts_unmapped_tags_as_default_category(tmp_path):
     names = {item['name']: item['tags'] for item in payload['categories']}
     assert names['未整理'] == 1, '未映射的标签计入默认分类'
     assert names['题材'] == 1
-    assert payload['uncategorized'] == 0, '有了默认分类就不该再报「无分类」'
+    # 「未整理」本身就是「没有分类」这一档：它不该同时被算成「显式归类的分类」。
+    # 计数口径必须与 resolve_candidates(source='categories') 一致，否则
+    # 「只取已归类」和这里的数量会互相矛盾。
+    assert payload['uncategorized'] == 1, '回填到 default_category 的仍算未归类'
 
 
 def test_tag_pool_accepts_arrays_and_reports_unknown_names(tmp_path):

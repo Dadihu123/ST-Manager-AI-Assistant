@@ -274,6 +274,8 @@ def _tag_pool_view(api, pool) -> dict:
     spec = tagpool_core.normalize_pool(pool)
 
     counts = {}
+    defaulted = index.get('defaulted_tags') or set()
+    default_category = str(index.get('default_category') or '')
     for tag in index['tags']:
         category = index['tag_to_category'].get(tag, '')
         counts[category] = counts.get(category, 0) + 1
@@ -294,7 +296,13 @@ def _tag_pool_view(api, pool) -> dict:
         'tag_pool': spec,
         'categories': categories,
         'isolated': sorted(isolated),
-        'uncategorized': int(counts.get('') or 0),
+        # 「未归类」= 真正没有分类的 + 回填进 default_category 的。
+        # 两个数字要分开看：分类清单里 `default_category` 那一行的数量是
+        # 「未整理」的真实总量（与宿主界面一致），而这里表达的是
+        # 「有多少标签没有显式分类」——`source='categories'` 会挡掉它们。
+        'uncategorized': int(counts.get('') or 0) + (
+            int(counts.get(default_category) or 0) if default_category else 0
+        ),
         'total_tags': len(index['tags']),
         # 「生效效果」：用户保存后最想知道的就是「到底挡住了什么」
         'effect': {

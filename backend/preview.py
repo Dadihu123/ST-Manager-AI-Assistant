@@ -28,6 +28,18 @@ logger = logging.getLogger(__name__)
 VARIABLE_PREVIEW_LIMIT = 200
 
 
+def _default_confidence(config) -> float:
+    """「没单独设置分类」的默认置信度门槛（含老配置 `confidence_min` 的迁移值）。
+
+    预览/估算与真实作业必须读同一个来源，否则预览显示的规则和实际执行的对不上。
+    """
+    if isinstance(config, dict):
+        value = config.get('legacy_confidence_min')
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return tagpool_core.DEFAULT_CATEGORY_CONFIDENCE
+
+
 def embedded_entries(card) -> list:
     """取卡片内嵌世界书条目（兼容 V2 数组与 V3 对象）。"""
     block = hashing.card_data_block(card)
@@ -156,9 +168,13 @@ def build_preview(*, api, store, config, card_id: str, profile_id: str = '',
     tag_rules = config.get('tag_category_rules')
     if not isinstance(tag_rules, dict):
         tag_rules = {}
+    default_confidence = _default_confidence(config)
     rendered['messages'] = prompt_core.append_system_note(
         rendered['messages'],
-        tagpool_core.rules_text(tag_rules, bundle['limits'].get('max_tags')),
+        tagpool_core.rules_text(
+            tag_rules, bundle['limits'].get('max_tags'),
+            default_confidence=default_confidence,
+        ),
     )
     prompt_tokens = tokens.estimate_messages(rendered['messages'])
 
@@ -242,17 +258,22 @@ def estimate_run(*, api, config, cards, profile, total: int, budget_tokens: int 
     tag_rules = config.get('tag_category_rules')
     if not isinstance(tag_rules, dict):
         tag_rules = {}
+    default_confidence = _default_confidence(config)
     prompt_total = 0
     for card in samples:
         bundle = build_variables(
             api=api, config=config, card=card, profile=profile,
             model_name='', budget_tokens=budget_tokens,
         )
-        profile = prompt_core.apply_limits(profile, bundle['limits'])
-        rendered = prompt_core.render_messages(profile, bundle['variables'], task='analyze')
+        # 注意：这里只用于估算，不要覆盖循环外的 profile
+        sample_profile = prompt_core.apply_limits(profile, bundle['limits'])
+        rendered = prompt_core.render_messages(sample_profile, bundle['variables'], task='analyze')
         messages = prompt_core.append_system_note(
             rendered['messages'],
-            tagpool_core.rules_text(tag_rules, bundle['limits'].get('max_tags')),
+            tagpool_core.rules_text(
+                tag_rules, bundle['limits'].get('max_tags'),
+                default_confidence=default_confidence,
+            ),
         )
         prompt_total += tokens.estimate_messages(messages)['total']
 

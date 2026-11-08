@@ -172,6 +172,24 @@ def test_manifest_id_and_version(manifest):
                     manifest['version'])
 
 
+def test_version_matches_docs(manifest):
+    """`manifest.version` 必须与 README / CHANGELOG / FORK.md 声称的版本一致。
+
+    README 写「本副本是版本 0.4.0」、manifest 却是 0.3.0 时，用户和宿主都无从判断
+    装的是哪一版；发布流程也依赖这个数字。
+    """
+    version = manifest['version']
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    readme = open(os.path.join(root, 'README.md'), encoding='utf-8').read()
+    assert f'版本 {version}' in readme, f'README 应声明版本 {version}'
+
+    fork = os.path.join(root, 'FORK.md')
+    assert os.path.isfile(fork), 'CHANGELOG 声明新增 FORK.md（Apache-2.0 §4(b) 要求），文件必须存在'
+    fork_text = open(fork, encoding='utf-8').read()
+    assert version in fork_text, f'FORK.md 应声明本副本版本 {version}'
+
+
 def test_api_version_and_min_app_version(manifest):
     """v3：`api_version` 与 `manifest_version` 都固定为 3（不保留 v2 兼容）。"""
     assert manifest['api_version'] == 3

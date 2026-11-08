@@ -154,6 +154,28 @@ def test_tag_pool_client_hits_backend_endpoints():
     )
 
 
+def test_tag_pool_prunes_orphaned_category_rules():
+    """分类被改名/删除后，它的规则必须能被清掉。
+
+    渲染遍历 `categories`、保存遍历 `Object.keys(rules)`：孤儿规则看不见、
+    删不掉，却仍会重新 POST 回去并被算进「已分配 N」——超限弹窗永远对不上。
+    """
+    source = _strip_comments(_read(SETTINGS_PATH))
+
+    assert 'orphanRules' in source, '渲染前必须识别出入已不存在的分类的规则'
+    assert re.search(r'knownNames\.has', source), '要有「规则名是否还在分类清单里」的判断'
+    assert re.search(r'delete\s+rules\[name\]', source), '孤儿规则要从工作副本里删掉'
+
+    # 守卫：分类清单没加载到时不能把所有规则当孤儿清空
+    assert 'categoriesLoaded' in source, (
+        '必须区分「分类清单为空」与「分类全被删了」：前者是没加载完，不能清规则'
+    )
+    assert re.search(r'state\.tagPoolCategories\.length\s*>\s*0', source)
+
+    # 用户要被告知，而不是设置莫名消失
+    assert '已失效' in source
+
+
 def test_styled_select_fits_inside_the_scroll_container():
     """下拉菜单必须按滚动区可用空间翻向/钳高，否则会被面板滚动区裁掉。
 

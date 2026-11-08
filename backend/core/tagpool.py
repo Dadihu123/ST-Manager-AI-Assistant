@@ -255,10 +255,17 @@ def classify_tags(tag_library) -> dict:
     # 没有显式分类映射的标签归入 `default_category`（宿主标签页显示为「未整理」）。
     # 不做这一步，「未整理」只统计显式映射的那部分，数量和宿主界面对不上
     # （实测：宿主显示 287，插件只数到 12）。同时让「排除 未整理」真的能挡住它们。
+    #
+    # 但**必须记住哪些是回填的**：`source='categories'`（只取已归类）依赖
+    # 「这个标签没有分类」这个事实。回填后人人都有分类，那条判断就永远不成立，
+    # 该模式会静默退化成 `source='library'`（未归类标签全被放进来）。
     default_category = str(taxonomy.get('default_category') or '').strip()
+    defaulted_tags = set()
     if default_category:
         for tag in tags:
-            tag_to_category.setdefault(tag, default_category)
+            if tag not in tag_to_category:
+                tag_to_category[tag] = default_category
+                defaulted_tags.add(tag)
         if default_category not in categories:
             categories.append(default_category)
 
@@ -279,6 +286,10 @@ def classify_tags(tag_library) -> dict:
         'tag_to_category': tag_to_category,
         'categories': categories,
         'default_category': default_category,
+        # 只有「显式映射」才算已归类；回填到 default_category 的属于「未整理」。
+        # `source='categories'` 与 /tag-pool 的 uncategorized 计数都读这一份，
+        # 不能直接看 tag_to_category（那里面已经没有空分类了）。
+        'defaulted_tags': defaulted_tags,
         'isolated': isolated,
         'usage': data.get('usage') if isinstance(data.get('usage'), dict) else {},
         'blacklist': blacklist,
@@ -296,6 +307,8 @@ def resolve_candidates(tag_library, pool, *, card=None) -> dict:
 
     known = set(index['tags'])
     tag_to_category = index['tag_to_category']
+    # 回填到 default_category 的标签：分类字段有值，但语义上仍是「未整理」。
+    defaulted_tags = index.get('defaulted_tags') or set()
 
     isolated_categories = set(index['isolated']) if spec['respect_isolated'] else set()
     include_categories = set(spec['categories_include'])
@@ -339,6 +352,11 @@ def resolve_candidates(tag_library, pool, *, card=None) -> dict:
                 continue
 
         if spec['source'] == SOURCE_CATEGORIES:
+            # 「只取已归类」：回填进 default_category 的标签算未归类，
+            # 否则 default_category 回填会让这个判断永远不成立，该模式静默失效。
+            if tag in defaulted_tags:
+                excluded[tag] = '无分类'
+                continue
             if not category:
                 excluded[tag] = '无分类'
                 continue
@@ -385,30 +403,42 @@ DEFAULT_CATEGORY_CONFIDENCE = 0.5
 MAX_RULE_CATEGORIES = 100
 
 
-def _to_confidence(value):
-    """把置信度收敛到 0–1；无法解析返回 None（= 用默认值）。"""
+def _finite_float(value):
+    """把值转成**有限**浮点数；解析失败 / NaN / ±Inf 一律返回 None。
+
+    这些值很容易进来：`tag_category_rules` 是宿主设置页可直接编辑的字符串键，
+    用户（或某次 JSON 往返）写进 `1e400` / `"Infinity"` 都是合法的 JSON。
+    不在这里挡掉，`int(float(...))` 会抛 `OverflowError` —— 它不属于
+    `TypeError/ValueError`，会一路穿透 `normalize_config()`（`load_config()`
+    只兜 `api.config.get()` 那一步）让所有接口 500。
+    """
     if isinstance(value, bool) or value is None:
         return None
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number:  # NaN
+    if number != number or number in (float('inf'), float('-inf')):  # NaN / ±Inf
+        return None
+    return number
+
+
+def _to_confidence(value):
+    """把置信度收敛到 0–1；无法解析返回 None（= 用默认值）。"""
+    number = _finite_float(value)
+    if number is None:
         return None
     return max(0.0, min(1.0, number))
 
 
 def _to_quota(value):
     """把「设置数量」收敛为非负整数；None / 空 = 不限（返回 None）。"""
-    if isinstance(value, bool) or value is None:
-        return None
     if isinstance(value, str) and not value.strip():
         return None
-    try:
-        number = int(float(value))
-    except (TypeError, ValueError):
+    number = _finite_float(value)
+    if number is None:
         return None
-    return max(0, number)
+    return max(0, int(number))
 
 
 def normalize_rules(raw) -> dict:
@@ -501,7 +531,8 @@ def rules_text(rules, max_total, *, default_confidence=DEFAULT_CATEGORY_CONFIDEN
 
 
 def apply_rules(tags, *, tag_to_category, rules, max_total,
-                default_confidence=DEFAULT_CATEGORY_CONFIDENCE) -> dict:
+                default_confidence=DEFAULT_CATEGORY_CONFIDENCE,
+                profile_floor=0.0) -> dict:
     """按「分类置信度门槛 + 分类数量配额 + 总数上限」过滤 AI 给的标签。
 
     Args:
@@ -509,6 +540,17 @@ def apply_rules(tags, *, tag_to_category, rules, max_total,
         tag_to_category: 标签 → 分类（`classify_tags()` 的映射；未登记的标签为空串）。
         rules: `normalize_rules()` 的结果。
         max_total: 总上限（0/None = 不限）。
+        default_confidence: 未单独设置的分类用这个门槛。
+        profile_floor: 档案（`output_schema.tags.min_confidence`）自己的额外门槛。
+
+    **档案门槛与分类门槛取更严格者**：分类规则是全局配置，档案是「这次任务」的
+    具体声明，两者都表达「低于它别打」。只认分类规则会让用户自建档案里写的
+    `min_confidence` 完全失效（README 明确承诺它仍生效）。
+
+    **缺少置信度的标签保留**（与原 `parsing.validate_result` 的行为一致）：
+    模型偶尔漏写 `confidence`，或直接返回字符串数组（`{"tags":["A","B"]}`）。
+    这种标签没有分数可比，丢掉它等于因为一个字段格式偏差而清空全部标签；
+    保留并告警比静默清空安全。
 
     Returns:
         `{'kept': [...], 'dropped': [{'name','reason','category'}], 'per_category': {...}}`
@@ -518,9 +560,11 @@ def apply_rules(tags, *, tag_to_category, rules, max_total,
     # 总上限 0 / 缺省 = 不限（分类配额才是「0 = 不选」）
     if total_limit is None or total_limit <= 0:
         total_limit = None
+    profile_floor = _to_confidence(profile_floor) or 0.0
 
     kept = []
     dropped = []
+    missing_confidence = []
     for item in tags or []:
         if not isinstance(item, dict):
             continue
@@ -529,15 +573,18 @@ def apply_rules(tags, *, tag_to_category, rules, max_total,
             continue
         category = str(tag_to_category.get(name) or '') if isinstance(tag_to_category, dict) else ''
         rule = rule_for(source, category, default_confidence=default_confidence)
+        threshold = max(float(rule['confidence_min']), profile_floor)
         confidence = _to_confidence(item.get('confidence'))
         if confidence is None:
-            dropped.append({'name': name, 'category': category, 'reason': '缺少置信度'})
+            # 没有分数可比：保留，交给数量/总数配额决定去留，并单独告警
+            missing_confidence.append(name)
+            kept.append({'name': name, 'confidence': None, 'category': category})
             continue
-        if confidence < rule['confidence_min']:
+        if confidence < threshold:
             dropped.append({
                 'name': name,
                 'category': category,
-                'reason': f'置信度 {confidence:.2f} < {rule["confidence_min"]:.2f}',
+                'reason': f'置信度 {confidence:.2f} < {threshold:.2f}',
             })
             continue
         kept.append({'name': name, 'confidence': confidence, 'category': category})
@@ -589,6 +636,9 @@ def apply_rules(tags, *, tag_to_category, rules, max_total,
         'kept': [{'name': entry['name'], 'confidence': entry['confidence']} for entry in final],
         'dropped': dropped,
         'per_category': per_category,
+        # 缺置信度但被保留的标签（调用方据此写告警，别静默）
+        'missing_confidence': [name for name in missing_confidence
+                               if name in {entry['name'] for entry in final}],
     }
 
 

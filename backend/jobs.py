@@ -571,13 +571,20 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
     # ---- 每分类标签规则（置信度门槛 / 分类数量 / 总数上限）----
     # 规则要在**两处**用同一份：① 拼进 system 让模型知道该给几个、置信度要多高；
     # ② 解析后用 `tagpool.apply_rules()` 确定性地执行（模型不听话也能兜住）。
-    tag_to_category = tagpool_core.classify_tags(tag_library)['tag_to_category']
+    tag_index = tagpool_core.classify_tags(tag_library)
+    tag_to_category = tag_index['tag_to_category']
     tag_rules = config.get('tag_category_rules')
     if not isinstance(tag_rules, dict):
         tag_rules = {}
+    # 老配置迁移过来的全局限阈：作为「未单独设置分类」的默认门槛。
+    default_confidence = config.get('legacy_confidence_min')
+    if default_confidence is None:
+        default_confidence = tagpool_core.DEFAULT_CATEGORY_CONFIDENCE
     messages = prompt_core.append_system_note(
         rendered['messages'],
-        tagpool_core.rules_text(tag_rules, limits.get('max_tags')),
+        tagpool_core.rules_text(
+            tag_rules, limits.get('max_tags'), default_confidence=default_confidence,
+        ),
     )
 
     # ---- 调用 ----
@@ -599,6 +606,7 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         result.get('content'), profile.get('output_schema'), strict=strict,
         prefill=str(profile.get('assistant_prefill') or ''),
         tag_rules=tag_rules, tag_to_category=tag_to_category,
+        default_confidence=default_confidence,
     )
 
     if not outcome['ok']:

@@ -310,6 +310,22 @@ export function createSettings(api, client, context) {
     const rules = JSON.parse(JSON.stringify(state.tagPoolRules || {}));
     let maxTags = Number(state.tagPoolMax) || 8;
 
+    // ---- 清理「孤儿规则」----
+    // 分类在标签库里被改名或删掉后，它的规则仍然留在配置里：渲染遍历 categories
+    // 所以看不见、也删不掉它，保存时却会把它重新 POST 回去，还被算进配额求和 ——
+    // 结果是「已分配 N / 超出 M」永远对不上，且没有任何入口能清掉。
+    // 这里在渲染前把它们摘出来，下面显式提示并允许一键清理。
+    //
+    // 守卫：分类清单还没加载到（`state.tagPoolCategories` 为空）时**一律不动**。
+    // 否则首屏渲染会把全部规则当成孤儿清空，用户一点保存就丢光了。
+    const categoriesLoaded = Array.isArray(state.tagPoolCategories)
+      && state.tagPoolCategories.length > 0;
+    const knownNames = new Set(categories.map((item) => item.name));
+    const orphanRules = categoriesLoaded
+      ? Object.keys(rules).filter((name) => !knownNames.has(name))
+      : [];
+    orphanRules.forEach((name) => { delete rules[name]; });
+
     // ---- 最大总数量 ----
     const maxInput = numberInput(
       maxTags,
@@ -400,6 +416,15 @@ export function createSettings(api, client, context) {
           'plugin-stm-ai-assistant-field-hint',
           `分类数量：${quotas.join('、')}`
             + (over ? '（保存后实际按总上限截断，分类配额只作参考）' : ''),
+        ));
+      }
+      // 孤儿规则（分类已改名/删除）会在下次保存时被清掉——先说清楚，别让用户以为丢了设置
+      if (orphanRules.length) {
+        allocation.append(el(
+          'span',
+          'plugin-stm-ai-assistant-field-hint',
+          `另有 ${orphanRules.length} 个分类设置已失效（分类不存在了：${orphanRules.join('、')}），`
+            + '保存时会一并清除。',
         ));
       }
     }

@@ -210,13 +210,47 @@ def test_apply_rules_quota_zero_disables_category_and_total_cap():
     assert kept['kept'][0]['name'] == '校园', '按置信度从高到低截断'
 
 
-def test_apply_rules_drops_tags_without_confidence():
+def test_apply_rules_keeps_tags_without_confidence():
+    """缺置信度的标签要**保留**（与原 validate_result 的行为一致）。
+
+    模型偶尔漏写 `confidence`，或直接返回字符串数组（`{"tags":["A","B"]}`）。
+    这种标签没有分数可比，丢掉等于因为一个字段格式偏差就清空全部标签；
+    保留并让调用方告警，比静默清空安全。
+    """
     result = tagpool.apply_rules(
         [{'name': '奇幻', 'confidence': None}],
         tag_to_category={'奇幻': '题材'}, rules={}, max_total=5,
     )
-    assert result['kept'] == []
-    assert result['dropped'][0]['reason'] == '缺少置信度'
+    assert [item['name'] for item in result['kept']] == ['奇幻']
+    assert result['missing_confidence'] == ['奇幻'], '要回报给调用方去告警'
+    assert result['dropped'] == []
+
+
+def test_apply_rules_keeps_missing_confidence_but_still_applies_quota():
+    """保留不等于免死：分类配额与总数上限仍然管它。"""
+    result = tagpool.apply_rules(
+        [{'name': 'A', 'confidence': 0.9}, {'name': 'B', 'confidence': None}],
+        tag_to_category={'A': '题材', 'B': '题材'},
+        rules={'题材': {'max_tags': 1}}, max_total=5,
+    )
+    assert [item['name'] for item in result['kept']] == ['A'], '高置信度优先保留'
+    assert result['missing_confidence'] == [], 'B 没进最终结果，不该再报缺置信度'
+
+
+def test_apply_rules_profile_floor_overrides_category_threshold():
+    """档案自己的 min_confidence 与分类门槛取**更严格者**。
+
+    只认分类规则会让用户自建档案里写的门槛完全失效（README 承诺它仍生效）。
+    """
+    tags = [{'name': 'A', 'confidence': 0.6}, {'name': 'B', 'confidence': 0.95}]
+    loose = dict(tagpool.default_pool(), categories_exclude=[])
+    # 分类规则只要求 0.2，但档案要求 0.9 -> 应该按 0.9
+    result = tagpool.apply_rules(
+        tags, tag_to_category={'A': '题材', 'B': '题材'},
+        rules={'题材': {'confidence_min': 0.2}}, max_total=5, profile_floor=0.9,
+    )
+    assert [item['name'] for item in result['kept']] == ['B']
+    assert '0.90' in result['dropped'][0]['reason']
 
 
 def test_protected_tags_only_covers_excluded_or_isolated_categories():
@@ -293,6 +327,53 @@ def test_source_categories_requires_category():
     result = tagpool.resolve_candidates(library, pool)
     assert result['allowed'] == []
     assert result['excluded']['无分类标签'] == '无分类'
+
+
+def test_source_categories_still_excludes_default_category_tags():
+    """有 `default_category` 的标签库：回填进默认分类的仍算「未归类」。
+
+    这是回归用例。`classify_tags()` 会把没有显式映射的标签回填成
+    `default_category`，于是 `tag_to_category` 里人人都有分类，
+    `source='categories'` 的 `if not category` 判断从此永远不成立 ——
+    该模式静默退化成 `source='library'`，未归类标签全被放进来。
+    """
+    library = {
+        'tags': ['奇幻', '散装标签'],
+        'taxonomy': {
+            'default_category': '未整理',
+            'tag_to_category': {'奇幻': '题材'},
+            'categories': {'题材': []},
+        },
+        'prefs': {},
+    }
+    categories_mode = tagpool.resolve_candidates(
+        library, dict(tagpool.default_pool(), source=tagpool.SOURCE_CATEGORIES),
+    )
+    library_mode = tagpool.resolve_candidates(
+        library, dict(tagpool.default_pool(), source=tagpool.SOURCE_LIBRARY),
+    )
+
+    assert categories_mode['allowed'] == ['奇幻'], '未归类的不能进「只取已归类」模式'
+    assert categories_mode['excluded']['散装标签'] == '无分类'
+    assert '散装标签' in library_mode['allowed'], 'library 模式仍然包含它'
+    assert categories_mode['allowed'] != library_mode['allowed'], '两种来源不能退化成同一个'
+
+
+def test_default_category_tags_are_still_protectable():
+    """回填不影响「排除 未整理」——冻结保护必须挡住它们。"""
+    library = {
+        'tags': ['奇幻', '散装标签'],
+        'taxonomy': {
+            'default_category': '未整理',
+            'tag_to_category': {'奇幻': '题材'},
+            'categories': {'题材': []},
+        },
+        'prefs': {},
+    }
+    frozen = tagpool.protected_tags(
+        library, dict(tagpool.default_pool(), categories_exclude=['未整理']),
+    )
+    assert frozen == {'散装标签'}
 
 
 # ------------------------------------------------------------------ 预算

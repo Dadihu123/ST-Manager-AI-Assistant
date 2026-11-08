@@ -111,6 +111,9 @@
 - `batch_size`（每批张数）、`concurrency`（并发数）仍无消费方（改了不起作用）；
 - `default_profile_id`（默认提示词档案）后端仍未读取，前端读的 `config.task_profiles`
   这个键也不存在。
+- 标签合并（`/propose` 的 `tag_merges`）**不经过**「冻结分类」保护：合并会直接
+  `remove=[source]`，不受 `categories_exclude` / 隔离分类约束。这是上游既有行为，
+  本次未改动。
 
 ## 0.3.0（2026-10-25）
 

@@ -50,13 +50,29 @@ DEFAULT_WI_KEYWORDS = ('世界观', '设定', '背景', '叙事要求', '元数�
 APPLY_MODES = ('auto', 'review')
 
 
-def _to_int(value, default, *, minimum=None, maximum=None):
+def _finite_number(value):
+    """把值转成**有限**浮点数；解析失败 / NaN / ±Inf 返回 None。
+
+    `normalize_config()` 直接吃宿主设置页写进来的原始值：`1e400`（合法 JSON）
+    或 `"Infinity"` 都会让 `int()` 抛 `OverflowError`，而 `OverflowError`
+    不是 `TypeError/ValueError`，会穿透 `load_config()` 让所有接口 500。
+    """
     if isinstance(value, bool) or value is None:
-        return default
+        return None
     try:
-        number = int(value)
+        number = float(value)
     except (TypeError, ValueError):
+        return None
+    if number != number or number in (float('inf'), float('-inf')):
+        return None
+    return number
+
+
+def _to_int(value, default, *, minimum=None, maximum=None):
+    number = _finite_number(value)
+    if number is None:
         return default
+    number = int(number)
     if minimum is not None:
         number = max(minimum, number)
     if maximum is not None:
@@ -65,11 +81,8 @@ def _to_int(value, default, *, minimum=None, maximum=None):
 
 
 def _to_float(value, default, *, minimum=None, maximum=None):
-    if isinstance(value, bool) or value is None:
-        return default
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
+    number = _finite_number(value)
+    if number is None:
         return default
     if minimum is not None:
         number = max(minimum, number)
@@ -139,6 +152,14 @@ def normalize_config(raw) -> dict:
     # 每分类规则：存成 JSON 字符串（宿主只接受已声明的键），这里折成 dict。
     tag_rules = tagpool_core.normalize_rules(data.get('tag_category_rules'))
 
+    # 旧版全局「标签置信度下限」（`confidence_min`）已删除。老用户保存过的值
+    # 不能就这么静默丢掉：那会把原本 0.8 的严格度悄悄放宽到默认 0.5。
+    # 这里把它抬成全部分类的统一门槛（没有分类规则的分类继承 `default_confidence`
+    # 的语义由档案/schema 决定，故写成 `rules_text` 的兜底门槛更直接）。
+    legacy_confidence = _finite_number(data.get('confidence_min'))
+    if legacy_confidence is not None and not tag_rules:
+        legacy_confidence = max(0.0, min(1.0, legacy_confidence))
+
     # 标签池 token 预算：决定「给 AI 列多少标签」。全局默认 1200；档案自己的
     # tag_pool.budget_tokens 仍可覆盖它。最后按模型上下文夹一次，避免预算超过窗口。
     budget = _to_int(
@@ -170,6 +191,16 @@ def normalize_config(raw) -> dict:
         # 新档案的初值；档案自己的 content_selector / tag_pool 会覆盖它（档案优先）
         'content_selector': selector_core.normalize_selector(data.get('content_selector')),
         'tag_pool': tag_pool,
+        # 旧版全局限阈被抬成「未单独设置的分类」的默认门槛（见上方 legacy_confidence）。
+        # 保留这个派生字段只是给 `tagpool.rules_text()` / `apply_rules()` 当兜底，
+        # 不再作为一个用户可见的配置项。
+        'legacy_confidence_min': legacy_confidence,
+        # 一次性迁移提示：老配置里有值、但还没写过分类规则时，提醒用户规则已变。
+        'migration_notices': (
+            [f'旧的全局「标签置信度下限 {legacy_confidence:g}」已改为未设置分类的默认门槛；'
+             '需要在「AI 助手设置 → 标签池」里按分类调整。']
+            if legacy_confidence is not None and not tag_rules else []
+        ),
     }
 
 

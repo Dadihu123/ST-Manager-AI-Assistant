@@ -404,6 +404,9 @@ def validate_result(result, output_schema=None, *, strict: bool = False,
             rules=tag_rules,
             max_total=limit,
             default_confidence=default_confidence,
+            # 档案自己声明的门槛与分类门槛取更严格者。不传的话，
+            # 用户自建档案里的 `min_confidence` 会被完全绕过（README 承诺它仍生效）。
+            profile_floor=confidence_min,
         )
         normalized['tags'] = [
             {'name': item['name'], 'confidence': item['confidence']}
@@ -411,6 +414,8 @@ def validate_result(result, output_schema=None, *, strict: bool = False,
         ]
         for item in filtered['dropped']:
             warnings.append(f'标签「{item["name"]}」已跳过：{item["reason"]}')
+        for name in filtered.get('missing_confidence') or []:
+            warnings.append(f'标签「{name}」缺少置信度，已保留')
         # 阈值/配额已经处理过，下面的旧门槛不能再筛一遍
         confidence_min = 0
     if confidence_min:
