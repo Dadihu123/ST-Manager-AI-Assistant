@@ -6,7 +6,7 @@
   "manifest_version": 3,
   "author": "ST-Manager",
   "description": "角色卡的 AI 工作台：打标（概览与标签）、世界书精简、自动归类、分类体系提议；批量作业、逐条审批与成本记账。",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "min_app_version": "1.0.0",
   "backend": {
     "entry": "backend",
@@ -305,7 +305,8 @@
       },
       "max_tags": {
         "type": "integer",
-        "title": "最大标签数",
+        "title": "最大标签数（总上限）",
+        "description": "一次分析最多打多少个标签。各分类的「设置数量」之和不能超过它；没单独设置的分类只受这个总上限约束。",
         "default": 8,
         "minimum": 1,
         "maximum": 20
@@ -316,13 +317,6 @@
         "default": 300,
         "minimum": 50,
         "maximum": 2000
-      },
-      "confidence_min": {
-        "type": "number",
-        "title": "标签置信度下限",
-        "default": 0.5,
-        "minimum": 0,
-        "maximum": 1
       },
       "batch_size": {
         "type": "integer",
@@ -377,6 +371,32 @@
         "title": "世界书高价值关键词",
         "description": "逗号分隔；条目名命中这些词的 content 优先进入提示词。",
         "default": "世界观,设定,背景,叙事要求,元数据,规则"
+      },
+      "tag_pool_categories_include": {
+        "type": "string",
+        "title": "标签池：只取这些分类",
+        "description": "按标签分类限制 AI 能看到的标签，逗号分隔（例：人设，关系）。留空 = 不限制。分类名要与标签库里的一致；带 ? 说明和分类按钮的图形化设置在「AI 助手设置 → 标签池」。",
+        "default": ""
+      },
+      "tag_pool_categories_exclude": {
+        "type": "string",
+        "title": "标签池：排除这些分类",
+        "description": "这些分类下的标签不会给 AI 看、也不会被建议删除（冻结），逗号分隔（例：成人，血腥）。留空 = 不排除。",
+        "default": ""
+      },
+      "tag_category_rules": {
+        "type": "string",
+        "title": "标签池：每个分类的置信度与数量（JSON）",
+        "description": "格式：{\"分类\": {\"confidence_min\": 0.6, \"max_tags\": 3}}。由插件设置页「AI 助手设置 → 标签池」维护，一般不用手填；各分类 max_tags 之和不能超过最大标签数。",
+        "default": ""
+      },
+      "tag_pool_budget_tokens": {
+        "type": "integer",
+        "title": "标签池 token 预算",
+        "description": "给 AI 列出标签库时最多花多少 token（默认 1200，约 60–100 个标签）。调大能让模型看到更多已有标签、减少「把已有标签当新标签」；代价是每次分析 prompt 更长、更贵。会被模型上下文上限夹住。",
+        "default": 1200,
+        "minimum": 200,
+        "maximum": 20000
       },
       "context_length": {
         "type": "integer",

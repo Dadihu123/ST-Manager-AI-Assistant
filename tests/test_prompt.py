@@ -348,6 +348,77 @@ def test_build_limits_takes_stricter_side():
     assert limits['confidence_min'] == 0.6, '取两者更大者（更严格）'
 
 
+def test_zero_in_schema_means_follow_global_config():
+    """内置档案用 0 表示「跟随全局配置」：配置页调大必须真的变大。
+
+    回归（用户报「配置里保存并应用后并未生效」）：内置档案原先写死
+    `max_items=8` / `max_chars=300` / `min_confidence=0.5`，而 `build_limits`
+    取更严格的一侧 —— 于是把「最大标签数」从 8 调到 20、「概览字数上限」从
+    300 调到 600 之后，实际生效值仍是 8 / 300，配置页只能调小、不能调大。
+    """
+    for profile_id in ('builtin-deepseek', 'builtin-gpt', 'builtin-default'):
+        profile = builtin_profile(profile_id)
+        props = profile['output_schema']['properties']
+        assert props['tags']['max_items'] == 0, f'{profile_id}: 0 = 跟随全局'
+        assert props['summary']['max_chars'] == 0, f'{profile_id}: 0 = 跟随全局'
+
+        limits = prompt.build_limits(
+            {'max_tags': 20, 'summary_max_chars': 600, 'confidence_min': 0.4}, profile,
+        )
+        assert limits['max_tags'] == 20, '内置档案的 0 不得把全局上限压回 8'
+        assert limits['summary_max_chars'] == 600
+        # 全局「标签置信度下限」已删除：门槛改为按分类配置，这里的 limits.confidence_min
+        # 只是给旧模板变量用的默认值（未单独设置的分类 = 0.5），不再读配置。
+        assert limits['confidence_min'] == 0.5
+
+
+def test_custom_profile_can_still_be_stricter_than_global():
+    """用户自建档案写具体数字时，仍然按「更严格者」压住全局配置。"""
+    limits = prompt.build_limits(
+        {'max_tags': 20, 'summary_max_chars': 600, 'confidence_min': 0.4},
+        {'output_schema': {'properties': {
+            'summary': {'type': 'string', 'max_chars': 200},
+            'tags': {'type': 'array', 'max_items': 5, 'min_confidence': 0.7},
+        }}},
+    )
+    assert limits['max_tags'] == 5
+    assert limits['summary_max_chars'] == 200
+    assert limits['confidence_min'] == 0.7
+
+
+def test_apply_limits_rewrites_schema_used_by_constraints_and_parsing():
+    """生效上限必须回写进 output_schema：生成约束、校验、超量截断读的都是它。
+
+    不回写就会出现两处口径分叉 —— 提示词说「最多 20 个」，校验却按档案里的 8 截断。
+    """
+    config = {'max_tags': 20, 'summary_max_chars': 600, 'confidence_min': 0.5}
+    profile = builtin_profile('builtin-deepseek')
+    limits = prompt.build_limits(config, profile)
+    resolved = prompt.apply_limits(profile, limits)
+
+    props = resolved['output_schema']['properties']
+    assert props['tags']['max_items'] == 20
+    assert props['summary']['max_chars'] == 600
+    # 不得就地改调用方手里的档案对象
+    assert profile['output_schema']['properties']['tags']['max_items'] == 0
+
+    variables = prompt.collect_variables(
+        card={'name': 'A'}, tag_library={'tags': []},
+        limits=limits, model_name='m', profile_id='p',
+    )
+    system = prompt.render_messages(resolved, variables)['messages'][0]['content']
+    assert '最多 20 项' in system, 'schema 描述必须按生效值写'
+    assert '不超过 600 字' in system
+
+    tags = ', '.join(f'{{"name": "t{i}", "confidence": 0.9}}' for i in range(15))
+    outcome = parsing.parse_llm_result(
+        '{"summary": "x", "tags": [' + tags + ']}', resolved['output_schema'],
+    )
+    assert outcome['ok'] is True
+    assert len(outcome['result']['tags']) == 15, '20 的上限不该把 15 个截掉'
+    assert not [w for w in outcome['warnings'] if '已截断' in w]
+
+
 def test_card_variables_support_data_block_and_string_tags():
     card = {'data': {'name': 'A', 'tags': 'x, y', 'alternate_greetings': ['a', 'b']}}
     variables = prompt.card_variables(card)

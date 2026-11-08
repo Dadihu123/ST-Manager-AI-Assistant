@@ -104,9 +104,40 @@ class FakeNode {
   dispatchEvent() { return true; }
   /** 测试辅助：点一下。 */
   click() {
-    (this._listeners.get('click') || []).forEach((fn) => fn({ preventDefault() {}, target: this }));
+    (this._listeners.get('click') || []).forEach((fn) => fn({
+      preventDefault() {},
+      stopPropagation() {},
+      target: this,
+    }));
   }
-  querySelector() { return null; }
+  /** 测试辅助：触发某个事件（如 input / change），用于输入框。 */
+  fire(name) {
+    (this._listeners.get(name) || []).forEach((fn) => fn({
+      preventDefault() {},
+      stopPropagation() {},
+      target: this,
+    }));
+  }
+  querySelector(selector) {
+    const found = [];
+    const walk = (node) => {
+      (node.children || []).forEach((child) => {
+        found.push(child);
+        walk(child);
+      });
+    };
+    walk(this);
+    const text = String(selector || '');
+    if (text.startsWith('.')) {
+      const name = text.slice(1);
+      return found.find((node) => node.classList && node.classList.contains(name)) || null;
+    }
+    const tag = text.toUpperCase();
+    if (/^[A-Z]+$/.test(tag)) {
+      return found.find((node) => node.tagName === tag) || null;
+    }
+    return null;
+  }
   querySelectorAll() { return []; }
   closest() { return null; }
   focus() {}
@@ -442,6 +473,15 @@ function check(name, fn) {
     .catch((error) => results.push([name, 'FAIL', error && error.message ? error.message : String(error)]));
 }
 
+/** 在某个子树里按条件收集节点（桩没有 querySelectorAll，测试自己走树）。 */
+function collect(node, predicate, out = []) {
+  (node.children || []).forEach((child) => {
+    if (predicate(child)) out.push(child);
+    collect(child, predicate, out);
+  });
+  return out;
+}
+
 async function main() {
   const { api, registered, opened, badges, calls } = createFakeApi({ pending: 2 });
 
@@ -484,6 +524,162 @@ async function main() {
     assert.equal(paths.includes('/settings'), true,
       `设置面板要读取 /settings（实际：${paths.join(', ')}）`);
     assert.equal(settings.element.hidden, false);
+  });
+
+  await check('设置页：标签池的 ? 说明、每分类规则与保存校验', async () => {
+    // 单独一套假 API：`/tag-pool` 返回两个分类，其中「成人」是隔离分类
+    const base = createFakeApi({ pending: 0 });
+    const poolPayload = {
+      success: true,
+      tag_pool: { categories_include: [], categories_exclude: [] },
+      categories: [
+        { name: '题材', tags: 12, isolated: false },
+        { name: '成人', tags: 3, isolated: true },
+      ],
+      isolated: ['成人'],
+      uncategorized: 2,
+      total_tags: 17,
+      max_tags: 8,
+      rules: { 题材: { confidence_min: 0.6, max_tags: 3 } },
+      default_confidence: 0.5,
+      effect: null,
+    };
+    const confirms = [];
+    const patched = {
+      ...base.api,
+      ui: {
+        ...base.api.ui,
+        confirm: async (options = {}) => { confirms.push(options); return true; },
+      },
+      api: (path, options = {}) => {
+        if (path === '/tag-pool') {
+          base.calls.push(['api', path, options && options.body]);
+          return options && options.method === 'POST'
+            ? Object.assign({}, poolPayload, {
+              tag_pool: { categories_include: ['题材'], categories_exclude: [] },
+              max_tags: options.body.max_tags,
+              rules: options.body.rules,
+              effect: { allowed: 12, blocked: 5, blocked_sample: ['R18', '未分类'] },
+              warnings: ['有 2 个标签没有分类；设了「只取」后它们会被排除'],
+            })
+            : poolPayload;
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createSettings } = await import('../frontend/views/settings.js');
+    const { createClient } = await import('../frontend/api.js');
+    const settings = createSettings(patched, createClient(patched), {});
+    await settings.refresh();
+
+    const helpButtons = collect(
+      settings.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-help-btn'),
+    );
+    assert.ok(helpButtons.length >= 2, `「?」按钮不足：${helpButtons.length}`);
+    const panels = collect(
+      settings.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-help-panel'),
+    );
+    assert.equal(panels.length >= 2, true, '缺少说明面板');
+    assert.equal(panels.every((node) => node.hidden === true), true, '说明面板默认应折叠');
+
+    helpButtons[0].click();
+    assert.equal(panels.some((node) => node.hidden === false), true, '点「?」应展开说明');
+    // 桩不实现 textContent 的向下拼接，这里自己收集子树文本
+    const helpText = panels
+      .map((panel) => [String(panel.textContent || '')]
+        .concat(collect(panel, () => true).map((node) => String(node.textContent || '')))
+        .join(' '))
+      .join('\n');
+    for (const keyword of ['留空', '逗号', '分类']) {
+      assert.equal(helpText.includes(keyword), true, `说明缺少「${keyword}」这类人话`);
+    }
+    const allText = collect(settings.element, () => true)
+      .map((node) => String(node.textContent || ''))
+      .join('\n');
+    assert.equal(allText.includes('隔离区'), true, '「现有标签分类」旁要有隔离区数量提醒');
+    assert.equal(allText.includes('阈值 0.60'), true, '折叠态要显示分类规则摘要');
+    assert.equal(allText.includes('已分配 3 / 总上限 8'), true, '要显示配额分配情况');
+
+    const boxes = collect(settings.element, (node) => node.tagName === 'TEXTAREA');
+    assert.equal(boxes.length >= 2, true, '应有「只取 / 排除」两个输入框');
+    const takeButton = collect(
+      settings.element,
+      (node) => node.tagName === 'BUTTON' && node.textContent === '只取',
+    )[0];
+    assert.ok(takeButton, '分类行缺少「只取」按钮');
+    takeButton.click();
+    assert.equal(
+      String(boxes[0].value).includes('题材'),
+      true,
+      `点「只取」应把分类名填进输入框（实际：${boxes[0].value}）`,
+    );
+
+    // ---- 展开「题材」的规则面板：超限只提醒、仍可保存；调回范围内正常保存 ----
+    const rulePanels = collect(
+      settings.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-tagpool-rule-panel'),
+    );
+    assert.equal(rulePanels.length, 2, '每个分类都要有规则面板');
+    assert.equal(rulePanels[0].hidden, true, '规则面板默认折叠');
+    collect(
+      settings.element,
+      (node) => node.tagName === 'BUTTON' && node.textContent === '设置',
+    )[0].click();
+    assert.equal(rulePanels[0].hidden, false, '点「设置」应展开规则面板');
+
+    const ruleInputs = collect(rulePanels[0], (node) => node.tagName === 'INPUT');
+    assert.equal(ruleInputs.length, 2, '规则面板应有「置信度」「设置数量」两个输入');
+    ruleInputs[1].value = '9';       // 数量 9 > 总上限 8
+    ruleInputs[1].fire('input');
+
+    const saveButton = collect(
+      settings.element,
+      (node) => node.tagName === 'BUTTON' && node.textContent === '保存标签池',
+    )[0];
+    assert.ok(saveButton, '缺少「保存标签池」按钮');
+    saveButton.click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.equal(confirms.length, 1, '超限时要弹窗提醒');
+    assert.equal(String(confirms[0].message).includes('超出 1 个'), true, confirms[0].message);
+    const overPosted = base.calls.filter(([, path, body]) => path === '/tag-pool' && body);
+    assert.equal(overPosted.length, 1, '确认后仍要保存（不拦截）');
+    assert.deepEqual(overPosted[0][2].rules['题材'], { confidence_min: 0.6, max_tags: 9 });
+
+    // 保存后重新渲染：再展开一次，改成范围内的值
+    const rulePanels2 = collect(
+      settings.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-tagpool-rule-panel'),
+    );
+    collect(
+      settings.element,
+      (node) => node.tagName === 'BUTTON' && node.textContent === '设置',
+    )[0].click();
+    const ruleInputs2 = collect(rulePanels2[0], (node) => node.tagName === 'INPUT');
+    ruleInputs2[1].value = '3';
+    ruleInputs2[1].fire('input');
+    ruleInputs2[0].value = '0.6';
+    ruleInputs2[0].fire('input');
+
+    collect(
+      settings.element,
+      (node) => node.tagName === 'BUTTON' && node.textContent === '保存标签池',
+    )[0].click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const posted = base.calls.filter(([, path, body]) => path === '/tag-pool' && body).pop();
+    assert.ok(posted, '保存没有 POST /tag-pool');
+    assert.deepEqual(posted[2].categories_include, ['题材']);
+    assert.equal(posted[2].max_tags, 8);
+    assert.deepEqual(posted[2].rules['题材'], { confidence_min: 0.6, max_tags: 3 });
+    assert.equal(confirms.length, 1, '范围内的保存不该再弹窗');
+    const afterText = collect(settings.element, () => true)
+      .map((node) => String(node.textContent || ''))
+      .join('\n');
+    assert.equal(afterText.includes('被排除'), true, '保存后要显示「挡住了什么」');
   });
 
   await check('右键分类 → analyze 面板解析作用域', async () => {

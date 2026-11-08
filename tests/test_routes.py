@@ -814,6 +814,44 @@ def _removal_row():
     })
 
 
+def test_apply_never_removes_frozen_category_tags(tmp_path):
+    """历史作业的删除建议里若含「排除/隔离分类」的标签，落地时也必须跳过。
+
+    分析阶段已经过滤过一次；这条兜底针对修复前生成的老作业。
+    """
+    library = {
+        'tags': ['奇幻', '关系标签'],
+        'taxonomy': {
+            'tag_to_category': {'奇幻': '题材', '关系标签': '关系'},
+            'categories': {'题材': [], '关系': []},
+        },
+        'prefs': {},
+    }
+    row = job_item_row(result_overrides={
+        'tag_removals': [
+            {'name': '奇幻', 'reason': 'r'},
+            {'name': '关系标签', 'reason': 'r'},
+        ],
+        'remove_tags': ['奇幻', '关系标签'],
+    })
+    client, api, _store = build_app(
+        cards={'Alice.png': dict(CARD, tags=['奇幻', '关系标签'])},
+        tag_library=library, db_rows=[row], tmp_path=tmp_path,
+    )
+    api._config.update({'tag_pool_categories_exclude': '关系'})
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+
+    payload = client.post(
+        '/jobs/run-1/apply', json={'remove_tags': ['奇幻', '关系标签']},
+    ).get_json()
+
+    removes = [entry['remove'] for entry in api.applied_tags if entry['remove']]
+    assert removes == [['奇幻']], '冻结分类的标签不得被删除'
+    assert any(
+        '冻结分类' in str(item.get('warning', '')) for item in payload['details']
+    ), payload['details']
+
+
 def test_wi_entries_marks_prefilter_protected_entries(tmp_path, monkeypatch):
     """预览要能提前告诉用户「哪几条会被前置过滤跳过」（§7）。"""
     client, api, _store = build_app(tmp_path=tmp_path)
@@ -1096,6 +1134,259 @@ def test_settings_saves_and_normalizes_model_capabilities(env):
     assert caps['reasoning_enabled'] is False
     assert caps['reasoning_effort'] == 'auto'
     assert api._config['context_length'] == 65536
+
+
+# ------------------------------------------------------------------ 标签池（分类白/黑名单）
+
+TAG_LIBRARY = {
+    'tags': ['奇幻', '冒险', '校园', 'R18', '未分类'],
+    'taxonomy': {
+        'tag_to_category': {
+            '奇幻': '题材', '冒险': '题材', '校园': '场景', 'R18': '成人',
+        },
+        'categories': {'题材': [], '场景': [], '成人': []},
+    },
+    'prefs': {'isolated_categories': ['成人']},
+}
+
+
+def test_tag_pool_lists_categories_and_current_pool(tmp_path):
+    client, _api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    payload = client.get('/tag-pool').get_json()
+
+    assert payload['success'] is True
+    assert payload['tag_pool']['categories_include'] == []
+    assert payload['tag_pool']['categories_exclude'] == []
+    # 分类按名字排序（Unicode 码位：场景 < 成人 < 题材）；`isolated` 来自主程序的隔离分类
+    assert [item['name'] for item in payload['categories']] == ['场景', '成人', '题材']
+    assert payload['isolated'] == ['成人']
+    assert payload['total_tags'] == 5
+    assert payload['uncategorized'] == 1, '「未分类」没有 tag_to_category'
+    # 隔离分类下的标签默认就不可用
+    assert payload['effect']['allowed'] == 4
+
+
+def test_tag_pool_accepts_chinese_separators(tmp_path):
+    """非程序员不会只打英文逗号：中文逗号 / 顿号 / 换行都要能解析。"""
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    payload = client.post('/tag-pool', json={
+        'categories_include': '题材，场景、\n题材',
+        'categories_exclude': '成人',
+    }).get_json()
+
+    assert payload['success'] is True
+    pool = payload['tag_pool']
+    assert pool['categories_include'] == ['题材', '场景'], '去重 + 去空白 + 保序'
+    assert pool['categories_exclude'] == ['成人']
+    # 存的是**已声明**的字符串键：宿主的 config.set 只接受 config_schema 里的键，
+    # 写内部结构 `tag_pool` 会被拒绝（实测返回 False，前端报「配置未写入」）。
+    assert api._config['tag_pool_categories_include'] == '题材，场景'
+    assert api._config['tag_pool_categories_exclude'] == '成人'
+    assert 'tag_pool' not in api._config, '不要写未声明的键'
+
+    # 生效效果：无分类的标签在「只取」下也被排除（否则设了像没设）
+    assert payload['effect']['allowed'] == 3, '奇幻/冒险/校园'
+    blocked = payload['effect']['blocked_sample']
+    assert 'R18' in blocked, '隔离分类'
+    assert '未分类' in blocked, '只取模式下未分类标签被排除'
+
+
+def test_tag_pool_saves_per_category_rules_and_total(tmp_path):
+    """每分类规则 + 最大总数量要落到**已声明**的键里，并能原样读回来。"""
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+
+    payload = client.post('/tag-pool', json={
+        'max_tags': 6,
+        'categories_include': [],
+        'categories_exclude': [],
+        'rules': {
+            '题材': {'confidence_min': 0.6, 'max_tags': 3},
+            '场景': {'max_tags': 2},
+        },
+    }).get_json()
+
+    assert payload['success'] is True
+    assert payload['max_tags'] == 6
+    assert payload['rules']['题材'] == {'confidence_min': 0.6, 'max_tags': 3}
+    assert payload['allocation']['total'] == 5
+    assert payload['allocation']['over'] == 0
+    assert api._config['max_tags'] == 6
+    assert '题材' in api._config['tag_category_rules'], '规则以 JSON 字符串存'
+
+    again = client.get('/tag-pool').get_json()
+    assert again['rules']['题材']['confidence_min'] == 0.6
+    assert again['max_tags'] == 6
+
+
+def test_tag_pool_warns_but_saves_when_quota_sum_over_total(tmp_path):
+    """各分类数量之和 > 总上限：**只提醒，不拦保存**（用户选定的行为）。
+
+    实际打标时按总上限截断，所以各分类配额此时只是参考值。
+    """
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+
+    payload = client.post('/tag-pool', json={
+        'max_tags': 5,
+        'rules': {'题材': {'max_tags': 3}, '场景': {'max_tags': 4}},
+    }).get_json()
+
+    assert payload['success'] is True, '超限也必须能保存'
+    assert payload['allocation']['over'] == 2
+    assert any(
+        '超过最大总数量' in text and '按总上限' in text for text in payload['warnings']
+    ), payload['warnings']
+    # 规则照样落盘
+    assert api._config['max_tags'] == 5
+    assert '场景' in api._config['tag_category_rules']
+
+
+def test_tag_pool_allows_total_greater_than_quota_sum(tmp_path):
+    """总上限可以大于各分类之和（剩下的留给没单独设置的分类）。"""
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    payload = client.post('/tag-pool', json={
+        'max_tags': 20, 'rules': {'题材': {'max_tags': 2}},
+    }).get_json()
+
+    assert payload['success'] is True
+    assert payload['allocation'] == {
+        'total': 2, 'max_tags': 20, 'over': 0, 'quotas': {'题材': 2},
+    }
+
+
+def test_tag_pool_rejects_invalid_total(tmp_path):
+    client, _api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    for value in (0, 999, 'abc', -1):
+        response = client.post('/tag-pool', json={'max_tags': value})
+        assert response.status_code == 400, value
+
+
+def test_tag_pool_saves_budget_tokens(tmp_path):
+    """标签池 token 预算可调，并走已声明的 `tag_pool_budget_tokens` 键。"""
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+
+    payload = client.post('/tag-pool', json={'max_tags': 8, 'budget_tokens': 3000}).get_json()
+
+    assert payload['success'] is True
+    assert payload['budget_tokens'] == 3000
+    assert api._config['tag_pool_budget_tokens'] == 3000
+
+    again = client.get('/tag-pool').get_json()
+    assert again['budget_tokens'] == 3000
+    assert again['default_budget_tokens'] == 1200
+
+
+def test_tag_pool_rejects_bad_budget(tmp_path):
+    client, _api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    for value in (0, 100, 99999, 'abc'):
+        response = client.post('/tag-pool', json={'budget_tokens': value})
+        assert response.status_code == 400, value
+
+
+def test_tag_pool_budget_is_clamped_by_context(tmp_path):
+    """预算不能超过模型上下文可用额度（8K 上下文时 20000 会被夹到 ~3K）。"""
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    api._config.update({'context_length': 8192, 'max_output_tokens': 1024})
+
+    payload = client.post('/tag-pool', json={'budget_tokens': 20000}).get_json()
+
+    assert payload['success'] is True
+    assert payload['budget_tokens'] == 3072, '8192 - 1024 - 4096 = 3072'
+    assert payload['budget_tokens'] < 20000
+
+
+def test_tag_pool_reads_declared_string_keys(tmp_path):
+    """发一次保存后，再读回来必须还是那份值（配置页表单直接改这两个键也一样）。"""
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    api._config.update({
+        'tag_pool_categories_include': '题材，场景',
+        'tag_pool_categories_exclude': '成人',
+    })
+
+    payload = client.get('/tag-pool').get_json()
+
+    assert payload['tag_pool']['categories_include'] == ['题材', '场景']
+    assert payload['tag_pool']['categories_exclude'] == ['成人']
+
+
+def test_tag_pool_counts_unmapped_tags_as_default_category(tmp_path):
+    """没有分类映射的标签属于宿主的 `default_category`（通常叫「未整理」）。
+
+    不计入的话「未整理」的数量会比宿主界面少一大截（实测 12 vs 287）。
+    """
+    library = {
+        'tags': ['奇幻', '散装标签'],
+        'taxonomy': {
+            'default_category': '未整理',
+            'tag_to_category': {'奇幻': '题材'},
+            'categories': {'题材': []},
+        },
+        'prefs': {},
+    }
+    client, _api, _store = build_app(tag_library=library, tmp_path=tmp_path)
+
+    payload = client.get('/tag-pool').get_json()
+
+    names = {item['name']: item['tags'] for item in payload['categories']}
+    assert names['未整理'] == 1, '未映射的标签计入默认分类'
+    assert names['题材'] == 1
+    assert payload['uncategorized'] == 0, '有了默认分类就不该再报「无分类」'
+
+
+def test_tag_pool_accepts_arrays_and_reports_unknown_names(tmp_path):
+    client, _api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    payload = client.post('/tag-pool', json={
+        'categories_include': ['题材', '题材库'],  # 后者拼错了
+        'categories_exclude': [],
+    }).get_json()
+
+    assert payload['success'] is True
+    assert payload['tag_pool']['categories_include'] == ['题材', '题材库']
+    assert any('题材库' in text for text in payload['warnings']), payload['warnings']
+
+
+def test_tag_pool_rejects_category_on_both_sides(tmp_path):
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    before = dict(api._config)
+
+    response = client.post('/tag-pool', json={
+        'categories_include': '题材',
+        'categories_exclude': '题材,成人',
+    })
+    payload = response.get_json()
+
+    assert response.status_code == 400
+    assert payload['success'] is False
+    assert '不能同时' in payload['msg']
+    assert api._config == before, '冲突时一个字节都不该写'
+
+
+def test_suggestions_hide_tags_already_in_library(tmp_path):
+    """建议队列里「已经在标签库里」的条目不再显示（历史作业留下的脏数据）。"""
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    api._ui['tag_suggestions'] = {
+        '真的新标签': {'count': 2, 'cards': ['a.png'], 'reason': 'r',
+                   'first_seen': 0, 'last_seen': 0},
+        '奇幻': {'count': 1, 'cards': [], 'reason': 'r',
+               'first_seen': 0, 'last_seen': 0},
+    }
+
+    payload = client.get('/suggestions').get_json()
+
+    assert [item['name'] for item in payload['items']] == ['真的新标签']
+    assert payload['hidden_existing'] == 1, '已有标签应按「已存在」隐藏'
+    assert payload['total'] == 1
+
+
+def test_suggestions_clear_still_works(tmp_path):
+    client, api, store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    api._ui['tag_suggestions'] = {
+        '真的新标签': {'count': 1, 'cards': [], 'reason': '', 'first_seen': 0, 'last_seen': 0},
+    }
+    payload = client.post('/suggestions/clear', json={'names': ['真的新标签']}).get_json()
+
+    assert payload['success'] is True
+    assert payload['removed'] == ['真的新标签']
+    assert store.list_tag_suggestions() == {}
 
 
 # ------------------------------------------------------------------ 归类落地：弃权不得移动

@@ -10,6 +10,7 @@
 import hashlib
 import json
 import logging
+import re
 import time
 
 from flask import jsonify, request
@@ -26,6 +27,7 @@ from .core import modelcap as modelcap_core
 from .core import prefilter as prefilter_core
 from .core import proposal as proposal_core
 from .core import prompt as prompt_core
+from .core import tagpool as tagpool_core
 from .core import wicheck as wicheck_core
 from .core import tokens as tokens_core
 from .core import trimming as trimming_core
@@ -193,6 +195,114 @@ def _has_form_value(value) -> bool:
     if isinstance(value, (list, tuple, dict)):
         return bool(value)
     return True
+
+
+#: 标签分类名单里的分隔符：中英文逗号/分号、顿号、换行都算（非程序员不会只打英文逗号）。
+_CATEGORY_SPLIT_PATTERN = re.compile(r'[,，;；、\n\r]+')
+
+#: 一次最多接受多少个分类（防止把整段文本粘进来）。
+MAX_CATEGORY_ITEMS = 50
+
+#: 「最大标签数」的上限（与 manifest `config_schema.max_tags.maximum` 一致）。
+MAX_TOTAL_TAGS = 20
+
+#: 标签池 token 预算的上下限（与 manifest 一致）。
+MIN_TAG_BUDGET = 200
+MAX_TAG_BUDGET = 20000
+
+
+def _check_rule_quotas(rules, max_tags) -> tuple:
+    """检查「各分类设置数量之和 ≤ 最大总数量」，**只提醒、不拦保存**。
+
+    用户选定的行为：超了也允许保存（弹窗提醒即可），实际打标时按总上限截断
+    （`tagpool.apply_rules()` 先按分类配额取，再按总上限按置信度截断），
+    所以各分类配额此时只是「参考值」。
+
+    Returns:
+        `(ok, message, detail)`；`ok=False` 表示只是**提醒**（不是拒绝），
+        `detail` 里带每个分类的配额，供设置页弹窗列明细。
+    """
+    quotas = {}
+    for name, rule in (rules or {}).items():
+        if isinstance(rule, dict) and rule.get('max_tags') is not None:
+            quotas[str(name)] = int(rule['max_tags'])
+    total = sum(quotas.values())
+    limit = int(max_tags or 0)
+    detail = {'total': total, 'max_tags': limit, 'over': max(0, total - limit),
+              'quotas': quotas}
+    if limit and total > limit:
+        over = total - limit
+        breakdown = '、'.join(f'{name} {count}' for name, count in sorted(quotas.items()))
+        message = (
+            f'各分类「设置数量」之和 {total} 超过最大总数量 {limit}（超出 {over}）。'
+            f'当前分配：{breakdown}。保存后实际打标会按总上限 {limit} 个截断'
+            f'（按置信度从高到低），各分类配额只作参考。'
+        )
+        return False, message, detail
+    return True, '', detail
+
+
+def _split_category_list(raw) -> list:
+    """把「只取 / 排除」输入解析成分类名列表。
+
+    接受数组或字符串；字符串按中英文逗号 / 分号 / 顿号 / 换行切分。
+    去空白、去重、保序，非法项（空串 / 超长）直接丢弃。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        parts = [str(item or '') for item in raw]
+    else:
+        parts = _CATEGORY_SPLIT_PATTERN.split(str(raw))
+
+    result = []
+    for part in parts:
+        name = str(part or '').strip()
+        if not name or len(name) > 64:
+            continue
+        if name not in result:
+            result.append(name)
+        if len(result) >= MAX_CATEGORY_ITEMS:
+            break
+    return result
+
+
+def _tag_pool_view(api, pool) -> dict:
+    """标签池的「可选项 + 生效效果」，供设置页渲染分类按钮与效果提示。"""
+    library = read_tag_library(api)
+    index = tagpool_core.classify_tags(library)
+    spec = tagpool_core.normalize_pool(pool)
+
+    counts = {}
+    for tag in index['tags']:
+        category = index['tag_to_category'].get(tag, '')
+        counts[category] = counts.get(category, 0) + 1
+
+    isolated = set(index['isolated'])
+    names = sorted({name for name in index['categories'] if name} | {name for name in counts if name})
+    categories = [
+        {
+            'name': name,
+            'tags': int(counts.get(name) or 0),
+            'isolated': name in isolated,
+        }
+        for name in names
+    ]
+
+    resolved = tagpool_core.resolve_candidates(library, spec)
+    return {
+        'tag_pool': spec,
+        'categories': categories,
+        'isolated': sorted(isolated),
+        'uncategorized': int(counts.get('') or 0),
+        'total_tags': len(index['tags']),
+        # 「生效效果」：用户保存后最想知道的就是「到底挡住了什么」
+        'effect': {
+            'allowed': len(resolved['allowed']),
+            'blocked': len(resolved['blocked']),
+            'blocked_sample': resolved['blocked'][:8],
+        },
+    }
 
 
 def _resolve_pull_headers(store, saved, payload) -> tuple:
@@ -366,6 +476,140 @@ def register_routes(api, store) -> None:
             return _fail(CODE_INVALID_PAYLOAD, '配置未写入（主程序拒绝了本次保存）',
                          http_status=400)
         return _ok(model_capabilities=caps)
+
+    # ---------------------------------------------------------- 标签池（分类白/黑名单）
+
+    @api.http.route('/tag-pool', ['GET'])
+    @_handle_errors
+    def get_tag_pool():
+        """全局标签池现状：分类白/黑名单 + 每分类规则 + 最大总数量。
+
+        `categories_include` / `categories_exclude` 的是**标签分类**（主程序标签体系里
+        `tag_to_category` 的值），不是角色卡目录分类 —— 设置页据此渲染「点一下就填」的
+        分类按钮，避免用户手打分类名打错。
+
+        `tag_category_rules` 是每个分类的「置信度门槛 + 数量配额」：
+        `{"人设": {"confidence_min": 0.6, "max_tags": 3}}`。
+        """
+        config = config_module.load_config(api)
+        view = _tag_pool_view(api, config.get('tag_pool'))
+        return _ok(
+            **view,
+            max_tags=config['max_tags'],
+            rules=config.get('tag_category_rules') or {},
+            default_confidence=tagpool_core.DEFAULT_CATEGORY_CONFIDENCE,
+            budget_tokens=config['tag_pool'].get('budget_tokens'),
+            default_budget_tokens=tagpool_core.DEFAULT_BUDGET_TOKENS,
+        )
+
+    @api.http.route('/tag-pool', ['POST'])
+    @_handle_errors
+    def save_tag_pool():
+        """保存标签池：分类白/黑名单 + 最大总数量 + 每分类规则。
+
+        写的都是**已声明**的 `config_schema` 键：宿主的 `api.config.set()` 只接受
+        声明过的键，写内部结构（如 `tag_pool`）会被拒绝（实测 `set()` 返回 False，
+        前端报「配置未写入」）。读取时由 `config.normalize_config()` 再折回内部结构。
+
+        `tag_category_rules` 存 JSON 字符串；保存前校验：
+        **各分类「设置数量」之和不得超过「最大总数量」**（用户要求：超了要拦下来）。
+        """
+        payload = _body()
+        include = _split_category_list(payload.get('categories_include'))
+        exclude = _split_category_list(payload.get('categories_exclude'))
+
+        both = sorted(set(include) & set(exclude))
+        if both:
+            return _fail(
+                CODE_INVALID_PAYLOAD,
+                f'同一个分类不能同时「只取」和「排除」：{"、".join(both)}',
+                detail={'overlap': both},
+            )
+
+        config = config_module.load_config(api)
+        max_tags = int(config['max_tags'])
+        if 'max_tags' in payload:
+            raw_total = payload.get('max_tags')
+            try:
+                max_tags = int(raw_total)
+            except (TypeError, ValueError):
+                return _fail(CODE_INVALID_PAYLOAD, f'最大总数量必须是整数：{raw_total!r}')
+            if not 1 <= max_tags <= MAX_TOTAL_TAGS:
+                return _fail(
+                    CODE_INVALID_PAYLOAD,
+                    f'最大总数量必须在 1–{MAX_TOTAL_TAGS} 之间：{max_tags}',
+                )
+
+        raw_rules = payload.get('rules', payload.get('tag_category_rules'))
+        rules = tagpool_core.normalize_rules(raw_rules)
+        # 只提醒、不拦保存（用户选定的行为）：实际打标会按总上限截断
+        quota_ok, quota_message, quota_detail = _check_rule_quotas(rules, max_tags)
+
+        budget_tokens = int(
+            config['tag_pool'].get('budget_tokens') or tagpool_core.DEFAULT_BUDGET_TOKENS,
+        )
+        if 'budget_tokens' in payload:
+            raw_budget = payload.get('budget_tokens')
+            try:
+                budget_tokens = int(raw_budget)
+            except (TypeError, ValueError):
+                return _fail(CODE_INVALID_PAYLOAD, f'标签池预算必须是整数：{raw_budget!r}')
+            if not MIN_TAG_BUDGET <= budget_tokens <= MAX_TAG_BUDGET:
+                return _fail(
+                    CODE_INVALID_PAYLOAD,
+                    f'标签池预算必须在 {MIN_TAG_BUDGET}–{MAX_TAG_BUDGET} 之间：{budget_tokens}',
+                )
+
+        try:
+            saved = bool(api.config.set({
+                'max_tags': max_tags,
+                'tag_pool_categories_include': '，'.join(include),
+                'tag_pool_categories_exclude': '，'.join(exclude),
+                'tag_category_rules': (
+                    json.dumps(rules, ensure_ascii=False, sort_keys=True) if rules else ''
+                ),
+                'tag_pool_budget_tokens': budget_tokens,
+            }))
+        except Exception:  # noqa: BLE001 - 配置写入失败不该 500
+            logger.warning('保存标签池失败', exc_info=True)
+            saved = False
+        if not saved:
+            return _fail(CODE_INVALID_PAYLOAD, '配置未写入（主程序拒绝了本次保存）',
+                         http_status=400)
+
+        # 以**重新读回来的配置**为准（宿主可能做钳位/规范化），而不是拿请求体回显
+        config = config_module.load_config(api)
+        view = _tag_pool_view(api, config.get('tag_pool'))
+
+        # 分类名拼错时给出可操作的提示（不阻塞保存：用户可能先配好、再去建分类）
+        known = {item['name'] for item in view['categories']}
+        unknown = [name for name in include + exclude if name not in known]
+        unknown += [name for name in rules if name not in known]
+        warnings = []
+        if not quota_ok and quota_message:
+            warnings.append(quota_message)
+        if unknown:
+            warnings.append(
+                '这些名字不是标签库里的分类（可能打错了）：' + '、'.join(
+                    sorted(set(unknown))),
+            )
+        if view['uncategorized']:
+            warnings.append(
+                f'有 {view["uncategorized"]} 个标签没有分类'
+                + ('；设了「只取」后它们会被排除' if include else ''),
+            )
+
+        return _ok(
+            tag_pool=view['tag_pool'], categories=view['categories'],
+            isolated=view['isolated'], uncategorized=view['uncategorized'],
+            total_tags=view['total_tags'], effect=view['effect'],
+            max_tags=config['max_tags'], rules=config.get('tag_category_rules') or {},
+            default_confidence=tagpool_core.DEFAULT_CATEGORY_CONFIDENCE,
+            budget_tokens=config['tag_pool'].get('budget_tokens'),
+            default_budget_tokens=tagpool_core.DEFAULT_BUDGET_TOKENS,
+            allocation=quota_detail,
+            warnings=warnings,
+        )
 
     @api.http.route('/cards', ['GET'])
     @_handle_errors
@@ -1362,6 +1606,26 @@ def register_routes(api, store) -> None:
         failed = 0
         details = []
 
+        # C13 兜底：即使结果里带着「删除某条冻结分类的标签」，落地时也不执行。
+        # 分析阶段（`jobs.analyze_one`）已经过滤过一次；这里再挡一次是为了
+        # **历史作业**——它们的 `tag_removals` 是这次修复之前生成的。
+        apply_config = config_module.load_config(api)
+        apply_library = read_tag_library(api)
+        frozen_cache = {}
+
+        def _frozen_tags(profile_id: str) -> set:
+            key = str(profile_id or '')
+            if key not in frozen_cache:
+                profile = None
+                if key:
+                    try:
+                        profile = store.get_profile(key)
+                    except Exception:  # noqa: BLE001 - 档案读不到按全局池算
+                        profile = None
+                pool_spec = prompt_core.profile_tag_pool(profile or {}, apply_config)
+                frozen_cache[key] = tagpool_core.protected_tags(apply_library, pool_spec)
+            return frozen_cache[key]
+
         # C13：用户在审批页勾选的删除项（默认一条都没有）。只删「这条结果里
         # 明确建议删除、且卡片上确实存在」的标签——删标签不可逆。
         selected_removals = {
@@ -1426,12 +1690,25 @@ def register_routes(api, store) -> None:
                     str(name).strip() for name in (card.get('tags') or [])
                     if str(name or '').strip()
                 }
+                frozen = _frozen_tags(str(result.get('profile_id') or ''))
+                frozen_skipped = []
                 for entry in (result.get('tag_removals') or []):
                     name = str(
                         (entry or {}).get('name') if isinstance(entry, dict) else entry or '',
                     ).strip()
-                    if name and name in selected_removals and name in card_tags:
+                    if not name:
+                        continue
+                    if name in frozen:
+                        frozen_skipped.append(name)
+                        continue
+                    if name in selected_removals and name in card_tags:
                         wanted_removals.append(name)
+                if frozen_skipped:
+                    details.append({
+                        'card_id': card_id,
+                        'warning': '已跳过冻结分类（排除/隔离）的删除项: '
+                                   + '、'.join(frozen_skipped[:5]),
+                    })
 
             if accepted or wanted_removals:
                 tag_result = api.cards.apply_tags(
@@ -1491,9 +1768,22 @@ def register_routes(api, store) -> None:
     @api.http.route('/suggestions', ['GET'])
     @_handle_errors
     def list_suggestions():
+        """新标签建议队列（**隐藏已经在标签库里的**）。
+
+        队列是历史累积的：早先的作业可能把「你已有的标签」写了进来（模型没看到
+        预算外的标签，就当成新的提了）。读的时候拿当前标签库再核一遍，
+        避免界面上出现「建议新增」的其实是你早就有的标签。
+
+        只做**展示过滤**，不删队列数据：标签被删掉后，对应建议会重新出现。
+        """
         queue = store.list_tag_suggestions()
+        known = known_tag_set(read_tag_library(api))
         items = []
+        hidden = 0
         for name, record in queue.items():
+            if str(name or '').strip() in known:
+                hidden += 1
+                continue
             items.append({
                 'name': name,
                 'count': int((record or {}).get('count') or 0),
@@ -1503,7 +1793,7 @@ def register_routes(api, store) -> None:
                 'last_seen': int((record or {}).get('last_seen') or 0),
             })
         items.sort(key=lambda item: (-item['count'], item['name']))
-        return _ok(items=items, total=len(items))
+        return _ok(items=items, total=len(items), hidden_existing=hidden)
 
     @api.http.route('/suggestions/clear', ['POST'])
     @_handle_errors

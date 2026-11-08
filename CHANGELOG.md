@@ -1,5 +1,117 @@
 # CHANGELOG
 
+## 未发布
+
+以下改动基于 v0.3.0，尚未发版。
+
+### 分发相关
+
+- `manifest.license` 由 `MIT` 改为 **`Apache-2.0`**，与随附的 `LICENSE` 文件对齐
+  （原文件与 manifest 声明不一致）。
+- 新增 `FORK.md`：说明本副本是**非官方修改版**、基于上游 v0.3.0、列出改动清单与
+  安装/许可注意事项（Apache-2.0 第 4(b) 条要求声明修改）。
+- 分发时不包含 `data/`（插件私有数据与密钥不随包走），目录名必须等于 `manifest.id`。
+
+### 新增
+
+- **标签池 token 预算可调**（`tag_pool_budget_tokens`，默认 1200）：
+  「AI 助手设置 → 标签池」新增输入框（200–20000，步进 100），决定给 AI 列多少标签。
+  调大能让模型看到更多已有标签、减少「把已有标签当新标签」；代价是 prompt 更长更贵。
+  实际值会被 `modelcap.context_available()`（上下文 − 输出 − 余量）夹住；
+  档案自己的 `tag_pool.budget_tokens` 仍可单独覆盖。
+  - 新键是 `config_schema` 已声明的整数键（宿主 `config.set` 只接受声明键）。
+  - 回归用例：路由 3 条（保存/非法值/上下文夹取）、设置页契约 1 条。
+
+- **每分类置信度 + 每分类数量（取代全局「标签置信度下限」）**：
+  - 全局 `confidence_min` **删除**，不再作为所有标签的统一门槛；
+  - 「AI 助手设置 → 标签池」里每个标签分类可展开设置：**标签置信度**（低于它的标签不打）
+    与**设置数量**（该分类最多保留几个，按置信度从高到低取）；
+  - 语义：未单独设置的分类默认置信度 **0.5**、数量**不限**；数量填 **0 = 该分类一个都不选**；
+    「最大总数量」（`max_tags`）仍是硬上限；
+  - **保存校验（只提醒、不拦保存）**：各分类「设置数量」之和超过「最大总数量」时，
+    弹窗列出明细（总上限 / 当前合计 / 超出多少 / 每个分类占的额度）并问「仍要保存吗」，
+    确认后照常保存；**实际打标按总上限按置信度截断**，此时各分类配额只作参考。
+    总上限大于分类之和是允许的。
+  - 规则会**同时**用于两处：拼进 system 提示词（模型知道该给几个、置信度要多高），
+    以及解析后的确定性过滤（`tagpool.apply_rules()`：分类阈值 → 分类配额 → 总数截断）；
+  - 存储：新增已声明的字符串键 `tag_category_rules`（JSON），`max_tags` 沿用；
+  - 预览/CLI 与真实作业同口径（`prompt.append_system_note()` 注入同一段规则文本）。
+  - 回归用例：`tagpool` 7 条、`parsing` 2 条、`jobs` 2 条、`routes` 4 条、设置页契约 1 条、
+    前端冒烟（含「超限拦截 + 成功保存」完整流程）1 条。
+
+- **冻结分类的标签不再进入「建议删除」**：`categories_exclude` 与主程序的「隔离分类」
+  现在被当作**冻结**内容 —— 分析阶段（`tag_removals`）与落地阶段（`/jobs/<id>/apply`）
+  都会跳过这些分类里的标签：审批页不会出现「要不要删掉你自己写的那条」，
+  自动模式也不可能删掉它们。落地阶段的兜底同时保护**修复前就已存在的老作业**
+  （它们的 `tag_removals` 是旧的、未过滤的）。
+  - `tagpool.protected_tags()` 只认「明确排除 / 隔离」；「只取」白名单之外的标签
+    不算冻结（那只是这次不参与挑词）。`respect_isolated=false` 时不冻结隔离分类。
+  - 回归用例：分析阶段 1 条、落地阶段 1 条、`protected_tags` 1 条。
+
+- **标签池分类过滤（设置页「标签池」，带 `?` 说明）**：两个输入框
+  `categories_include`（只取这些分类）/ `categories_exclude`（排除这些分类），
+  标题旁的 `?` 点开就是逐条填写说明（留空等于什么、多个怎么分隔、名字从哪来、
+  会不会误伤、和隔离分类的关系）。下方列出「现有标签分类」并给出「只取 / 排除」按钮，
+  点一下自动填进对应输入框（两边互斥），**不用手打分类名**。
+  保存后显示生效效果：可用标签数 / 被排除数与示例，分类名拼错会明确提示。
+  - 新端点：`GET /tag-pool`（当前值 + 分类清单 + 未分类数）、
+    `POST /tag-pool`（保存 `tag_pool.categories_*`，接受数组或中英文逗号/顿号/换行分隔的字符串）。
+  - 设置页新增区块「标签池」；`frontend/api.js` 增加 `tagPool()` / `saveTagPool()`。
+  - 回归用例：路由 4 条、`tagpool` 1 条、设置页静态契约 2 条、前端冒烟 1 条。
+
+### 修复
+
+- **「建议新增标签」里出现你已经有的标签**：模型只看得到**预算内**被列出的标签
+  （`listed ⊆ allowed`，标签池按 token 截断），预算外的真实标签它没见过，就会当新标签
+  提出来；它也可能把「库里已有、但没写进 tags」的名字直接塞进 `suggested_new_tags`。
+  之前只在**本次响应的 tags** 里做去重，没有拿标签库核对。
+  现在两处都补上：
+  - 作业侧：`filter_new_suggestions()` 先做别名还原，再用真实标签库（+ 排除/隔离分类）
+    核对，已有的直接丢掉，并在作业警告里写「已经存在/属于排除分类」以及「原名→规范名」；
+  - 队列侧：`GET /suggestions` 按**当前**标签库过滤历史脏数据（只隐藏、不删数据），
+    返回 `hidden_existing`，设置页显示「另有 N 条建议其实已经在标签库里，已隐藏」。
+  - 回归用例：`jobs` 2 条（别名/排除、端到端）、`routes` 2 条（隐藏与清空）。
+
+- **标签池保存后不生效（真机实测）**：根因是宿主的 `api.config.set()` **只接受
+  `config_schema` 里声明过的键** —— 写内部结构 `tag_pool` 会被拒绝（`set()` 返回
+  False，前端报「配置未写入」）。现在把两个分类名单存成**已声明**的字符串键
+  `tag_pool_categories_include` / `tag_pool_categories_exclude`（逗号分隔），
+  `normalize_config()` 再折进 `tag_pool`。宿主「插件配置」页也会直接显示这两个输入框。
+- **「未整理」标签数量与宿主界面对不上**：没有显式分类映射的标签现在归入
+  `taxonomy.default_category`（宿主标签页的「未整理」）。此前它们被算成「未分类」，
+  于是「未整理」只统计显式映射的那部分（实测宿主 287、插件 12），
+  且「排除 未整理」也挡不住它们。
+- **`categories_include` 现在也会挡下「没有分类」的标签**：此前白名单只作用于
+  有分类的标签，未分类标签会漏进候选集 —— 用户设了「只取 题材」仍看到别的标签，
+  表现就是「设了跟没设一样」。
+- **配置页的「最大标签数 / 概览字数上限 / 标签置信度下限」只能调小，调大不生效**
+  （用户原话：「配置中，保存并应用后并未生效」）。根因是三处叠在一起：
+  1. 内置档案的 `output_schema` 写死了 `tags.max_items=8` / `summary.max_chars=300` /
+     `tags.min_confidence=0.5`；
+  2. `prompt.build_limits()` 按「配置是全局上限，与档案规则取更严格者」取
+     `min(全局, 档案)`，于是配置 20 / 600 永远被压回 8 / 300；
+  3. 生成约束（`schema.describe_constraints`）、事后校验与超量截断（`parsing`）
+     读的都是**档案**里的那份数字，与 `{{ limits.* }}` 渲染出来的值分叉。
+
+  改法：
+  - `output_schema` 里写 **0 = 跟随全局配置**（与 `generation.max_tokens = 0` 同一约定），
+    内置档案改为 0，`build_limits()` 把 0 视为「未声明」；用户自建档案写具体数字时
+    仍按「更严格者」生效；
+  - 新增 `prompt.apply_limits(profile, limits)`，把生效值回写进
+    `output_schema.properties.{tags.max_items, tags.min_confidence, summary.max_chars}`，
+    并在 `ai.analyze` / `ai.classify` / 预览 / 估算 / CLI 的调用点统一应用
+    —— 提示词约束、校验、截断从此同源。
+  - 回归用例：`test_zero_in_schema_means_follow_global_config`、
+    `test_custom_profile_can_still_be_stricter_than_global`、
+    `test_apply_limits_rewrites_schema_used_by_constraints_and_parsing`、
+    `test_saved_limits_reach_prompt_and_truncation`。
+
+### 已知未处理
+
+- `batch_size`（每批张数）、`concurrency`（并发数）仍无消费方（改了不起作用）；
+- `default_profile_id`（默认提示词档案）后端仍未读取，前端读的 `config.task_profiles`
+  这个键也不存在。
+
 ## 0.3.0（2026-10-25）
 
 首个公开发布：插件契约 v3 + 模型能力设置。以下 2026-10-19 ~ 2026-10-24 各批次均随本版本发布。

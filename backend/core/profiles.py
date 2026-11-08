@@ -39,16 +39,21 @@ MISSING_POLICIES = ('error', 'empty')
 TASK_IDS = ('', 'wi_rewrite', 'classify', 'analyze', 'propose', 'agent')
 
 #: 默认输出 schema：等同改造前「summary + tags + 建议新标签」的行为
+#:
+#: `max_chars` / `max_items` / `min_confidence` 写 **0 = 跟随全局配置**
+#: （`prompt.build_limits()` 的 `ZERO_MEANS_FOLLOW_GLOBAL`）。这三个上限属于
+#: 用户可调的全局口径，写死默认值会让配置页「只能调小、无法调大」
+#: —— 实测：配置 max_tags=20 / summary_max_chars=600，实际仍是 8 / 300。
 DEFAULT_OUTPUT_SCHEMA = {
     'strip_think': True,
     'json_only': True,
     'forbidden_wrappers': ['```json', '```'],
     'required': ['summary', 'tags'],
     'properties': {
-        'summary': {'type': 'string', 'min_chars': 0, 'max_chars': 300},
+        'summary': {'type': 'string', 'min_chars': 0, 'max_chars': 0},
         'tags': {
-            'type': 'array', 'min_items': 0, 'max_items': 8,
-            'min_confidence': 0.5, 'order_by': 'confidence',
+            'type': 'array', 'min_items': 0, 'max_items': 0,
+            'min_confidence': 0, 'order_by': 'confidence',
             'item': {
                 'name': {'type': 'string'},
                 'confidence': {'type': 'number', 'min': 0, 'max': 1},
