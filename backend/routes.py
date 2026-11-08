@@ -2122,8 +2122,17 @@ def _apply_propose(api, store, run_id: str, job, payload) -> dict:
     merges_executed = []
     raw_merges = payload.get('merges')
     if isinstance(raw_merges, list) and raw_merges:
+        # 合并会从每张卡上 `remove` 标签，因此和「建议删除」一样要过冻结分类这一关。
+        # 不传的话 `categories_exclude` / 「隔离分类」里的标签会被合并整体搬空。
+        try:
+            merge_config = config_module.load_config(api)
+        except Exception:  # noqa: BLE001 - 配置读不到就退回内置池
+            merge_config = {}
+        frozen = _frozen_tags_for(
+            api, store, merge_config, str(job.get('profile_id') or ''),
+        )
         for merge in raw_merges:
-            merges_executed.append(_execute_tag_merge(api, merge))
+            merges_executed.append(_execute_tag_merge(api, merge, frozen=frozen))
 
     # 只要有分类没建出来，就不能报「成功」。
     #
@@ -2160,11 +2169,39 @@ def _apply_propose(api, store, run_id: str, job, payload) -> dict:
     )
 
 
-def _execute_tag_merge(api, merge) -> dict:
+def _frozen_tags_for(api, store, config, profile_id: str = '') -> set:
+    """「冻结分类」（排除 / 隔离）下的标签名集合。
+
+    落地阶段与标签合并都必须过这一关：这些分类是用户手写并固定的内容，
+    「排除」的语义就是「别动我这些」——不只是不看不建议删，而是任何自动
+    删除动作都不该碰它们。档案自己的 `tag_pool` 可能进一步收窄范围，所以
+    按档案 id 分别计算（与 `/jobs/<id>/apply` 的 `_frozen_tags` 同一口径）。
+    """
+    try:
+        library = read_tag_library(api)
+    except Exception:  # noqa: BLE001 - 读不到标签库时不该误删，按「无冻结」处理
+        logger.warning('读取标签库失败，跳过冻结分类保护', exc_info=True)
+        return set()
+
+    profile = None
+    if profile_id:
+        try:
+            profile = store.get_profile(profile_id)
+        except Exception:  # noqa: BLE001 - 档案读不到就按全局池算
+            profile = None
+    pool_spec = prompt_core.profile_tag_pool(profile or {}, config)
+    return tagpool_core.protected_tags(library, pool_spec)
+
+
+def _execute_tag_merge(api, merge, *, frozen=None) -> dict:
     """把 `from` 标签下的卡片改挂 `to`，再删掉 `from`。
 
     `from` 允许是字符串或字符串数组（propose 的 `tag_merges[].from` 是数组，
     表示多个近义标签合并到一个规范名）。返回每个来源标签的移动条数。
+
+    `frozen` 里的标签（排除/隔离分类）**不参与合并**：合并会 `remove=[source]`，
+    等于从每张卡上删标签。跳过并把它们报回到 `skipped_frozen`，让审批页
+    能显示「这几条没动，因为它们在冻结分类里」。
     """
     data = merge if isinstance(merge, dict) else {}
     target = str(data.get('to') or '').strip()
@@ -2173,9 +2210,19 @@ def _execute_tag_merge(api, merge) -> dict:
     sources = [str(item or '').strip() for item in sources]
     sources = [item for item in sources if item and item != target]
 
-    result = {'from': sources, 'to': target, 'moved': 0, 'failed': [], 'error': ''}
+    frozen_set = {str(name).strip() for name in (frozen or set()) if str(name or '').strip()}
+    skipped_frozen = [name for name in sources if name in frozen_set]
+    sources = [name for name in sources if name not in frozen_set]
+
+    result = {
+        'from': sources, 'to': target, 'moved': 0, 'failed': [], 'error': '',
+        'skipped_frozen': skipped_frozen,
+    }
     if not target or not sources:
-        result['error'] = 'invalid_merge'
+        result['error'] = 'invalid_merge' if not target else ''
+        if not sources and skipped_frozen:
+            # 整条都被冻结挡住：不是用户配错了，要说清楚
+            result['error'] = 'all_frozen'
         return result
 
     for source in sources:

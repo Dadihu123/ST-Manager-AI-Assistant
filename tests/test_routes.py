@@ -1100,6 +1100,88 @@ def test_propose_apply_reports_invalid_merge(tmp_path):
     assert payload['merges_executed'][0]['error'] == 'invalid_merge'
 
 
+# 冻结分类（排除 / 隔离）保护：合并会从每张卡上 `remove` 标签，等于删标签，
+# 因此必须和「建议删除」走同一道关。修之前 `_execute_tag_merge` 不看冻结集合，
+# 「合并标签」能把用户明确排除的分类整体搬空。
+
+FROZEN_LIBRARY = {
+    'tags': ['旧名', '别称', '恋爱', '成人向'],
+    'taxonomy': {
+        'tag_to_category': {
+            '旧名': '题材', '别称': '题材',
+            '恋爱': '题材', '成人向': '成人',
+        },
+        'categories': {'题材': [], '成人': []},
+    },
+    'isolated_categories': ['成人'],
+    'prefs': {},
+}
+
+
+def test_propose_apply_merge_skips_frozen_excluded_category(tmp_path):
+    """「排除」的分类不参与合并：既不移走也不删除。"""
+    client, api, _store = build_app(
+        tag_library=FROZEN_LIBRARY,
+        db_rows=[_card_row('a.png', ['成人向']), _card_row('b.png', ['旧名']),],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.propose', 'status': 'completed'}
+    merge = {'from': ['成人向', '旧名'], 'to': '规范名'}
+    api.job_items = [_propose_row([], merges=[merge])]
+
+    # 通过全局配置把「成人」设成排除分类
+    api.config_data = {'tag_pool_categories_exclude': '成人'}
+
+    payload = client.post('/jobs/run-1/apply', json={'merges': [merge]}).get_json()
+
+    executed = payload['merges_executed'][0]
+    assert executed['skipped_frozen'] == ['成人向'], '冻结分类的标签要被跳过并报回'
+    assert executed['from'] == ['旧名'], '只合并没被冻结的那些'
+
+    touched = {(entry['card_ids'][0], tuple(entry['remove'])) for entry in api.applied_tags}
+    assert ('a.png', ('成人向',)) not in touched, '冻结分类的标签绝不能被删'
+    assert ('b.png', ('旧名',)) in touched, '未冻结的照常合并'
+
+
+def test_propose_apply_merge_skips_isolated_category(tmp_path):
+    """隔离分类同样冻结（用户明确说过别动）。"""
+    client, api, _store = build_app(
+        tag_library=FROZEN_LIBRARY,
+        db_rows=[_card_row('a.png', ['成人向'])],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.propose', 'status': 'completed'}
+    merge = {'from': ['成人向'], 'to': '规范名'}
+    api.job_items = [_propose_row([], merges=[merge])]
+
+    payload = client.post('/jobs/run-1/apply', json={'merges': [merge]}).get_json()
+
+    executed = payload['merges_executed'][0]
+    assert executed['skipped_frozen'] == ['成人向']
+    assert executed['moved'] == 0
+    assert executed['error'] == 'all_frozen', '整条都被挡住时要说清楚原因'
+    assert all(not entry['remove'] for entry in api.applied_tags)
+
+
+def test_propose_apply_merge_still_works_when_nothing_frozen(tmp_path):
+    """没有排除/隔离配置时，合并行为与以前完全一致（不能误伤正常功能）。"""
+    client, api, _store = build_app(
+        tag_library=FROZEN_LIBRARY,
+        db_rows=[_card_row('a.png', ['旧名'])],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.propose', 'status': 'completed'}
+    merge = {'from': ['旧名'], 'to': '规范名'}
+    api.job_items = [_propose_row([], merges=[merge])]
+
+    payload = client.post('/jobs/run-1/apply', json={'merges': [merge]}).get_json()
+
+    executed = payload['merges_executed'][0]
+    assert executed['skipped_frozen'] == []
+    assert executed['moved'] == 1
+    assert executed['error'] == ''
+
+
 # ------------------------------------------------------------------ 模型能力设置
 
 

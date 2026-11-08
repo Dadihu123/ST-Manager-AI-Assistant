@@ -22,6 +22,7 @@ from conftest import ROOT
 
 SETTINGS_PATH = os.path.join(ROOT, 'frontend', 'views', 'settings.js')
 API_PATH = os.path.join(ROOT, 'frontend', 'api.js')
+REVIEW_PATH = os.path.join(ROOT, 'frontend', 'views', 'review.js')
 
 
 def _read(path: str) -> str:
@@ -174,6 +175,19 @@ def test_tag_pool_prunes_orphaned_category_rules():
 
     # 用户要被告知，而不是设置莫名消失
     assert '已失效' in source
+
+
+def test_merge_result_surfaces_frozen_skips():
+    """合并结果必须把「被冻结分类挡下」的标签显示出来。
+
+    合并 = `remove(from)`，等于删标签。跳过冻结项后如果界面仍只说「成功」，
+    用户会以为合并做了、实际那几条压根没动。
+    """
+    source = _strip_comments(_read(REVIEW_PATH))
+
+    assert 'merges_executed' in source, '审批页要读合并执行结果'
+    assert 'skipped_frozen' in source, '要把被冻结挡下的标签列出来'
+    assert '冻结' in source, '提示要说清原因，不能只报个数'
 
 
 def test_styled_select_fits_inside_the_scroll_container():

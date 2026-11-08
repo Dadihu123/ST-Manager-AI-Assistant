@@ -48,6 +48,12 @@
     不算冻结（那只是这次不参与挑词）。`respect_isolated=false` 时不冻结隔离分类。
   - 回归用例：分析阶段 1 条、落地阶段 1 条、`protected_tags` 1 条。
 
+- **标签合并也受冻结分类约束**：`/jobs/<id>/apply` 执行 `tag_merges` 时会
+  `remove=[source]`，等于从每张卡上删标签，此前完全不看冻结集合 —— 一次合并就能把
+  用户明确排除的分类整体搬空。现在跳过冻结标签并回传 `skipped_frozen`，
+  审批页显示「未合并 X：属于排除/隔离分类」，整条都被挡住时 `error` 为 `all_frozen`。
+  - 回归用例：排除分类 1 条、隔离分类 1 条、无冻结时行为不变 1 条。
+
 - **标签池分类过滤（设置页「标签池」，带 `?` 说明）**：两个输入框
   `categories_include`（只取这些分类）/ `categories_exclude`（排除这些分类），
   标题旁的 `?` 点开就是逐条填写说明（留空等于什么、多个怎么分隔、名字从哪来、
@@ -111,9 +117,6 @@
 - `batch_size`（每批张数）、`concurrency`（并发数）仍无消费方（改了不起作用）；
 - `default_profile_id`（默认提示词档案）后端仍未读取，前端读的 `config.task_profiles`
   这个键也不存在。
-- 标签合并（`/propose` 的 `tag_merges`）**不经过**「冻结分类」保护：合并会直接
-  `remove=[source]`，不受 `categories_exclude` / 隔离分类约束。这是上游既有行为，
-  本次未改动。
 
 ## 0.3.0（2026-10-25）
 

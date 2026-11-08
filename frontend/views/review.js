@@ -312,6 +312,31 @@ export function createReview(api, client, context) {
       detailHost.append(el('div', 'plugin-stm-ai-assistant-warning',
         String(detail.message || detail.error || detail.warning || '').trim()));
     });
+
+    // 标签合并结果：被「冻结分类」（排除 / 隔离）挡下的必须让用户看见，
+    // 否则他勾了合并、界面却说成功，实际那几条压根没动。
+    const merges = Array.isArray(data.merges_executed) ? data.merges_executed : [];
+    merges.forEach((merge) => {
+      const skipped = Array.isArray(merge.skipped_frozen) ? merge.skipped_frozen : [];
+      if (merge.moved) {
+        detailHost.append(banner(
+          `已合并 ${merge.moved} 张卡片：${(merge.from || []).join('、')} → ${merge.to}`,
+          'ok',
+        ));
+      }
+      if (skipped.length) {
+        detailHost.append(banner(
+          `未合并 ${skipped.join('、')}：属于排除/隔离分类（冻结），插件不会动这些标签`,
+          'warn',
+        ));
+      }
+      if (merge.error && merge.error !== 'invalid_merge') {
+        const label = merge.error === 'all_frozen'
+          ? '全部落在冻结分类里，未执行合并'
+          : `合并失败：${merge.error}`;
+        detailHost.append(banner(label, 'warn'));
+      }
+    });
   }
 
   async function applyAccepted() {
