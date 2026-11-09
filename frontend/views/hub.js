@@ -100,6 +100,17 @@ export function createHub(api, client, context) {
         alertHost.append(banner('还没有配置 Provider，所有 AI 任务都无法运行。', 'warn', [goto]));
       }
 
+      // 本地记账写不进去（宿主 ui_data 超配额）时，界面会「看起来不动」。
+      // 把原因和出路直接说出来，别让用户自己猜。
+      const writeState = data.ui_data || {};
+      if (writeState.ok === false) {
+        alertHost.append(banner(
+          `插件本地记录写不进去了：${writeState.message || 'ui_data 写入被拒绝'}。`
+          + '最近作业、待审批角标等状态会停在旧值 —— 清掉一些历史记录可恢复。',
+          'warn',
+        ));
+      }
+
       renderReviewCard(pending);
     } catch (error) {
       clear(summaryHost);

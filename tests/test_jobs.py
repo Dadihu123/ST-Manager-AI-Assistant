@@ -18,6 +18,7 @@ store_module = load_backend_submodule('store')
 bridge = load_backend_submodule('summary_bridge')
 errors = load_backend_submodule('core.errors')
 profiles_core = load_backend_submodule('core.profiles')
+tagpool_core = load_backend_submodule('core.tagpool')
 
 PluginStore = store_module.PluginStore
 AiAssistantError = errors.AiAssistantError
@@ -624,6 +625,36 @@ def test_analyze_applies_per_category_rules(api, store, stub_llm, stub_bridge,
     )
     assert '标签总数最多 3 个' in system
     assert '题材' in system and '0.80' in system and '最多 1 个' in system
+
+
+def test_analyze_job_shares_one_tag_index_across_cards(api, store, stub_llm, stub_bridge,
+                                                       monkeypatch):
+    """整个作业只建一次分类索引，每张卡只构造一次标签池文本。
+
+    旧实现每卡 4 次 `classify_tags()` + 2 次 `build_pool_text()`：3000 个标签时
+    合计约 130ms/卡，300 卡作业凭空多出 39 秒**本地 CPU**，而它跑在宿主进程里
+    （Flask 单进程 + GIL），用户感受是「整个软件卡」。
+    """
+    calls = {'classify': 0, 'build': 0}
+    real_classify = tagpool_core.classify_tags
+    real_build = tagpool_core.build_pool_text
+
+    def counting_classify(library):
+        calls['classify'] += 1
+        return real_classify(library)
+
+    def counting_build(*args, **kwargs):
+        calls['build'] += 1
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(tagpool_core, 'classify_tags', counting_classify)
+    monkeypatch.setattr(tagpool_core, 'build_pool_text', counting_build)
+
+    ctx = run_job(api, store, items=make_items(('Alice.png', 'Bob.png')))
+
+    assert len(ctx.reports) == 2
+    assert calls['classify'] == 1, f'整个作业只该建一次分类索引，实际 {calls["classify"]} 次'
+    assert calls['build'] == 2, f'每卡只该构造一次标签池文本，实际 {calls["build"]} 次'
 
 
 def test_analyze_without_rules_uses_default_confidence(api, store, stub_llm, stub_bridge,

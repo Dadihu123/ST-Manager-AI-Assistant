@@ -403,6 +403,9 @@ def register_routes(api, store) -> None:
             pending_reviews=store.list_pending_reviews(),
             suggestions=len(store.list_tag_suggestions()),
             outbound_acknowledged=store.outbound_acknowledged(),
+            # 宿主超配额时整笔写入会被丢弃；这里让 UI 能显示「存不进去了」，
+            # 而不是让用户对着一个不动的界面猜。
+            ui_data=store.last_write_state(),
         )
 
     @api.http.route('/health', ['GET'])
@@ -705,9 +708,16 @@ def register_routes(api, store) -> None:
     @api.http.route('/profiles', ['GET'])
     @_handle_errors
     def list_profiles():
+        """档案列表（**只读**）。
+
+        不在这里 `sync_profile_index()`：索引由 `save_profile` / `delete_profile` /
+        `reset_profiles` / `import_profiles` 维护，读路径再写一次等于「打开一次面板
+        就整文件重写一遍 ui_data」。宿主每次 `private.update()` 都是深拷贝 + 序列化
+        测配额 + 4 代备份轮转 + fsync；命名空间顶到配额时，这还会每次多刷一行
+        「写入被拒绝」（见 `tmp/audit/ANALYSIS.md` 问题 2）。
+        """
         profiles = store.list_profiles()
         index = store.profile_index()
-        store.sync_profile_index()
         return _ok(
             items=[
                 {
@@ -1642,106 +1652,109 @@ def register_routes(api, store) -> None:
             if str(item or '').strip()
         }
 
-        for item in items:
-            if str(item.get('status') or '') != 'done':
-                continue
-
-            result = item.get('result') if isinstance(item.get('result'), dict) else {}
-            ui_key = str(result.get('ui_key') or item.get('item_key') or '')
-            card_id = str(result.get('card_id') or item.get('item_key') or '')
-            if not card_id:
-                continue
-
-            if only_keys and card_id not in only_keys and ui_key not in only_keys:
-                skipped += 1
-                continue
-
-            meta = store.get_card_meta(ui_key)
-            applied_runs = meta.get('applied_runs') if isinstance(meta.get('applied_runs'), list) else []
-            if run_id in applied_runs:
-                skipped += 1
-                continue
-
-            card = api.cards.read(card_id)
-            if not isinstance(card, dict):
-                failed += 1
-                details.append({'card_id': card_id, 'error': 'card_unreadable'})
-                continue
-
-            if not force:
-                current_hash = hashing.card_content_hash(card)
-                expected = str(result.get('content_hash') or '')
-                if expected and current_hash != expected:
-                    stale += 1
-                    details.append({'card_id': card_id, 'error': 'apply_stale'})
+        # 整批落地只同步一次热缓存：逐卡同步等于逐卡整文件重写 ui_data
+        # （宿主每次 update 都是「整文件 + 4 代备份 + fsync」）。
+        with store.batch_card_meta():
+            for item in items:
+                if str(item.get('status') or '') != 'done':
                     continue
 
-            summary_text = str(result.get('summary') or '').strip()
-            tags = result.get('tags') if isinstance(result.get('tags'), list) else []
+                result = item.get('result') if isinstance(item.get('result'), dict) else {}
+                ui_key = str(result.get('ui_key') or item.get('item_key') or '')
+                card_id = str(result.get('card_id') or item.get('item_key') or '')
+                if not card_id:
+                    continue
 
-            if summary_text and write_note_enabled:
-                bridge_result = summary_bridge.write_summary(
-                    api, store, card_id, summary_text, ui_key=ui_key)
-                if not bridge_result.get('ok'):
-                    details.append({'card_id': card_id,
-                                    'warning': f'概览降级写入: {bridge_result.get("message", "")}'})
+                if only_keys and card_id not in only_keys and ui_key not in only_keys:
+                    skipped += 1
+                    continue
 
-            if apply_tags_enabled:
-                tag_library = read_tag_library(api)
-                accepted, _suggested, _blocked = split_tags(tags, known_tag_set(tag_library))
-            else:
-                accepted = []
+                meta = store.get_card_meta(ui_key)
+                applied_runs = meta.get('applied_runs') if isinstance(meta.get('applied_runs'), list) else []
+                if run_id in applied_runs:
+                    skipped += 1
+                    continue
 
-            wanted_removals = []
-            if selected_removals:
-                card_tags = {
-                    str(name).strip() for name in (card.get('tags') or [])
-                    if str(name or '').strip()
-                }
-                frozen = _frozen_tags(str(result.get('profile_id') or ''))
-                frozen_skipped = []
-                for entry in (result.get('tag_removals') or []):
-                    name = str(
-                        (entry or {}).get('name') if isinstance(entry, dict) else entry or '',
-                    ).strip()
-                    if not name:
-                        continue
-                    if name in frozen:
-                        frozen_skipped.append(name)
-                        continue
-                    if name in selected_removals and name in card_tags:
-                        wanted_removals.append(name)
-                if frozen_skipped:
-                    details.append({
-                        'card_id': card_id,
-                        'warning': '已跳过冻结分类（排除/隔离）的删除项: '
-                                   + '、'.join(frozen_skipped[:5]),
-                    })
-
-            if accepted or wanted_removals:
-                tag_result = api.cards.apply_tags(
-                    [card_id], add=accepted, remove=wanted_removals, replace=False,
-                )
-                if tag_result.get('failed'):
+                card = api.cards.read(card_id)
+                if not isinstance(card, dict):
                     failed += 1
-                    details.append({'card_id': card_id, 'error': 'write_failed'})
+                    details.append({'card_id': card_id, 'error': 'card_unreadable'})
                     continue
-                if tag_result.get('added') or tag_result.get('removed'):
-                    details.append({
-                        'card_id': card_id,
-                        'added': list(tag_result.get('added') or []),
-                        'removed': list(tag_result.get('removed') or []),
-                    })
 
-            applied_runs.append(run_id)
-            store.update_card_meta(ui_key, {
-                'applied_runs': applied_runs[-APPLIED_RUNS_KEEP:],
-                'applied_at': int(time.time()),
-                'summary': summary_text,
-                'tags_applied': [str((tag or {}).get('name') or '') for tag in tags],
-                'last_run_id': run_id,
-            })
-            applied += 1
+                if not force:
+                    current_hash = hashing.card_content_hash(card)
+                    expected = str(result.get('content_hash') or '')
+                    if expected and current_hash != expected:
+                        stale += 1
+                        details.append({'card_id': card_id, 'error': 'apply_stale'})
+                        continue
+
+                summary_text = str(result.get('summary') or '').strip()
+                tags = result.get('tags') if isinstance(result.get('tags'), list) else []
+
+                if summary_text and write_note_enabled:
+                    bridge_result = summary_bridge.write_summary(
+                        api, store, card_id, summary_text, ui_key=ui_key)
+                    if not bridge_result.get('ok'):
+                        details.append({'card_id': card_id,
+                                        'warning': f'概览降级写入: {bridge_result.get("message", "")}'})
+
+                if apply_tags_enabled:
+                    tag_library = read_tag_library(api)
+                    accepted, _suggested, _blocked = split_tags(tags, known_tag_set(tag_library))
+                else:
+                    accepted = []
+
+                wanted_removals = []
+                if selected_removals:
+                    card_tags = {
+                        str(name).strip() for name in (card.get('tags') or [])
+                        if str(name or '').strip()
+                    }
+                    frozen = _frozen_tags(str(result.get('profile_id') or ''))
+                    frozen_skipped = []
+                    for entry in (result.get('tag_removals') or []):
+                        name = str(
+                            (entry or {}).get('name') if isinstance(entry, dict) else entry or '',
+                        ).strip()
+                        if not name:
+                            continue
+                        if name in frozen:
+                            frozen_skipped.append(name)
+                            continue
+                        if name in selected_removals and name in card_tags:
+                            wanted_removals.append(name)
+                    if frozen_skipped:
+                        details.append({
+                            'card_id': card_id,
+                            'warning': '已跳过冻结分类（排除/隔离）的删除项: '
+                                       + '、'.join(frozen_skipped[:5]),
+                        })
+
+                if accepted or wanted_removals:
+                    tag_result = api.cards.apply_tags(
+                        [card_id], add=accepted, remove=wanted_removals, replace=False,
+                    )
+                    if tag_result.get('failed'):
+                        failed += 1
+                        details.append({'card_id': card_id, 'error': 'write_failed'})
+                        continue
+                    if tag_result.get('added') or tag_result.get('removed'):
+                        details.append({
+                            'card_id': card_id,
+                            'added': list(tag_result.get('added') or []),
+                            'removed': list(tag_result.get('removed') or []),
+                        })
+
+                applied_runs.append(run_id)
+                store.update_card_meta(ui_key, {
+                    'applied_runs': applied_runs[-APPLIED_RUNS_KEEP:],
+                    'applied_at': int(time.time()),
+                    'summary': summary_text,
+                    'tags_applied': [str((tag or {}).get('name') or '') for tag in tags],
+                    'last_run_id': run_id,
+                })
+                applied += 1
 
         if applied:
             store.clear_pending_review(run_id)
@@ -1751,8 +1764,18 @@ def register_routes(api, store) -> None:
             except Exception:  # noqa: BLE001 - 台账失败不影响落地结果
                 logger.debug('更新作业台账失败: %s', run_id, exc_info=True)
 
+        warnings = []
+        write_state = store.last_write_state()
+        if not write_state['ok']:
+            # 卡片确实写了，但插件自己的记账（applied_runs / 待审批清除 / 台账）
+            # 没落地。不告诉用户的话，下次同一批会被重复落地。
+            warnings.append(
+                '卡片已写入，但插件本地的作业记录没有保存成功（ui_data 可能已达上限）：'
+                f'{write_state["message"]}。清理一些历史记录后可恢复。'
+            )
+
         return _ok(applied=applied, skipped=skipped, stale=stale, failed=failed,
-                   details=details[:50], total=len(items),
+                   details=details[:50], total=len(items), warnings=warnings,
                    write={'note': write_note_enabled, 'tags': apply_tags_enabled})
 
     @api.http.route('/jobs/<run_id>/cancel', ['POST'])

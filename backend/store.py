@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import time
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 from . import protocols
@@ -42,6 +43,32 @@ USAGE_FILENAME = 'usage.jsonl'
 CARD_META_UI_LIMIT = 800
 CARD_META_UI_BYTES_LIMIT = 200 * 1024
 JSONL_COMPACT_BYTES = 8 * 1024 * 1024
+
+#: 宿主给单个插件命名空间的配额（`core/plugins/api.py:72`，超出即整笔拒写）。
+HOST_UI_QUOTA_BYTES = 256 * 1024
+#: 同步时给别的子键与序列化抖动留的余量。
+CARD_META_UI_SAFETY_BYTES = 24 * 1024
+#: 热缓存的下限：再挤也要能装几张卡（否则落地后审批页看不到状态）。
+CARD_META_UI_MIN_BYTES = 16 * 1024
+
+#: 作业台账上限（「最近作业」只显示 8 条，50 条足够找回历史）。
+RUNS_MAX = 50
+
+#: 用量明细上限：改前只有 8MB 压缩，且记录没有 `ui_key` 时压缩完全不去重
+#: （`_compact_jsonl` 会退化成 `_anon_i`），文件越过 8MB 后每次写入都要整文件
+#: 重读重写。改按条数裁尾，稳定在一个可预期的规模。
+USAGE_JSONL_MAX_RECORDS = 2000
+
+#: 待审批登记上限 + TTL：只在 apply「有落地」时才清，取消 / 失败 / 一直没审的
+#: 作业会永久残留；而宿主自己会清理终态作业，被清掉的 run 再也等不到 apply。
+PENDING_REVIEW_MAX = 50
+PENDING_REVIEW_TTL_SECONDS = 14 * 24 * 3600
+
+#: 新标签建议的**键**上限（`cards` 列表原来就截 50，但键本身无上限）。
+TAG_SUGGESTIONS_MAX = 200
+
+#: 单个标签最多记住多少张卡片（避免 `cards` 列表无限长）。
+TAG_SUGGESTION_CARDS_MAX = 50
 
 PROVIDER_ID_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,31}$')
 DEFAULT_BASE_URL = 'https://api.openai.com/v1'
@@ -136,6 +163,14 @@ class PluginStore:
         self._api = api
         self._data_dir = ''
         self._card_meta_cache = None
+        #: `batch_card_meta()` 的嵌套深度；>0 表示攒着不同步热缓存。
+        self._card_meta_depth = 0
+        #: 批量块内是否有待同步的变更。
+        self._card_meta_dirty = False
+        #: ui_data 写入失败统计（宿主超配额时整笔被丢弃，必须留痕）。
+        self._write_attempts = 0
+        self._failed_writes = 0
+        self._last_write_error = ''
 
     # ------------------------------------------------------------ 路径
 
@@ -262,17 +297,56 @@ class PluginStore:
         return data if isinstance(data, dict) else {}
 
     def _mutate(self, mutator) -> bool:
-        """在锁内修改命名空间；**丢弃 mutator 的返回值**以避免整体替换（C3）。"""
+        """在锁内修改命名空间；**丢弃 mutator 的返回值**以避免整体替换（C3）。
+
+        失败必须留痕：宿主在命名空间超过配额时会**拒绝整笔写入**，而这里只返回
+        `bool`。调用方（`record_run` / `record_usage` / `mark_pending_review` /
+        `update_card_meta` …）历史上全部丢掉返回值，于是超限后「标签建议、作业
+        台账、待审批角标、档案索引」集体静默停在旧值，接口却仍然 `success` ——
+        用户只看到「界面不动了」（见 `tmp/audit/ANALYSIS.md` 问题 2）。
+
+        现在失败会记一行 warning 并写进 `last_write_state()`，供 `/status` 与
+        日志侧排查。
+        """
+        self._write_attempts += 1
 
         def _inner(entry):
             mutator(entry)
             return None
 
         try:
-            return bool(self._api.private.update(_inner))
-        except Exception:  # noqa: BLE001
+            ok = bool(self._api.private.update(_inner))
+        except Exception as exc:  # noqa: BLE001
             logger.warning('写入插件 ui_data 命名空间失败', exc_info=True)
+            self._note_write_failure(f'{type(exc).__name__}: {exc}')
             return False
+
+        if ok:
+            self._last_write_error = ''
+        else:
+            self._note_write_failure(
+                '宿主拒绝了本次写入（命名空间可能已达配额上限）'
+            )
+        return ok
+
+    def _note_write_failure(self, message: str) -> None:
+        self._failed_writes += 1
+        self._last_write_error = str(message or '写入失败')
+        logger.warning(
+            'ui_data 写入未生效（第 %s 次）：%s。'
+            '依赖 ui_data 的状态（最近作业台账 / 待审批 / 标签建议 / 档案索引）'
+            '可能停在旧值；清理一些历史数据后可恢复。',
+            self._failed_writes, self._last_write_error,
+        )
+
+    def last_write_state(self) -> dict:
+        """最近一次 ui_data 写入的结果（供 `/status` 与诊断用）。"""
+        return {
+            'ok': not self._last_write_error,
+            'message': self._last_write_error,
+            'failed_writes': self._failed_writes,
+            'attempts': self._write_attempts,
+        }
 
     # ------------------------------------------------------------ 提示词档案
 
@@ -778,6 +852,7 @@ class PluginStore:
         return dict(record) if isinstance(record, dict) else {}
 
     def update_card_meta(self, ui_key: str, patch) -> dict:
+        """写入一张卡的元数据：jsonl 逐条追加，`ui_data` 热缓存按批同步。"""
         key = str(ui_key or '').strip()
         if not key or not isinstance(patch, dict):
             return {}
@@ -790,30 +865,98 @@ class PluginStore:
         cache[key] = record
 
         self._append_jsonl(self.card_meta_path(), record)
-        self.sync_card_meta_ui()
+        # 批量块里先攒着：宿主每次 update 都是「整文件重写 + 4 代备份 + fsync」，
+        # 300 张卡的作业逐卡同步就是 300 次全量写盘（见 tmp/audit/ANALYSIS.md）。
+        if self._card_meta_depth:
+            self._card_meta_dirty = True
+        else:
+            self.sync_card_meta_ui()
         return record
 
+    @contextmanager
+    def batch_card_meta(self):
+        """批量写入作用域：期间只落 jsonl，退出时统一同步一次热缓存。
+
+        嵌套调用只在外层退出时同步；块内抛异常也照样同步已写入的部分
+        （否则用户在审批页点「接受」看到的结果会与卡片状态不一致）。
+        """
+        self._card_meta_depth += 1
+        try:
+            yield self
+        finally:
+            self._card_meta_depth -= 1
+            if not self._card_meta_depth and self._card_meta_dirty:
+                self._card_meta_dirty = False
+                self.sync_card_meta_ui()
+
+    def card_meta_budget(self, entry=None) -> int:
+        """热缓存这次能占多少字节：在自限与「配额余额」之间取小。
+
+        `CARD_META_UI_BYTES_LIMIT` 是 200KB，而宿主给整个命名空间的配额只有
+        256KB（`core/plugins/api.py:72`）—— 一个子键固定吃掉 78%，剩下 57KB 要
+        装下标签建议、作业台账、待审批、档案索引等 8 个子键。余额一旦被吃穿，
+        宿主就**整笔拒绝**所有写入（连有待审批角标都刷不动）。
+
+        所以按「其它子键实际占用」倒算本次预算；留 `CARD_META_UI_SAFETY_BYTES`
+        余量给同步过程中的抖动。`entry` 省略时读一次当前命名空间。
+        """
+        if entry is None:
+            entry = self.read_ui()
+        other = 0
+        for key, value in (entry or {}).items():
+            if key == 'card_meta':
+                continue
+            try:
+                other += len(json.dumps({key: value}, ensure_ascii=False).encode('utf-8')) + 2
+            except (TypeError, ValueError):
+                continue
+        available = HOST_UI_QUOTA_BYTES - other - CARD_META_UI_SAFETY_BYTES
+        return max(CARD_META_UI_MIN_BYTES, min(CARD_META_UI_BYTES_LIMIT, available))
+
     def sync_card_meta_ui(self) -> bool:
-        """把最近的元数据同步进 ui_data（带条数与体积双重裁剪）。"""
+        """把最近的元数据同步进 ui_data（带条数与体积双重裁剪）。
+
+        成本必须与缓存条数**近似线性**：`update_card_meta()` 每写一张卡都会调它，
+        作业里就是逐卡调用（`jobs.py:769/838`、`routes.py:1737`）。
+
+        旧实现是「先全收，再循环删最旧，每删一条重新 `json.dumps` 整个字典」，
+        成本 ∝ 条数 × 200KB —— 缓存涨到上千条后单次同步要 700–800ms，
+        落地 20 张卡就是十几秒（见 `tmp/audit/ANALYSIS.md` 问题 3）。
+
+        现在按 `updated_at` 倒序**一次遍历**累加体积，装不下就停：保留的永远是
+        最新的一批，且每条只序列化一次。体积口径与宿主一致（默认分隔符
+        `', '` / `': '`，`ensure_ascii=False`）。
+
+        预算取 `card_meta_budget()`（配额余额与自限取小），不是固定 200KB ——
+        否则别的子键一涨，整笔写入就会被宿主拒绝。
+        """
         cache = self.load_card_meta()
         records = sorted(
             cache.values(), key=lambda item: -int(item.get('updated_at') or 0),
         )
 
+        entry_now = self.read_ui()
+        budget = self.card_meta_budget(entry_now)
+
         selected = {}
+        size = 2  # '{}'
         for record in records[:CARD_META_UI_LIMIT]:
             key = str(record.get('ui_key') or '')
-            if key:
-                selected[key] = record
-
-        while selected:
-            size = len(json.dumps(selected, ensure_ascii=False).encode('utf-8'))
-            if size <= CARD_META_UI_BYTES_LIMIT:
-                break
-            oldest_key = min(
-                selected, key=lambda item: int(selected[item].get('updated_at') or 0),
+            if not key:
+                continue
+            # 一条记录在 JSON 对象里的字节数： "key": <value>
+            # 必须是 UTF-8 字节数，不是字符数：概览以中文为主（3 字节/字），
+            # 用 len(str) 会低估约 1.5 倍，热缓存直接超出预算。
+            entry_size = (
+                len(json.dumps(key, ensure_ascii=False).encode('utf-8'))
+                + 2  # ': '
+                + len(json.dumps(record, ensure_ascii=False).encode('utf-8'))
             )
-            selected.pop(oldest_key, None)
+            grow = entry_size + (2 if selected else 0)  # 分隔逗号
+            if size + grow > budget:
+                break
+            selected[key] = record
+            size += grow
 
         def mutator(entry):
             entry['card_meta'] = selected

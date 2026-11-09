@@ -361,6 +361,9 @@ def run_analyze(ctx, *, api, store) -> None:
     # ---- 共享上下文（标签库、频次、世界书预算）----
     tag_library = read_tag_library(api)
     known_tags = known_tag_set(tag_library)
+    # 分类索引整批算一次：它在 `analyze_one` 里既用于分类规则、又用于冻结分类。
+    # 逐卡重算的代价随标签数近似平方增长（3000 个标签约 27ms/卡）。
+    tag_index = tagpool_core.classify_tags(tag_library)
     usage_map = tag_usage(api)
     wi_budget = max(
         MIN_WI_BUDGET,
@@ -381,68 +384,71 @@ def run_analyze(ctx, *, api, store) -> None:
     consecutive_failures = 0
     last_error_code = ''
 
-    for index, item in enumerate(ctx.items, start=1):
-        if ctx.should_cancel():
-            ctx.log('warning', f'收到取消/暂停请求，已在第 {index - 1}/{total} 项停下')
-            break
-
-        item_payload = item.get('payload') if isinstance(item.get('payload'), dict) else {}
-        key = str(item.get('key') or '')
-
-        ctx.set_message(f'分析中 {index}/{total}：{item_payload.get("card_id") or key}')
-
-        try:
-            outcome = analyze_one(
-                api=api, store=store, config=config, ctx=ctx,
-                card_id=str(item_payload.get('card_id') or key),
-                ui_key=str(item_payload.get('ui_key') or key),
-                content_hash=str(item_payload.get('content_hash') or ''),
-                mode=str(item_payload.get('mode') or MODE_BOTH),
-                profile=profile, limits=limits, model_name=model_name,
-                provider=provider, api_key=api_key, extra_headers=extra_headers,
-                tag_library=tag_library, known_tags=known_tags, usage_map=usage_map,
-                wi_budget=wi_budget, keywords=keywords,
-                apply_mode=apply_mode, dry_run=dry_run, force=force, strict=strict,
-                apply_tags_enabled=apply_tags_enabled,
-                apply_removals=apply_removals_enabled,
-            )
-        except AiAssistantError as exc:
-            counters['failed'] += 1
-            ctx.report(
-                key, status='failed',
-                error=f'{exc.code}: {exc.message}',
-                result={'error': exc.code, 'message': exc.message, 'detail': exc.detail},
-            )
-            if exc.code == last_error_code:
-                consecutive_failures += 1
-            else:
-                last_error_code = exc.code
-                consecutive_failures = 1
-            if exc.code in FATAL_CODES and consecutive_failures >= ABORT_AFTER_CONSECUTIVE_FAILURES:
-                ctx.log('error', f'连续 {consecutive_failures} 项因 {exc.code} 失败，已中止作业')
+    # 整批只同步一次热缓存：`update_card_meta()` 每卡都写一次 ui_data，
+    # 而宿主每次都是「整文件重写 + 4 代备份 + fsync」（见 tmp/audit/ANALYSIS.md）。
+    with store.batch_card_meta():
+        for index, item in enumerate(ctx.items, start=1):
+            if ctx.should_cancel():
+                ctx.log('warning', f'收到取消/暂停请求，已在第 {index - 1}/{total} 项停下')
                 break
-            continue
-        except Exception as exc:  # noqa: BLE001 - 单条异常不能中断整个作业
-            counters['failed'] += 1
-            logger.exception('分析条目失败: %s', key)
-            ctx.report(key, status='failed', error=f'{type(exc).__name__}: {exc}',
-                       result={'error': 'internal_error', 'message': str(exc)})
-            continue
 
-        consecutive_failures = 0
-        last_error_code = ''
+            item_payload = item.get('payload') if isinstance(item.get('payload'), dict) else {}
+            key = str(item.get('key') or '')
 
-        usage_totals['prompt_tokens'] += int(outcome['usage'].get('prompt_tokens') or 0)
-        usage_totals['completion_tokens'] += int(outcome['usage'].get('completion_tokens') or 0)
+            ctx.set_message(f'分析中 {index}/{total}：{item_payload.get("card_id") or key}')
 
-        status = outcome['status']
-        if status == 'awaiting_review':
-            counters['review'] += 1
-        elif status == 'done':
-            counters['applied' if outcome.get('applied') else 'skipped'] += 1
+            try:
+                outcome = analyze_one(
+                    api=api, store=store, config=config, ctx=ctx,
+                    card_id=str(item_payload.get('card_id') or key),
+                    ui_key=str(item_payload.get('ui_key') or key),
+                    content_hash=str(item_payload.get('content_hash') or ''),
+                    mode=str(item_payload.get('mode') or MODE_BOTH),
+                    profile=profile, limits=limits, model_name=model_name,
+                    provider=provider, api_key=api_key, extra_headers=extra_headers,
+                    tag_library=tag_library, known_tags=known_tags, usage_map=usage_map,
+                    wi_budget=wi_budget, keywords=keywords, tag_index=tag_index,
+                    apply_mode=apply_mode, dry_run=dry_run, force=force, strict=strict,
+                    apply_tags_enabled=apply_tags_enabled,
+                    apply_removals=apply_removals_enabled,
+                )
+            except AiAssistantError as exc:
+                counters['failed'] += 1
+                ctx.report(
+                    key, status='failed',
+                    error=f'{exc.code}: {exc.message}',
+                    result={'error': exc.code, 'message': exc.message, 'detail': exc.detail},
+                )
+                if exc.code == last_error_code:
+                    consecutive_failures += 1
+                else:
+                    last_error_code = exc.code
+                    consecutive_failures = 1
+                if exc.code in FATAL_CODES and consecutive_failures >= ABORT_AFTER_CONSECUTIVE_FAILURES:
+                    ctx.log('error', f'连续 {consecutive_failures} 项因 {exc.code} 失败，已中止作业')
+                    break
+                continue
+            except Exception as exc:  # noqa: BLE001 - 单条异常不能中断整个作业
+                counters['failed'] += 1
+                logger.exception('分析条目失败: %s', key)
+                ctx.report(key, status='failed', error=f'{type(exc).__name__}: {exc}',
+                           result={'error': 'internal_error', 'message': str(exc)})
+                continue
 
-        ctx.report(key, status=status, result=outcome['result'],
-                   error=str(outcome.get('error') or ''))
+            consecutive_failures = 0
+            last_error_code = ''
+
+            usage_totals['prompt_tokens'] += int(outcome['usage'].get('prompt_tokens') or 0)
+            usage_totals['completion_tokens'] += int(outcome['usage'].get('completion_tokens') or 0)
+
+            status = outcome['status']
+            if status == 'awaiting_review':
+                counters['review'] += 1
+            elif status == 'done':
+                counters['applied' if outcome.get('applied') else 'skipped'] += 1
+
+            ctx.report(key, status=status, result=outcome['result'],
+                       error=str(outcome.get('error') or ''))
 
     # ---- 收尾 ----
     summary = {

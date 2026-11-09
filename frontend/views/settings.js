@@ -16,6 +16,7 @@ import {
   input,
   textarea,
 } from '../dom.js';
+import { banner } from '../ui.js';
 
 const API_STYLES = [
   { value: 'openai_chat', label: 'OpenAI Chat Completions（/chat/completions）' },
@@ -127,6 +128,21 @@ export function createSettings(api, client, context) {
       badge(`Provider ${(status.providers && status.providers.count) || 0}`),
       badge(`待审批标签 ${status.suggestions || 0}`, (status.suggestions ? 'is-warn' : 'is-muted')),
     );
+
+    // 宿主 ui_data 超配额时，插件所有本地记录都会静默停在旧值。
+    // 这是用户判断「要不要清历史」的唯一线索，必须显示出来。
+    const writeState = status.ui_data || {};
+    if (writeState.ok === false) {
+      overviewBox.append(banner(
+        `本地记录写不进去了：${writeState.message || 'ui_data 写入被拒绝'}`
+        + `（已失败 ${formatNumber(writeState.failed_writes || 0)} 次）。`
+        + '最近作业、待审批角标、新标签建议会停在旧值；清空下面「新标签建议」或'
+        + '「用量明细」后通常可恢复。',
+        'error',
+      ));
+    } else {
+      overviewBox.append(badge('本地记录可写', 'is-muted'));
+    }
   }
 
   function renderCapabilities() {
