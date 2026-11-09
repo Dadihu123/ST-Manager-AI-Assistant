@@ -6,6 +6,8 @@
 就把大量合法标签误判成违规。
 """
 
+import time
+
 import pytest
 
 from conftest import load_backend_submodule
@@ -60,6 +62,56 @@ def test_profile_pool_prefers_profile_over_config():
 def test_profile_pool_falls_back_to_config():
     config = {'tag_pool': {'budget_tokens': 500}}
     assert tagpool.profile_pool({}, config)['budget_tokens'] == 500
+
+
+# ------------------------------------------------------------------ 列表规范化
+#
+# `classify_tags()` 每卡要跑好几次，它第一件事就是把标签列表规范化（去重 +
+# strip）。旧实现用 `text not in result`（list 线性查找）去重，3000 个标签时
+# 单次 28.85ms —— 成本 ∝ N²，被每卡 4–5 次调用放大成整个作业的主要本地开销。
+# 下面这组是**等价性钉子**：换成 set 去重后，这些输入必须一个字节都不变。
+
+
+@pytest.mark.parametrize('raw', [[], (), set(), None, '不是列表', 12, {'a': 1}])
+def test_tag_list_normalization_rejects_non_sequence(raw):
+    """非 list/tuple/set 一律当空（`str`/`dict` 有自己的一套语义，不收）。"""
+    assert tagpool.classify_tags({'tags': raw})['tags'] == []
+
+
+@pytest.mark.parametrize('raw, expected', [
+    (['奇幻', '奇幻', '冒险'], ['奇幻', '冒险']),
+    ([' 奇幻 ', '奇幻', ' 冒险'], ['奇幻', '冒险']),
+    ([None, '', '   ', '奇幻'], ['奇幻']),
+    (('冒险', '奇幻', '冒险'), ['冒险', '奇幻']),
+    # 0 / False 是假值，`str(item or '')` 之后是空串 —— 与 '0' 不是一回事
+    (['0', 0, False], ['0']),
+])
+def test_tag_list_normalization_keeps_first_occurrence_order(raw, expected):
+    """去重保留**首次出现**的顺序，且先 strip 再去重。"""
+    assert tagpool.classify_tags({'tags': raw})['tags'] == expected
+
+
+def test_tag_list_normalization_accepts_set_input():
+    result = tagpool.classify_tags({'tags': {'奇幻', '冒险', '奇幻'}})['tags']
+    assert sorted(result) == ['冒险', '奇幻']
+
+
+def test_classify_tags_cost_stays_linear_in_tag_count():
+    """性能守卫：分类成本必须随标签数线性增长。
+
+    旧实现（list 上线性查找去重）3000 个标签单次 ~27ms、6000 个 ~107ms；
+    而它在每张卡上被调用 4–5 次。阈值放到 25ms（本机修好后 ~1ms，36× 余量），
+    只为拦住「谁又把它写回 O(N²)」，不做精确基准。
+    """
+    tags = [f'标签{index:05d}' for index in range(6000)]
+    library = {'tags': tags, 'taxonomy': {}, 'prefs': {}}
+
+    started = time.perf_counter()
+    index = tagpool.classify_tags(library)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+
+    assert index['tags'] == tags
+    assert elapsed_ms < 25, f'6000 标签分类耗时 {elapsed_ms:.1f}ms，疑似退回 O(N²) 去重'
 
 
 # ------------------------------------------------------------------ 分类与隔离

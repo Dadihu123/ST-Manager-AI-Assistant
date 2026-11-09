@@ -505,7 +505,7 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
                 profile, limits, model_name, provider, api_key, extra_headers,
                 tag_library, known_tags, usage_map, wi_budget, keywords,
                 apply_mode, dry_run, force, strict, apply_tags_enabled,
-                apply_removals=False) -> dict:
+                apply_removals=False, tag_index=None) -> dict:
     """处理单张卡片：读取 → 渲染 → 调用 → 解析 → （可选）写回。"""
     started = time.monotonic()
 
@@ -517,9 +517,13 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
     selector_spec = prompt_core.profile_selector(profile, config)
 
     # ---- 标签池：来源过滤 + token 预算 + 相关性排序（卡片已知，可按词面重叠排）----
+    # 整批复用同一份分类索引：`classify_tags()` 的成本随标签数近似平方增长
+    # （3000 个标签约 27ms），逐卡重算会让一次 300 卡作业凭空多出十几秒。
+    if tag_index is None:
+        tag_index = tagpool_core.classify_tags(tag_library)
     pool_spec = prompt_core.profile_tag_pool(profile, config)
     pool_result = tagpool_core.build_pool_text(
-        tag_library, pool_spec, card=card, usage=usage_map,
+        tag_library, pool_spec, card=card, usage=usage_map, index=tag_index,
     )
     # 硬过滤只针对**明确被禁**的标签（隔离/排除分类/手动排除）。
     # 「不在候选集里」是陌生标签，应走新标签建议分支，不能当禁止项处理 ——
@@ -553,11 +557,13 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         local_note = read_local_note(api, card_id)
 
     # ---- 渲染 ----
+    # `tags.library` 直接用上面那份 pool_result 的文本：再传 tag_library 让
+    # `tag_variables()` 重算一遍是纯重复（3000 标签时约 8ms/卡）。
     variables = prompt_core.collect_variables(
         card=card, excerpt=excerpt, tag_library=tag_library, usage=usage_map,
         limits=limits, model_name=model_name, profile_id=str(profile.get('id') or ''),
         selector=selector_spec, extensions=extensions, local_note=local_note,
-        tag_pool=pool_spec,
+        tag_pool=pool_spec, tag_pool_text=pool_result['text'],
     )
     rendered = prompt_core.render_messages(profile, variables, task='analyze')
 
@@ -571,7 +577,6 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
     # ---- 每分类标签规则（置信度门槛 / 分类数量 / 总数上限）----
     # 规则要在**两处**用同一份：① 拼进 system 让模型知道该给几个、置信度要多高；
     # ② 解析后用 `tagpool.apply_rules()` 确定性地执行（模型不听话也能兜住）。
-    tag_index = tagpool_core.classify_tags(tag_library)
     tag_to_category = tag_index['tag_to_category']
     tag_rules = config.get('tag_category_rules')
     if not isinstance(tag_rules, dict):
@@ -720,7 +725,7 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
     }
     # 冻结分类（「排除」或「隔离」）里的标签是用户手写并已固定的内容：
     # 连「建议删除」都不给，免得审批页出现「要不要删掉你自己写的那条」。
-    frozen_tags = tagpool_core.protected_tags(tag_library, pool_spec)
+    frozen_tags = tagpool_core.protected_tags(tag_library, pool_spec, index=tag_index)
     removals = []
     ignored_removals = []
     frozen_removals = []

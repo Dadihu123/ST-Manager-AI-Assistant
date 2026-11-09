@@ -2,7 +2,7 @@
 
 import pytest
 
-from stm_ai_core import parsing, profiles, prompt
+from stm_ai_core import parsing, profiles, prompt, tagpool
 from stm_ai_core.profiles import builtin_profile
 
 
@@ -443,6 +443,89 @@ def test_tag_variables_include_library_taxonomy_and_blacklist():
     assert '已用3次' in variables['tags.library']
     assert variables['tags.blacklist'] == '暴力'
     assert '题材' in variables['tags.taxonomy']
+
+
+# ------------------------------------------------------------------ 标签池文本复用
+#
+# `analyze_one()` 为了「硬过滤 + 隔离分类」已经算过一次 `build_pool_text()`；
+# `collect_variables()` → `tag_variables()` 又用**同样的**入参算第二遍，只为取
+# `tags.library` 那段文本。大标签库时这一次占单卡本地开销的大头（3000 标签约
+# 8ms/卡）。下面的测试钉住：能传入现成文本，且文本逐字节不变。
+
+POOL_LIBRARY = {
+    'tags': ['奇幻', '冒险', '校园', '恋爱', 'R18', '血腥'],
+    'taxonomy': {
+        'tag_to_category': {
+            '奇幻': '题材', '冒险': '题材',
+            '校园': '场景', '恋爱': '场景',
+            'R18': '成人', '血腥': '成人',
+        },
+        'categories': {'题材': [], '场景': [], '成人': []},
+    },
+    'prefs': {'tag_blacklist': ['血腥']},
+    'isolated_categories': ['成人'],
+}
+
+
+def test_tag_variables_accepts_precomputed_pool_text(monkeypatch):
+    """传了现成文本，`tag_variables` 不该再构造一次标签池。"""
+    spec = prompt.profile_tag_pool({}, {})
+    card = {'name': '测试卡', 'description': '校园里的恋爱故事'}
+    usage = {'奇幻': 3}
+    pooled = tagpool.build_pool_text(POOL_LIBRARY, spec, card=card, usage=usage)
+
+    calls = {'count': 0}
+    real = tagpool.build_pool_text
+
+    def counting(*args, **kwargs):
+        calls['count'] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(tagpool, 'build_pool_text', counting)
+
+    variables = prompt.tag_variables(
+        POOL_LIBRARY, usage=usage, pool=spec, card=card, pool_text=pooled['text'],
+    )
+
+    assert calls['count'] == 0, '已经算好的标签池文本不该在这里重算第二遍'
+    assert variables['tags.library'] == pooled['text']
+
+
+def test_collect_variables_pool_text_is_byte_identical_to_legacy_path():
+    """`tags.library` 是本轮唯一不可动的契约：两条路径必须逐字节相等。
+
+    特意带上 `jobs.py` 会注入的 `_isolated` 键 —— 它不进 `normalize_pool()`，
+    但必须确认它不会改变任何输出。
+    """
+    spec = prompt.profile_tag_pool({'tag_pool': {'budget_tokens': 60}}, {'max_tags': 5})
+    card = {'data': {'name': '校园', 'description': '校园里的恋爱故事'}}
+    usage = {'奇幻': 2}
+    pooled = tagpool.build_pool_text(POOL_LIBRARY, spec, card=card, usage=usage)
+
+    legacy = prompt.collect_variables(
+        card=card, tag_library=POOL_LIBRARY, usage=usage, tag_pool=spec,
+    )
+    reused = prompt.collect_variables(
+        card=card, tag_library=POOL_LIBRARY, usage=usage,
+        tag_pool=dict(spec, _isolated=['成人']),
+        tag_pool_text=pooled['text'],
+    )
+
+    assert reused['tags.library'] == legacy['tags.library'] == pooled['text']
+    assert {key: value for key, value in reused.items() if key != 'tags.library'} == \
+        {key: value for key, value in legacy.items() if key != 'tags.library'}
+
+
+def test_collect_variables_without_pool_text_keeps_building_it():
+    """默认行为不变：不给现成文本就自己算（其它调用点照旧）。"""
+    spec = prompt.profile_tag_pool({}, {})
+    variables = prompt.collect_variables(
+        card={'name': 'A'}, tag_library=POOL_LIBRARY, tag_pool=spec,
+    )
+    assert variables['tags.library'] == tagpool.build_pool_text(
+        POOL_LIBRARY, spec, card={'name': 'A'},
+    )['text']
+
 
 
 def test_collect_variables_only_leaves_task_specific_names_out():

@@ -64,12 +64,23 @@ def default_pool() -> dict:
 
 
 def _to_str_list(values) -> list:
+    """去空白 + 去重（保留首次出现的顺序）。
+
+    注意 `str`/`dict_keys` 这类**不是** list/tuple/set 的有序序列不收：
+    `classify_tags()` 的分类名走的是 `dict_keys`，历史上一直是空列表，
+    改宽它会改变 `/tag-pool` 的返回内容（见 routes.py 的分类名汇总）。
+    """
     if not isinstance(values, (list, tuple, set)):
         return []
     result = []
+    # 用 set 记账而不是 `text not in result`：后者是 list 上的线性查找，
+    # 3000 个标签时单次 28ms（O(N²)），而 classify_tags 每张卡要被调 4–5 次。
+    # 元素全是 `str()` 的产物，set 与 list 的相等判定结果完全一致。
+    seen = set()
     for item in values:
         text = str(item or '').strip()
-        if text and text not in result:
+        if text and text not in seen:
+            seen.add(text)
             result.append(text)
     return result
 
@@ -129,7 +140,7 @@ def profile_pool(profile, config=None) -> dict:
     return normalize_pool(merged)
 
 
-def protected_tags(tag_library, pool) -> set:
+def protected_tags(tag_library, pool, *, index=None) -> set:
     """「冻结分类」下的标签名集合：所属分类被排除，或该分类是隔离分类。
 
     这些分类是用户**手写并已固定**的内容（「排除」的语义就是「别动我这些」），
@@ -138,9 +149,15 @@ def protected_tags(tag_library, pool) -> set:
     与 `blocked` 的区别：`blocked` 还包含「不在 include 白名单里」的标签
     （那是「这次不参与挑词」，不代表用户冻结了它们）；这里只认**明确排除 /
     隔离**的分类。
+
+    Args:
+        index: 已经算好的 `classify_tags()` 结果（可选）。作业里每张卡都要调
+            这里，而 `classify_tags()` 的成本随标签数近似平方增长
+            （3000 个标签时约 27ms）—— 传进来就能整批复用。
     """
     spec = normalize_pool(pool)
-    index = classify_tags(tag_library)
+    if index is None:
+        index = classify_tags(tag_library)
 
     frozen = set(spec['categories_exclude'])
     if spec['respect_isolated']:
@@ -296,14 +313,19 @@ def classify_tags(tag_library) -> dict:
     }
 
 
-def resolve_candidates(tag_library, pool, *, card=None) -> dict:
+def resolve_candidates(tag_library, pool, *, card=None, index=None) -> dict:
     """按标签池的「来源」与「排除项」算出可用候选集。
+
+    Args:
+        index: 已经算好的 `classify_tags()` 结果（可选）。`build_pool_text()`
+            自己就有一份，传进来就不用再拆一遍标签库。
 
     Returns:
         `{'allowed': [...], 'excluded': {tag: reason}, 'isolated_categories': [...]}`
     """
     spec = normalize_pool(pool)
-    index = classify_tags(tag_library)
+    if index is None:
+        index = classify_tags(tag_library)
 
     known = set(index['tags'])
     tag_to_category = index['tag_to_category']
@@ -659,7 +681,7 @@ def _outline_line(category: str, count: int) -> str:
 
 
 def build_pool_text(tag_library, pool, *, card=None, budget_tokens=None,
-                    usage=None) -> dict:
+                    usage=None, index=None) -> dict:
     """按预算构造两层标签池文本。
 
     第 1 层：分类概览（只有分类名 + 数量，成本极低但能让模型知道「有什么维度」）。
@@ -668,14 +690,17 @@ def build_pool_text(tag_library, pool, *, card=None, budget_tokens=None,
     Args:
         usage: 使用频次表；不给则取标签库自带的那份，
             再没有就不按频次排序（仍会按词面重叠与名称排）。
+        index: 已经算好的 `classify_tags()` 结果（可选）。不给就自己算；
+            作业里每张卡都要调这里，把作业开头的索引传进来即可整批复用。
 
     Returns:
         `{'text', 'outline', 'listed', 'dropped', 'tokens', 'budget_tokens',
            'excluded', 'isolated_categories', 'available'}`
     """
     spec = normalize_pool(pool)
-    index = classify_tags(tag_library)
-    resolved = resolve_candidates(tag_library, spec, card=card)
+    if index is None:
+        index = classify_tags(tag_library)
+    resolved = resolve_candidates(tag_library, spec, card=card, index=index)
 
     allowed = resolved['allowed']
     usage_map = usage if isinstance(usage, dict) else index['usage']

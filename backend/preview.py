@@ -115,7 +115,8 @@ def build_variables(*, api, config, card, profile, model_name: str,
         card=card, excerpt=excerpt, tag_library=tag_library, usage=usage_map,
         limits=limits, model_name=model_name, profile_id=str(profile.get('id') or ''),
         selector=spec, extensions=extensions, local_note=local_note,
-        tag_pool=pool_spec,
+        # 上面已经为了返回值算过一次标签池，文本直接复用（预览页同样吃这个成本）
+        tag_pool=pool_spec, tag_pool_text=pool_result['text'],
     )
 
     return {

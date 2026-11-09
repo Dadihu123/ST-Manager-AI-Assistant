@@ -888,11 +888,17 @@ def format_usage_top(usage, *, limit: int = 20) -> str:
     return '、'.join(f'{tag}({count})' for tag, count in pairs[:max(1, int(limit or 20))])
 
 
-def tag_variables(tag_library, *, usage=None, pool=None, card=None) -> dict:
+def tag_variables(tag_library, *, usage=None, pool=None, card=None,
+                  pool_text=None) -> dict:
     """从 `api.tags.library()` 的返回构建 `tags.*` 变量。
 
     标签池（`core.tagpool`）负责：来源过滤、隔离分类硬过滤、token 预算、相关性排序。
     未给 `pool` 时用默认池（全库、1200 token 预算），行为比改造前更省 token。
+
+    Args:
+        pool_text: 已经算好的 `build_pool_text()['text']`（可选）。调用方
+            （作业里的 `analyze_one`）为了硬过滤本来就要算一次标签池，把那段
+            文本直接传进来即可 —— 这里只为取 `tags.library`，不值得再算一遍。
     """
     from . import tagpool  # noqa: PLC0415 - 局部导入，避免顶层依赖链变长
 
@@ -909,13 +915,14 @@ def tag_variables(tag_library, *, usage=None, pool=None, card=None) -> dict:
     if not isinstance(isolated, (list, tuple)):
         isolated = []
 
-    spec = tagpool.normalize_pool(pool if pool is not None else tagpool.default_pool())
-    pool_result = tagpool.build_pool_text(
-        data, spec, card=card, usage=usage,
-    )
+    if pool_text is None:
+        spec = tagpool.normalize_pool(pool if pool is not None else tagpool.default_pool())
+        pool_text = tagpool.build_pool_text(
+            data, spec, card=card, usage=usage,
+        )['text']
 
     return {
-        'tags.library': pool_result['text'],
+        'tags.library': pool_text,
         'tags.taxonomy': format_taxonomy(data.get('taxonomy')),
         # 空串而非「（无）」：占位文案会被发进提示词，且「（无）」可能被模型当成真实条目
         'tags.blacklist': '、'.join(str(item) for item in blacklist),
@@ -927,11 +934,12 @@ def tag_variables(tag_library, *, usage=None, pool=None, card=None) -> dict:
 def collect_variables(*, card=None, excerpt=None, tag_library=None, usage=None,
                       limits=None, model_name: str = '', profile_id: str = '',
                       selector=None, extensions=None, local_note=None,
-                      tag_pool=None, extra=None) -> dict:
+                      tag_pool=None, tag_pool_text=None, extra=None) -> dict:
     """汇总全部变量；缺失的来源按空值填充（不抛错，由渲染层决定策略）。
 
     `selector` 只影响 `card.*` 的取值广度；`tag_pool` 只影响 `tags.library`
-    的内容与预算。两者都不改变变量表结构。
+    的内容与预算。两者都不改变变量表结构。`tag_pool_text` 是已算好的
+    `tags.library` 文本（可选）：给了就不再内部构造标签池。
     """
     variables = {}
     variables.update(card_variables(
@@ -939,7 +947,7 @@ def collect_variables(*, card=None, excerpt=None, tag_library=None, usage=None,
     ))
     variables.update(worldbook_variables(excerpt))
     variables.update(tag_variables(
-        tag_library, usage=usage, pool=tag_pool, card=card,
+        tag_library, usage=usage, pool=tag_pool, card=card, pool_text=tag_pool_text,
     ))
 
     limits_data = limits if isinstance(limits, dict) else {}
