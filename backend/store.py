@@ -90,6 +90,18 @@ def extra_headers_secret_name(provider_id: str) -> str:
     return EXTRA_HEADERS_SECRET_TEMPLATE.format(provider_id=str(provider_id or '').strip().lower())
 
 
+def _keep_newest(mapping: dict, field: str, limit: int) -> dict:
+    """保留 `mapping` 中 `field` 最大的 `limit` 项，并列时以后插入者优先。
+
+    `field` 是秒级时间戳，同一秒内写入多条时全并列 —— 只按它排序结果取决于
+    dict 的迭代顺序，看起来「随机保留」。dict 保序这里可以免费拿到插入顺序，
+    后插入的视为更新。
+    """
+    indexed = list(enumerate(mapping.items()))
+    indexed.sort(key=lambda pair: (-int((pair[1][1] or {}).get(field) or 0), -pair[0]))
+    return dict(item for _index, item in indexed[:limit])
+
+
 def _to_int(value, default, *, minimum=None, maximum=None):
     if isinstance(value, bool) or value is None:
         return default
@@ -285,6 +297,56 @@ class PluginStore:
             logger.warning('压缩 %s 失败: %s', path, exc)
             return False
         return True
+
+    def _trim_jsonl_tail(self, path: str, keep: int, *, max_bytes: int = 0) -> int:
+        """只保留最后 `keep` 条记录，返回丢弃条数。
+
+        与 `_compact_jsonl` 的区别：那个按 `ui_key` 去重，对**没有**该字段的
+        记录（用量明细）会退化成 `_anon_i` 从而一条都删不掉 —— 文件越过阈值后
+        每次写入都要整文件重读重写。这里按出现顺序裁尾，语义是「留最近的」。
+
+        `max_bytes` 非 0 时只有文件超过它才真的去数记录（避免每次追加都整读）。
+        """
+        if keep <= 0 or not path or not os.path.isfile(path):
+            return 0
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return 0
+        if size <= 0:
+            return 0
+        if max_bytes and size <= max_bytes:
+            return 0
+
+        records = self._read_jsonl(path)
+        if len(records) <= keep:
+            return 0
+        payload = records[-keep:]
+        try:
+            temp_path = f'{path}.trim'
+            with open(temp_path, 'w', encoding='utf-8') as handle:
+                for record in payload:
+                    handle.write(json.dumps(record, ensure_ascii=False) + '\n')
+            os.replace(temp_path, path)
+        except OSError as exc:
+            logger.warning('裁剪 %s 失败: %s', path, exc)
+            return 0
+        return len(records) - len(payload)
+
+    def _truncate_jsonl(self, path: str) -> int:
+        """清空 jsonl 文件（保留文件本身），返回被删条数。"""
+        if not path or not os.path.isfile(path):
+            return 0
+        records = self._read_jsonl(path)
+        try:
+            temp_path = f'{path}.clear'
+            with open(temp_path, 'w', encoding='utf-8') as handle:
+                handle.write('')
+            os.replace(temp_path, path)
+        except OSError as exc:
+            logger.warning('清空 %s 失败: %s', path, exc)
+            return 0
+        return len(records)
 
     # ------------------------------------------------------------ ui_data
 
@@ -998,12 +1060,18 @@ class PluginStore:
                 cards = record.get('cards') if isinstance(record.get('cards'), list) else []
                 if card_key and card_key not in cards:
                     cards.append(card_key)
-                record['cards'] = cards[:50]
+                record['cards'] = cards[:TAG_SUGGESTION_CARDS_MAX]
                 record['reason'] = str((item or {}).get('reason') or record.get('reason') or '')
                 record['last_seen'] = now
 
                 queue[name] = record
                 updated[name] = record
+
+            if len(queue) > TAG_SUGGESTIONS_MAX:
+                # 键本身无上限时，2000 个标签名 = 240KB+，单这一个子键就能把
+                # ui_data 配额吃穿。保留最近的一批：主键 last_seen 倒序，
+                # 同一秒内并列时用插入顺序兜底（dict 保序，后出现的更新）。
+                queue = _keep_newest(queue, 'last_seen', TAG_SUGGESTIONS_MAX)
 
             entry['tag_suggestions'] = queue
 
@@ -1069,13 +1137,13 @@ class PluginStore:
             merged = dict(existing)
             merged.update(payload)
             runs[run_id] = merged
-            # 台账只保留最近 50 条，避免 ui_data 无限增长
-            if len(runs) > 50:
+            # 台账只保留最近 RUNS_MAX 条，避免 ui_data 无限增长
+            if len(runs) > RUNS_MAX:
                 ordered = sorted(
                     runs.items(),
                     key=lambda pair: int((pair[1] or {}).get('created_at') or 0),
                     reverse=True,
-                )[:50]
+                )[:RUNS_MAX]
                 runs = dict(ordered)
             entry['runs'] = runs
 
@@ -1106,6 +1174,11 @@ class PluginStore:
         return self._mutate(mutator)
 
     def forget_run(self, run_id: str) -> bool:
+        """删掉一条作业记录，**同时**清掉它的待审批登记。
+
+        只删台账不清 pending 会留下永远清不掉的孤儿登记：宿主会自己清理终态
+        作业，之后 `/jobs/<id>/apply` 直接 404，那条 pending 再没有任何清除路径。
+        """
         identifier = str(run_id or '').strip()
 
         def mutator(entry):
@@ -1113,8 +1186,25 @@ class PluginStore:
             if isinstance(runs, dict):
                 runs.pop(identifier, None)
                 entry['runs'] = runs
+            pending = entry.get('pending_reviews')
+            if isinstance(pending, dict) and identifier in pending:
+                pending.pop(identifier, None)
+                entry['pending_reviews'] = pending
 
         return self._mutate(mutator)
+
+    def clear_runs(self) -> dict:
+        """清空「最近作业」台账（**不**动累计用量）。"""
+        removed = []
+
+        def mutator(entry):
+            runs = entry.get('runs')
+            if isinstance(runs, dict):
+                removed.extend(list(runs.keys()))
+            entry['runs'] = {}
+
+        ok = self._mutate(mutator)
+        return {'removed': len(removed), 'run_ids': removed[:50], 'ok': ok}
 
     # ------------------------------------------------------------ 用量台账
 
@@ -1122,6 +1212,17 @@ class PluginStore:
         payload = dict(record or {})
         payload['recorded_at'] = int(time.time())
         self._append_jsonl(self.usage_path(), payload)
+        # 用量明细没有 `ui_key`，`_compact_jsonl` 对它完全不去重（N 条压完还是 N 条），
+        # 所以按条数裁尾：保留最近 USAGE_JSONL_MAX_RECORDS 条。
+        #
+        # 前置字节检查只为省 IO：每次追加都整读一遍文件会让写入退化成 O(n²)。
+        # 阈值取「上限条数 × 每条估算字节」，因此不会出现「条数已经超了、字节还没到
+        # 阈值所以永远不裁」的漏洞。
+        self._trim_jsonl_tail(
+            self.usage_path(), USAGE_JSONL_MAX_RECORDS,
+            max_bytes=max(1, len(json.dumps(payload, ensure_ascii=False).encode('utf-8')))
+            * USAGE_JSONL_MAX_RECORDS,
+        )
 
         prompt_tokens = int(payload.get('prompt_tokens') or 0)
         completion_tokens = int(payload.get('completion_tokens') or 0)
@@ -1155,12 +1256,33 @@ class PluginStore:
         size = max(1, int(limit or 20))
         return records[-size:]
 
+    def clear_usage_records(self, *, reset_ledger: bool = False) -> dict:
+        """清空用量明细（`usage.jsonl`）。
+
+        默认**保留**累计台账（`usage_ledger` 的 token / 作业总数）：那是「总共花了
+        多少」的账，清明细通常只是想甩掉历史条目。`reset_ledger=True` 才连累计一起归零。
+        """
+        removed = self._truncate_jsonl(self.usage_path())
+        if reset_ledger:
+            def mutator(entry):
+                entry['usage_ledger'] = {
+                    'total_prompt_tokens': 0,
+                    'total_completion_tokens': 0,
+                    'jobs': 0,
+                    'updated_at': int(time.time()),
+                }
+
+            self._mutate(mutator)
+        return {'removed': removed, 'ledger_reset': bool(reset_ledger)}
+
     # ------------------------------------------------------------ 审批与提示
 
     def mark_pending_review(self, run_id: str, job_type: str, item_count: int) -> None:
         identifier = str(run_id or '').strip()
         if not identifier:
             return
+
+        now = int(time.time())
 
         def mutator(entry):
             pending = entry.get('pending_reviews')
@@ -1169,30 +1291,68 @@ class PluginStore:
             pending[identifier] = {
                 'job_type': str(job_type or ''),
                 'items': int(item_count or 0),
-                'created_at': int(time.time()),
+                'created_at': now,
             }
+            # 上限 + TTL：这个子键原来无上限、无老化，而它只在 apply「有落地」时
+            # 才被清（routes.py），取消/失败/一直没审的作业会永久残留；宿主还会
+            # 自己清理终态作业，被清掉的 run 再也等不到 apply。
+            pending = self._prune_pending(pending, now)
             entry['pending_reviews'] = pending
 
         self._mutate(mutator)
 
+    @staticmethod
+    def _prune_pending(pending: dict, now: int) -> dict:
+        """按 TTL + 条数上限裁剪待审批登记（保留最近的一批）。"""
+        fresh = {
+            key: value for key, value in pending.items()
+            if now - int((value or {}).get('created_at') or 0) <= PENDING_REVIEW_TTL_SECONDS
+        }
+        if len(fresh) > PENDING_REVIEW_MAX:
+            fresh = _keep_newest(fresh, 'created_at', PENDING_REVIEW_MAX)
+        return fresh
+
     def clear_pending_review(self, run_id: str) -> None:
-        identifier = str(run_id or '').strip()
-        if not identifier:
-            return
+        self.clear_pending_reviews([run_id])
+
+    def clear_pending_reviews(self, run_ids=None) -> dict:
+        """清掉待审批登记；不传 `run_ids` 就全清。
+
+        这是「宿主已把作业清理掉、apply 永远 404」时唯一的解救通道。
+        """
+        targets = [
+            str(item or '').strip() for item in (run_ids or []) if str(item or '').strip()
+        ]
+        removed = []
 
         def mutator(entry):
             pending = entry.get('pending_reviews')
-            if isinstance(pending, dict):
-                pending.pop(identifier, None)
-                entry['pending_reviews'] = pending
+            if not isinstance(pending, dict):
+                pending = {}
+            if targets:
+                for identifier in targets:
+                    if identifier in pending:
+                        pending.pop(identifier, None)
+                        removed.append(identifier)
+            else:
+                removed.extend(list(pending.keys()))
+                pending = {}
+            entry['pending_reviews'] = pending
 
-        self._mutate(mutator)
+        ok = self._mutate(mutator)
+        return {'removed': removed, 'ok': ok}
 
     def list_pending_reviews(self) -> dict:
+        """当前待审批登记（读取时惰性老化过期条目，不改写磁盘）。"""
         pending = self.read_ui().get('pending_reviews')
         if not isinstance(pending, dict):
             return {}
-        return {str(key): value for key, value in pending.items() if isinstance(value, dict)}
+        now = int(time.time())
+        return {
+            str(key): value for key, value in pending.items()
+            if isinstance(value, dict)
+            and now - int((value or {}).get('created_at') or 0) <= PENDING_REVIEW_TTL_SECONDS
+        }
 
     def outbound_acknowledged(self) -> bool:
         return bool(self.read_ui().get('outbound_notice_ack'))

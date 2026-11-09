@@ -1796,6 +1796,48 @@ def register_routes(api, store) -> None:
 
     # ---------------------------------------------------------- 建议队列与用量
 
+    @api.http.route('/jobs/<run_id>', ['DELETE'])
+    @_handle_errors
+    def forget_job(run_id):
+        """删掉一条作业记录（「最近作业」里的手动清除）。
+
+        宿主清理终态作业后，插件台账里会留下再也点不开的记录；这里也顺手清掉
+        它的待审批登记 —— 只删台账不清 pending 会留下永远清不掉的孤儿。
+        对不存在的 run 也返回成功：前端点第二次不该报错。
+        """
+        run_id = str(run_id or '').strip()
+        if not run_id:
+            return _fail(CODE_INVALID_PAYLOAD, '缺少 run_id')
+        existed = any(item.get('run_id') == run_id for item in store.list_runs())
+        store.forget_run(run_id)
+        store.clear_pending_reviews([run_id])
+        return _ok(run_id=run_id, removed=1 if existed else 0)
+
+    @api.http.route('/jobs/clear', ['POST'])
+    @_handle_errors
+    def clear_jobs():
+        """清空「最近作业」台账（不动累计用量）。"""
+        return _ok(**store.clear_runs())
+
+    @api.http.route('/usage/clear', ['POST'])
+    @_handle_errors
+    def clear_usage():
+        """清空用量明细；`reset_ledger=true` 时连累计台账一起归零。"""
+        reset = bool(_body().get('reset_ledger'))
+        return _ok(**store.clear_usage_records(reset_ledger=reset))
+
+    @api.http.route('/pending/clear', ['POST'])
+    @_handle_errors
+    def clear_pending():
+        """清空 / 定点清除待审批登记（`run_ids` 省略即全清）。
+
+        宿主会自己清理终态作业，之后 `/jobs/<id>/apply` 直接 404 ——
+        这是那种情况下唯一能把这批 pending 清掉的通道。
+        """
+        payload = _body()
+        run_ids = payload.get('run_ids')
+        return _ok(**store.clear_pending_reviews(run_ids if isinstance(run_ids, list) else None))
+
     @api.http.route('/suggestions', ['GET'])
     @_handle_errors
     def list_suggestions():

@@ -30,17 +30,61 @@ export function createHub(api, client, context) {
   const reviewHost = el('div', 'plugin-stm-ai-assistant-hub-review');
   const runsHost = el('div', 'plugin-stm-ai-assistant-hub-runs');
 
+  // 「最近作业」标题行：右侧放手动清除（用户要求：能自己把历史清掉）。
+  const runsTitle = el('div', 'plugin-stm-ai-assistant-hub-title', '最近作业');
+  const runsTitleRow = el('div', 'plugin-stm-ai-assistant-hub-title-row');
+  const clearRunsBtn = api.ui.button({
+    label: '清除',
+    variant: 'ghost',
+    onClick: () => clearRuns(),
+  });
+  clearRunsBtn.dataset.marqueeIgnore = 'true';
+  runsTitleRow.append(runsTitle, clearRunsBtn);
+
   root.append(
     alertHost,
     summaryHost,
     el('div', 'plugin-stm-ai-assistant-hub-title', '现在能做什么'),
     taskHost,
     reviewHost,
-    el('div', 'plugin-stm-ai-assistant-hub-title', '最近作业'),
+    runsTitleRow,
     runsHost,
   );
 
   TASK_ORDER.forEach((taskId) => taskHost.append(renderTaskCard(TASKS[taskId])));
+
+  async function clearRuns() {
+    const confirmed = await api.ui.confirm({
+      title: '清除最近作业记录？',
+      message: '列表会被清空，但累计用量与卡片上的打标结果不受影响。',
+      danger: true,
+    });
+    if (!confirmed) return;
+    try {
+      const result = await client.clearJobs();
+      api.host.toast(`已清除 ${formatNumber(result.removed || 0)} 条作业记录`, 2400, 'check');
+      await loadRuns();
+    } catch (error) {
+      api.host.toast(`清除失败：${error.message}`, 3600, 'close');
+    }
+  }
+
+  async function clearPendingReviews() {
+    const confirmed = await api.ui.confirm({
+      title: '清空待审批登记？',
+      message: '只清掉「还有几个作业等着审批」的登记，作业结果仍在「结果与审批」里。',
+      danger: true,
+    });
+    if (!confirmed) return;
+    try {
+      const result = await client.clearPending();
+      api.host.toast(`已清空 ${formatNumber((result.removed || []).length)} 条待审批登记`, 2400, 'check');
+      await loadStatus();
+      context.setPendingBadge && context.setPendingBadge(0);
+    } catch (error) {
+      api.host.toast(`清空失败：${error.message}`, 3600, 'close');
+    }
+  }
 
   function renderTaskCard(task) {
     const card = el('button', 'plugin-stm-ai-assistant-task-card');
@@ -140,6 +184,17 @@ export function createHub(api, client, context) {
     });
     open.dataset.marqueeIgnore = 'true';
     card.append(open);
+    if (pending) {
+      // 宿主会自己清理终态作业；被清掉的 run 再也等不到 apply，
+      // 那批 pending 只能手动清 —— 没有这个入口就永远挂在角标上。
+      const clearPending = api.ui.button({
+        label: '清空待审批登记',
+        variant: 'ghost',
+        onClick: () => clearPendingReviews(),
+      });
+      clearPending.dataset.marqueeIgnore = 'true';
+      card.append(clearPending);
+    }
     reviewHost.append(card);
   }
 
@@ -164,27 +219,51 @@ export function createHub(api, client, context) {
   }
 
   function renderRunRow(job) {
-    const row = el('button', 'plugin-stm-ai-assistant-run-row');
-    row.type = 'button';
-    row.dataset.marqueeIgnore = 'true';
+    const row = el('div', 'plugin-stm-ai-assistant-run-row');
+
+    // 行本身是按钮（打开结果），删除按钮必须**并列**而不是嵌进去：
+    // 按钮不能嵌套按钮（HTML 不允许，点击也会冒泡成「打开结果」）。
+    const open = el('button', 'plugin-stm-ai-assistant-run-open');
+    open.type = 'button';
+    open.dataset.marqueeIgnore = 'true';
 
     const task = TASKS[String(job.task || '')];
-    row.append(el('span', 'plugin-stm-ai-assistant-run-task', task ? task.label : String(job.job_type || '作业')));
+    open.append(el('span', 'plugin-stm-ai-assistant-run-task', task ? task.label : String(job.job_type || '作业')));
 
     const status = String(job.status || '');
     const statusNode = el('span', `plugin-stm-ai-assistant-run-status is-${status}`);
     statusNode.textContent = jobStatusLabel(status);
-    row.append(statusNode);
+    open.append(statusNode);
 
     const counts = job.counts || {};
     if (counts.total) {
-      row.append(el('span', 'plugin-stm-ai-assistant-run-counts',
+      open.append(el('span', 'plugin-stm-ai-assistant-run-counts',
         `${counts.completed || 0}/${counts.total}`));
     }
-    row.append(el('span', 'plugin-stm-ai-assistant-run-time', formatTime(job.created_at)));
+    open.append(el('span', 'plugin-stm-ai-assistant-run-time', formatTime(job.created_at)));
 
-    row.addEventListener('click', () => context.openReview(String(job.run_id || '')));
+    open.addEventListener('click', () => context.openReview(String(job.run_id || '')));
+
+    const runId = String(job.run_id || '');
+    const remove = el('button', 'plugin-stm-ai-assistant-run-remove', '删除');
+    remove.type = 'button';
+    remove.title = '从最近作业里删掉这一条（不影响卡片与用量）';
+    remove.dataset.marqueeIgnore = 'true';
+    remove.addEventListener('click', () => forgetRun(runId));
+
+    row.append(open, remove);
     return row;
+  }
+
+  async function forgetRun(runId) {
+    if (!runId) return;
+    try {
+      await client.forgetJob(runId);
+      api.host.toast('已删除这条作业记录', 2400, 'check');
+      await loadRuns();
+    } catch (error) {
+      api.host.toast(`删除失败：${error.message}`, 3600, 'close');
+    }
   }
 
   return {

@@ -116,6 +116,11 @@ export function createSettings(api, client, context) {
   overviewSection.append(overviewBox);
   capabilitySection.append(capabilityBox);
   tagPoolSection.append(tagPoolBox);
+  // 这两个盒子此前是**孤儿节点**：只创建、渲染进 `usageBox` / `suggestionBox`，
+  // 却从未挂进各自的 section —— 于是「用量台账」与「新标签建议」两区在界面上
+  // 一直是空的（用户看不到用量，也点不到清空入口）。
+  usageSection.append(usageBox);
+  suggestionSection.append(suggestionBox);
 
   // ---------------------------------------------------------------- 渲染
 
@@ -1025,9 +1030,44 @@ export function createSettings(api, client, context) {
       badge(`作业 ${formatNumber(ledger.jobs)}`, 'is-muted'),
     );
 
+    // 用量明细曾经无界增长（记录没有 ui_key，8MB 压缩对它完全不去重）。
+    // 给一个手动清空入口，并明确「明细」与「累计」是两件事。
+    const usageActions = el('div', 'plugin-stm-ai-assistant-row');
+    usageActions.append(button('清空用量明细', 'is-danger', async () => {
+      const confirmed = await api.ui.confirm({
+        title: '清空用量明细？',
+        message: '只清空「最近用量」列表，上面的累计 token 与作业数会保留。',
+        danger: true,
+      });
+      if (!confirmed) return;
+      try {
+        const result = await client.clearUsage(false);
+        api.host.toast(`已清空 ${formatNumber(result.removed || 0)} 条用量明细`, 2400, 'check');
+        await load();
+      } catch (error) {
+        api.host.toast(error.message, 3600, 'close');
+      }
+    }));
+    usageActions.append(button('连同累计一起归零', 'is-danger', async () => {
+      const confirmed = await api.ui.confirm({
+        title: '连累计用量一起归零？',
+        message: '累计 token 与作业数会被清零，无法恢复。',
+        danger: true,
+      });
+      if (!confirmed) return;
+      try {
+        await client.clearUsage(true);
+        api.host.toast('累计用量已归零', 2400, 'check');
+        await load();
+      } catch (error) {
+        api.host.toast(error.message, 3600, 'close');
+      }
+    }));
+
     const recent = (state.usage && state.usage.recent) || [];
     if (!recent.length) {
       usageBox.append(el('p', 'plugin-stm-ai-assistant-hint', '（暂无用量记录）'));
+      usageBox.append(usageActions);
       return;
     }
 
@@ -1038,7 +1078,7 @@ export function createSettings(api, client, context) {
         + `${formatNumber(record.prompt_tokens)}/${formatNumber(record.completion_tokens)} token · `
         + `${record.items || 0} 张`));
     });
-    usageBox.append(list);
+    usageBox.append(list, usageActions);
   }
 
   function renderSuggestions() {

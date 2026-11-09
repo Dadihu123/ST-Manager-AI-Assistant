@@ -1114,6 +1114,127 @@ async function main() {
     assert.equal(cards, 4, `任务卡数量应为 4，实际 ${cards}`);
   });
 
+  // ---- 清除入口（问题 1：用户要求「手动清除 + 到上限自动老化」）----
+
+  await check('hub「最近作业」能清除台账', async () => {
+    const { createHub } = await import('../frontend/views/hub.js');
+    const { createClient } = await import('../frontend/api.js');
+    const { api: api3, calls: calls3 } = createFakeApi();
+    const client = createClient(api3);
+    const hub = createHub(api3, client, {
+      openTask: () => {}, openReview: () => {}, openSettings: () => {},
+    });
+    await hub.refresh();
+    const buttons = collect(hub.element, (node) => node.tagName === 'BUTTON');
+    const clearBtn = buttons.find((node) => String(node.textContent).includes('清除'));
+    assert.ok(clearBtn, `hub 没有「清除」按钮：${buttons.map((b) => b.textContent).join(',')}`);
+    clearBtn.click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(
+      calls3.some(([kind, path]) => kind === 'api' && path === '/jobs/clear'),
+      'hub 的「清除」应调用 /jobs/clear',
+    );
+  });
+
+  await check('hub 能单条删除作业记录', async () => {
+    const { createHub } = await import('../frontend/views/hub.js');
+    const { createClient } = await import('../frontend/api.js');
+    const { api: api4, calls: calls4 } = createFakeApi();
+    const client = createClient(api4);
+    const hub = createHub(api4, client, {
+      openTask: () => {}, openReview: () => {}, openSettings: () => {},
+    });
+    await hub.refresh();
+    const buttons = collect(
+      hub.element,
+      (node) => node.tagName === 'BUTTON' && String(node.textContent).includes('删除'),
+    );
+    assert.ok(buttons.length, '「最近作业」每行应有删除按钮');
+    buttons[0].click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(
+      calls4.some(([kind, path, body]) => kind === 'api'
+        && path === '/jobs/abcdef123456'
+        && body === undefined),
+      '删除应走 DELETE /jobs/<run_id>',
+    );
+  });
+
+  await check('hub 有「清空待审批登记」入口', async () => {
+    const { createHub } = await import('../frontend/views/hub.js');
+    const { createClient } = await import('../frontend/api.js');
+    const { api: api5, calls: calls5 } = createFakeApi({ pending: 2 });
+    const client = createClient(api5);
+    const hub = createHub(api5, client, {
+      openTask: () => {}, openReview: () => {}, openSettings: () => {},
+    });
+    await hub.refresh();
+    const buttons = collect(hub.element, (node) => node.tagName === 'BUTTON');
+    const clearPending = buttons.find((node) => String(node.textContent).includes('清空待审批'));
+    assert.ok(clearPending, '有待审批时必须能清空登记（宿主清理后那批再也清不掉）');
+    clearPending.click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(
+      calls5.some(([kind, path]) => kind === 'api' && path === '/pending/clear'),
+      '应调用 /pending/clear',
+    );
+  });
+
+  await check('设置页用量区能清空明细', async () => {
+    const { createSettings } = await import('../frontend/views/settings.js');
+    const { createClient } = await import('../frontend/api.js');
+    const { api: api6, calls: calls6 } = createFakeApi();
+    const settingsView = createSettings(api6, createClient(api6), {});
+    await settingsView.refresh();
+    const buttons = collect(
+      settingsView.element,
+      (node) => node.tagName === 'BUTTON' && String(node.textContent).includes('清空用量明细'),
+    );
+    assert.ok(buttons.length, '设置页用量区需要「清空用量明细」');
+    buttons[0].click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.ok(
+      calls6.some(([kind, path]) => kind === 'api' && path === '/usage/clear'),
+      '应调用 /usage/clear',
+    );
+  });
+
+  await check('ui_data 写入失败时 hub 给出提示', async () => {
+    const { createHub } = await import('../frontend/views/hub.js');
+    const { createClient } = await import('../frontend/api.js');
+    const { api: api7 } = createFakeApi();
+    const baseApi = api7.api;
+    api7.api = async (path, options = {}) => {
+      if (path === '/status') {
+        return {
+          success: true,
+          config: {},
+          profiles: { count: 1 },
+          providers: { count: 1 },
+          pending_reviews: {},
+          suggestions: 0,
+          usage: {},
+          ui_data: { ok: false, message: '命名空间已达上限', failed_writes: 3 },
+        };
+      }
+      return baseApi(path, options);
+    };
+    const hub = createHub(api7, createClient(api7), {
+      openTask: () => {}, openReview: () => {}, openSettings: () => {},
+    });
+    await hub.refresh();
+    const text = [];
+    (function walk(node) {
+      if (!node) return;
+      if (node._text) text.push(String(node._text));
+      (node.children || []).forEach(walk);
+    })(hub.element);
+    assert.ok(
+      text.some((line) => line.includes('写不进去') || line.includes('命名空间已达上限')),
+      `写入失败必须有提示，实际文本：${text.join(' | ').slice(0, 200)}`,
+    );
+  });
+
   for (const [name, verdict, message] of results) {
     const mark = verdict === 'ok' ? 'PASS' : 'FAIL';
     console.log(`${mark}  ${name}${message ? ` — ${message}` : ''}`);

@@ -98,6 +98,20 @@ export function createClient(api) {
       const suffix = query.toString();
       return call(`/jobs${suffix ? `?${suffix}` : ''}`);
     },
+    /** 删一条作业记录（连带它的待审批登记）。 */
+    forgetJob: (runId) =>
+      call(`/jobs/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+    /** 清空「最近作业」台账（不动累计用量）。 */
+    clearJobs: () => call('/jobs/clear', { method: 'POST' }),
+    /** 清空用量明细；`resetLedger` 为真时连累计台账一起归零。 */
+    clearUsage: (resetLedger = false) =>
+      call('/usage/clear', { method: 'POST', body: { reset_ledger: Boolean(resetLedger) } }),
+    /** 清空待审批登记；传 `runIds` 只清指定的那几个。 */
+    clearPending: (runIds = null) =>
+      call('/pending/clear', {
+        method: 'POST',
+        body: { run_ids: Array.isArray(runIds) ? runIds : null },
+      }),
     applyJob: (runId, payload = {}) =>
       call(`/jobs/${encodeURIComponent(runId)}/apply`, { method: 'POST', body: payload }),
     cancelJob: (runId) => call(`/jobs/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
