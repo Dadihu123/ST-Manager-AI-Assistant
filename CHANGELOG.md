@@ -1,5 +1,134 @@
 # CHANGELOG
 
+## 未发布
+
+基于 0.4.0。这一轮修的是三个**长期运行才会显形**的问题：用久了变卡、历史记录
+无限积累、以及 `ui_data` 命名空间顶到宿主配额后静默丢数据。诊断过程与实测数字见
+`tmp/audit/ANALYSIS.md`（含可复跑脚本）。
+
+### 修复：用久了每次保存都变慢（问题 3）
+
+- **`sync_card_meta_ui()` 的 O(N²) 裁剪**：原实现在超出体积自限后「每删一条就
+  `json.dumps` 整个字典」，成本 ∝ 条数 × 200KB。改为按 `updated_at` 倒序**一次
+  遍历**累加体积、装不下即停（保留的永远是最新的那批）。
+  实测缓存 800 条时单次同步 **787ms → 2ms**；1200 条时 **699ms → 9ms**。
+  注意：体积必须按 UTF-8 **字节**算而不是字符数（概览以中文为主，3 字节/字，
+  用 `len(str)` 会低估约 1.5 倍，热缓存反而超出预算）。
+
+- **批量写入不再逐条重写命名空间**：新增 `store.batch_card_meta()` 作用域，
+  `update_card_meta()` 在块内只追加 jsonl，退出时统一同步一次热缓存。
+  `ai.analyze` 作业与 `/jobs/<id>/apply` 已接入 —— 宿主每次
+  `private.update()` 都是「深拷贝 + 序列化测配额 + 4 代备份轮转 + fsync」，
+  300 张卡的作业原来是 300 次全量写盘。实测「落地 20 张卡」
+  **14.2s → 155ms**（缓存 1000 条时）。
+
+- **读接口不再写 `ui_data`**：`GET /profiles` 每次调用都会
+  `sync_profile_index()`（全量重写命名空间）。索引由 `save_profile` /
+  `delete_profile` / `reset_profiles` / `import_profiles` 维护，读路径不需要写。
+  打开一次面板就多一次全量写盘（超配额时还会每次刷一行「写入被拒绝」）。
+
+- **标签分类索引在作业内复用**（0.4.0 的性能放大器）：`analyze_one()` 原来每卡
+  跑两次全量 `classify_tags()`（`tagpool.protected_tags()` 内部又算一次），成本
+  随标签数近似平方增长。现在整批算一次并传下去
+  （`protected_tags(..., index=…)`）。实测 3000 个标签 / 300 张卡：
+  **118ms/卡 → 62.8ms/卡，省 16.6 秒（46.8%）**。
+  注：剩余主要成本 `build_pool_text()`（62ms/卡）是 0.3.0 就存在的固定开销，
+  不在本轮范围内。
+
+### 修复：历史记录无限积累（问题 1）
+
+用户原话：「最近的作业记录貌似会不断积累，希望能够添加个手动清除，如果当前会无限
+积累的话，请也增加以下上限，到了上限后自动老化旧的记录」。
+
+审计结论：`runs` 台账本来就有 50 条上限；真正会无限涨的是另外三处。
+
+- **`usage.jsonl` 按条数裁尾**（`USAGE_JSONL_MAX_RECORDS = 2000`）。原来只有
+  「8MB 压缩」，而用量记录没有 `ui_key` → `_compact_jsonl` 退化成 `_anon_i`，
+  **一条都删不掉**（实测 37117 条追加后压完还是 37118 条）；越过 8MB 后每次写入
+  都要整文件重读重写（244ms）。
+- **`pending_reviews` 加上限 + TTL**（50 条 / 14 天）。原来只在 apply「有落地」时
+  清，取消 / 失败 / 一直没审的作业永久残留；宿主还会自己清理终态作业，被清掉的
+  run 再也等不到 apply（1000 条 = 79.1KB，2528 条就吃掉 200KB）。
+- **`tag_suggestions` 的键加上限**（`TAG_SUGGESTIONS_MAX = 200`）。原来只限
+  每个标签的 `cards` 列表长度，键无上限（2000 个标签名 = 242.9KB）。
+- **手动清除入口**：
+  - `DELETE /jobs/<run_id>`（复用已实现但零调用的 `forget_run`，连带清掉该 run
+    的待审批登记）+ hub「最近作业」每行的「删除」；
+  - `POST /jobs/clear` + hub「最近作业」标题旁的「清除」；
+  - `POST /usage/clear`（默认保留累计台账，`reset_ledger=true` 才归零）；
+  - `POST /pending/clear`（可定点清 `run_ids`）+ 待审批卡上的「清空待审批登记」；
+  - 设置页「用量台账」区新增「清空用量明细」与「连同累计一起归零」。
+
+- **顺带修掉一个界面 bug**：设置页的 `usageBox` / `suggestionBox` 从未挂进各自的
+  section（孤儿节点）——「用量台账」与「新标签建议」两区在界面上一直是空的，
+  用户既看不到用量也点不到清空。前端冒烟测试抓到的。
+
+### 修复：`ui_data` 顶到配额后静默丢数据（问题 2）
+
+用户看到的日志：`插件 stm-ai-assistant 的 ui_data 命名空间已达 232245 字节
+（上限 262144），即将被拒绝`。实测构成 = `card_meta` 顶在 200KB 自限 + 其余子键
+约 27.7KB。
+
+- **热缓存预算改为动态**（`card_meta_budget()`）：不再固定占 200KB，而是
+  「宿主配额 − 其它子键实际占用 − 24KB 安全垫」，下限 16KB。
+  原来一个子键固定吃掉配额 78%，剩下 57KB 要装 8 个子键，吃穿后宿主**整笔拒绝**
+  所有写入（连待审批角标都刷不动）。
+- **写入失败不再静默**：`_mutate()` 失败时记 warning 并累计到
+  `last_write_state()`；`/status` 新增 `ui_data` 字段；hub 与设置页在失败时显示
+  提示与出路。原来所有调用方都丢掉返回值，`jobs.py` 外层 `try/except` 包的是
+  **不会抛异常**的调用，永远不触发 —— 用户只能看到「界面不动了」。
+- `/jobs/<id>/apply` 在本地记账写失败时回传 `warnings`：卡片确实写了，但
+  `applied_runs` / 待审批清除没落地，不说的话下次同一批会被重复落地。
+
+### 回归用例（新增 55 条）
+
+`tests/test_card_meta_scaling.py`（性能守卫 + 保留最新）、
+`tests/test_card_meta_batching.py`（批量只写一次 / 异常也 flush / 嵌套）、
+`tests/test_read_paths_do_not_write.py`、`tests/test_retention_and_clear.py`、
+`tests/test_clear_endpoints.py`、`tests/test_ui_budget_and_visibility.py`、
+`tests/test_status_write_state.py`、`tests/test_clear_entries_frontend_contract.py`、
+`tests/test_tagpool_reuse.py`；
+`tests_frontend/smoke.mjs` 新增 5 条清除入口用例。
+合计 **1011 passed / 前端冒烟 34 项全过**。
+
+### 修复：打标作业的单卡本地 CPU（3000 标签 129.8ms → 10.4ms）
+
+`ai.analyze` 每张卡的**本地**开销（LLM 网络之外）在 3000 个标签的库上实测
+**129.8ms/卡 → 10.4ms/卡（-92%）**，300 卡作业的本地 CPU **39s → 3.1s**。
+这段 CPU 跑在宿主进程里（Flask 单进程 + GIL），所以省下的是**宿主卡顿**
+（打标时整个软件卡住），不是作业等待 API 的时间。
+
+- **`_to_str_list()` 的 O(N²) 去重**：`text not in result` 是 list 上的线性
+  查找。改为 set 记账，语义完全等价（保留首次出现的顺序、先 strip 再去重）。
+  实测 3000 个标签单次 **28.85ms → 0.28ms**；6000 个 **109ms → ~1ms**
+  （`tests/test_tagpool.py` 有边界等价用例 + 6000 标签的线性守卫）。
+- **`resolve_candidates()` / `build_pool_text()` 接受现成分类索引**：
+  `classify_tags()` 每卡原本被调 4 次（每次 `build_pool_text` 内部两次）。
+  作业开头算一次，顺着 `analyze_one(tag_index=…)` 传下去。
+  每卡调用 **4.0 → 0 次**。
+- **`collect_variables()` 接受现成的 `tags.library` 文本**：`analyze_one()` 为了
+  硬过滤本来就算过一次 `build_pool_text()`，`tag_variables()` 又用同样的入参
+  算第二遍，只为取那段文本。每卡 `build_pool_text` **2.0 → 1.0 次**；
+  `/prompt/preview` 同样接入。
+- **`tags.library` 逐字节不变**：两条路径在同一组输入下（含作业注入的
+  `_isolated` 键）`text` / `listed` / `dropped` / `excluded` / `outline` 全等，
+  用测试钉住 —— 这是发进提示词的标签清单，改一个字节就会改变模型行为。
+- **索引只在作业内复用**：`tag_library` 本来就是作业开头 `read_tag_library()`
+  读一次的快照，索引随它同生共死；没有任何模块级缓存，跨作业不会串味。
+- 小标签库不回退：76 个标签 **1.7ms/卡 → 1.2ms/卡**。
+- 剩余 10–11ms 已是「一次建池」的固有成本（3000 个标签 × 词面重叠打分 +
+  逐行 token 估算），不再是重复计算。再往下压要改排序/估算算法本身，
+  不在本轮范围（本轮只做重复开销）。
+
+### 回归用例（本轮新增 21 条）
+
+`tests/test_tagpool.py`（列表规范化边界 13 条 + 6000 标签线性守卫）、
+`tests/test_tagpool_reuse.py`（`index=` 复用与两条路径输出相等）、
+`tests/test_prompt.py`（`tags.library` 逐字节相等 / 不重算 / 默认行为不变）、
+`tests/test_jobs.py`（整个作业只 classify 一次、每卡只建池一次）、
+`tests/test_analyze_local_cost.py`（端到端单卡本地开销守卫）。
+合计 **1032 passed / 前端冒烟 34 项全过 / 插件契约 0 error**。
+
 ## 0.4.0（2026-11-08）
 
 基于 v0.3.0。这一版主要是「让设置真的生效」：修掉配置页改了不生效、标签建议里出现
