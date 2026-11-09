@@ -22,6 +22,7 @@ import { createClient } from './api.js';
 import { createHeaderStatus } from './headerStatus.js';
 import { createViews, mountView, SURFACES } from './panel.js';
 import { createPromptPreview } from './promptPreview.js';
+import { createHistory } from './views/history.js';
 
 /**
  * 贡献项运行期状态回报器（v3）。
@@ -176,6 +177,8 @@ export async function activate(api) {
 
   const views = createViews(api, client, context);
   const preview = createPromptPreview(api);
+  // AI打标历史记录：独立 surface（宿主标题行显示「AI打标历史记录」）
+  const historyView = createHistory(api, client, context);
   // 状态胶囊只挂在任务中心（hub）标题行：其余面板不重复拉 status。
   const headerStatus = createHeaderStatus(api);
 
@@ -209,6 +212,12 @@ export async function activate(api) {
       onOpen(openCtx) {
         if (view && typeof view.applyContext === 'function') view.applyContext(openCtx);
         if (surfaceId === 'hub') refreshBadge();
+        // 设置面板：宿主可能**复用已挂载的容器**（`mount` 只跑一次），
+        // 而「主程序 → 插件管理 → 配置」也改同一份配置。不在打开时重新拉，
+        // 就会看到上一次的旧值（用户报过：宿主改成 30，插件里还是 20）。
+        if (surfaceId === 'settings' && view && typeof view.refresh === 'function') {
+          view.refresh();
+        }
       },
     });
   });
@@ -219,6 +228,19 @@ export async function activate(api) {
     type: 'modal',
     mount(container) {
       return preview.mount(container);
+    },
+  });
+
+  // AI打标历史记录（落地结果的按日归档；从任务面板/审批面板的按钮打开）
+  api.surfaces.register('history', {
+    title: 'AI打标历史记录',
+    description: '落地后的打标记录（按落地日期）',
+    icon: 'frontend/assets/icon.svg',
+    type: 'modal',
+    size: 'xl',
+    mount: mountView(historyView),
+    onOpen() {
+      historyView.onOpen();
     },
   });
 
@@ -251,6 +273,10 @@ export async function activate(api) {
 
   context.openSettings = () => {
     api.surfaces.open('settings', { source: 'hub' });
+  };
+
+  context.openHistory = () => {
+    api.surfaces.open('history', { source: 'hub' });
   };
 
   context.notifyReview = () => {

@@ -25,6 +25,7 @@ from .core import parsing
 from .core import prefilter as prefilter_core
 from .core import proposal as proposal_core
 from .core import prompt as prompt_core
+from .store import history_entry_id
 from .core import selector as selector_core
 from .core import tagpool as tagpool_core
 from .core import trimming
@@ -844,6 +845,44 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         logger.warning('写入卡片元数据失败', exc_info=True)
 
     result_payload['applied'] = applied
+
+    # auto 模式真的写进卡片了 → 补「已落地」标记 + 历史快照。
+    # 少了这一步，审批队列会把它们当成「已接受 · 待落地」再显示一遍，
+    # 用户会以为「选了直接写入却没落地」；历史里也查不到。
+    if applied:
+        applied_at = int(time.time())
+        try:
+            previous = store.get_card_meta(ui_key)
+            applied_runs = [
+                str(item) for item in (previous.get('applied_runs') or [])
+                if str(item or '').strip()
+            ]
+            run_id = str(ctx.run_id)
+            if run_id in applied_runs:
+                applied_runs.remove(run_id)
+            applied_runs.append(run_id)
+            store.update_card_meta(ui_key, {
+                'applied_runs': applied_runs[-20:],
+                'applied_at': applied_at,
+                'last_run_id': run_id,
+            })
+            store.record_history({
+                'entry_id': history_entry_id(run_id, ui_key),
+                'run_id': run_id,
+                'item_key': ui_key,
+                'card_id': card_id,
+                'ui_key': ui_key,
+                'summary': summary_text,
+                'tags': result_payload.get('tags') or [],
+                'new_tags': result_payload.get('new_tags') or [],
+                'tag_removals': result_payload.get('tag_removals') or [],
+                'profile_id': str(profile.get('id') or ''),
+                'accepted': True,
+                'applied_at': applied_at,
+            })
+        except Exception:  # noqa: BLE001 - 记账失败不影响作业本身
+            logger.warning('记录自动落地失败', exc_info=True)
+
     return {'status': 'done', 'result': result_payload, 'usage': usage, 'applied': applied}
 
 

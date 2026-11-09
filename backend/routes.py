@@ -32,10 +32,12 @@ from .core import wicheck as wicheck_core
 from .core import tokens as tokens_core
 from .core import trimming as trimming_core
 from .core.errors import (
+    CODE_CARD_UNREADABLE,
     CODE_INVALID_PAYLOAD,
     CODE_JOB_NOT_FOUND,
     CODE_SECRET_MISSING,
     CODE_VALIDATION_FAILED,
+    CODE_WRITE_FAILED,
     AiAssistantError,
 )
 from .jobs import (
@@ -51,7 +53,12 @@ from .jobs import (
     read_tag_library,
     split_tags,
 )
-from .store import api_key_secret_name, normalize_provider
+from .store import (
+    api_key_secret_name,
+    history_entry_id,
+    normalize_manual_tags,
+    normalize_provider,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +143,142 @@ def _load_job_items(api, run_id: str, *, limit: int = APPLY_ITEM_LIMIT) -> list:
     return [item for item in (items or []) if isinstance(item, dict)]
 
 
+def _visible_review_items(api, store, run_id: str, items: list) -> list:
+    """过滤出「还该出现在审批里」的条目；顺带补历史快照。
+
+    - 已落地的条目：补一份「已接受」历史快照后隐藏；
+    - 已跳过的条目：补一份「未接受」历史快照后隐藏；
+    - 其余只看状态：`awaiting_review` / `done`（已接受但还没落地）。
+    """
+    meta_map = store.load_card_meta()
+    visible = []
+    for item in items:
+        result = item.get('result') if isinstance(item.get('result'), dict) else {}
+        ui_key = str(
+            result.get('ui_key') or item.get('item_key') or item.get('key') or ''
+        )
+        item_key = str(item.get('key') or item.get('item_key') or '').strip()
+        meta = meta_map.get(ui_key) if ui_key else None
+        applied_runs = meta.get('applied_runs') if isinstance(meta, dict) else None
+
+        if isinstance(applied_runs, list) and run_id in applied_runs:
+            if item_key:
+                entry_id = history_entry_id(run_id, item_key)
+                if not store.get_history_entry(entry_id):
+                    store.record_history({
+                        'entry_id': entry_id,
+                        'run_id': run_id,
+                        'item_key': item_key,
+                        'card_id': str(result.get('card_id') or item_key),
+                        'ui_key': ui_key,
+                        'summary': str(result.get('summary') or ''),
+                        'tags': result.get('tags') if isinstance(result.get('tags'), list) else [],
+                        'new_tags': result.get('new_tags') or [],
+                        'tag_removals': result.get('tag_removals') or [],
+                        'profile_id': str(result.get('profile_id') or ''),
+                        'accepted': True,
+                        'applied_at': int(
+                            (meta.get('applied_at') if isinstance(meta, dict) else 0)
+                            or time.time()
+                        ),
+                    })
+            continue
+
+        # auto 模式：结果里 `applied=true` 说明卡已经写过了，但旧版本没记落地标记。
+        # 这里补记并隐藏，避免它们被当成「待落地」再显示一遍。
+        if str(item.get('status') or '') == 'done' and bool(result.get('applied')):
+            if item_key:
+                applied_at = int(item.get('updated_at') or time.time())
+                entry_id = history_entry_id(run_id, item_key)
+                if not store.get_history_entry(entry_id):
+                    store.record_history({
+                        'entry_id': entry_id,
+                        'run_id': run_id,
+                        'item_key': item_key,
+                        'card_id': str(result.get('card_id') or item_key),
+                        'ui_key': ui_key,
+                        'summary': str(result.get('summary') or ''),
+                        'tags': result.get('tags') if isinstance(result.get('tags'), list) else [],
+                        'new_tags': result.get('new_tags') or [],
+                        'tag_removals': result.get('tag_removals') or [],
+                        'profile_id': str(result.get('profile_id') or ''),
+                        'accepted': True,
+                        'applied_at': applied_at,
+                    })
+                if isinstance(applied_runs, list):
+                    existing_runs = applied_runs
+                else:
+                    existing_runs = []
+                if run_id not in existing_runs:
+                    store.update_card_meta(ui_key, {
+                        'applied_runs': (existing_runs + [run_id])[-20:],
+                        'applied_at': applied_at,
+                    })
+            continue
+
+        if str(item.get('status') or '') == 'skipped':
+            if item_key:
+                entry_id = history_entry_id(run_id, item_key)
+                if not store.get_history_entry(entry_id):
+                    store.record_history({
+                        'entry_id': entry_id,
+                        'run_id': run_id,
+                        'item_key': item_key,
+                        'card_id': str(result.get('card_id') or item_key),
+                        'ui_key': ui_key,
+                        'summary': str(result.get('summary') or ''),
+                        'tags': result.get('tags') if isinstance(result.get('tags'), list) else [],
+                        'new_tags': result.get('new_tags') or [],
+                        'tag_removals': result.get('tag_removals') or [],
+                        'profile_id': str(result.get('profile_id') or ''),
+                        'accepted': False,
+                        'applied_at': int(item.get('updated_at') or time.time()),
+                    })
+            continue
+
+        if str(item.get('status') or '') in ('awaiting_review', 'done'):
+            visible.append(item)
+    return visible
+
+
+def _live_pending_reviews(api, store, limit: int = 30) -> dict:
+    """按**实际条目状态**算「待审批作业」，不依赖可能写不进去的登记表。
+
+    背景：宿主对插件 `ui_data` 命名空间有体积配额，本插件已顶到上限，
+    `mark_pending_review()` / `clear_pending_review()` 的写入会被整次拒绝。
+    所以角标与任务中心必须以真实条目为准（最近 30 个作业够用）。
+    """
+    result = {}
+    registry = store.list_pending_reviews()
+    for record in store.list_runs()[:limit]:
+        run_id = str(record.get('run_id') or '')
+        if not run_id:
+            continue
+        counts = record.get('counts') if isinstance(record.get('counts'), dict) else {}
+        # 只检查「跑完时登记过待审批」或仍在登记表里的作业，避免每次都扫全部条目
+        if int(counts.get('review') or 0) <= 0 and run_id not in registry:
+            continue
+        try:
+            detail = api.jobs.get(run_id)
+        except Exception:  # noqa: BLE001 - 作业可能已被清理
+            detail = None
+        if not isinstance(detail, dict):
+            continue
+        items = _load_job_items(api, run_id)
+        awaiting = [
+            item for item in items
+            if str(item.get('status') or '') == 'awaiting_review'
+        ]
+        if not awaiting:
+            continue
+        result[run_id] = {
+            'job_type': str(detail.get('job_type') or record.get('job_type') or ''),
+            'items': len(awaiting),
+            'created_at': int(record.get('created_at') or 0),
+        }
+    return result
+
+
 def _normalize_card_ids(raw) -> list:
     if isinstance(raw, str):
         raw = [raw]
@@ -203,8 +346,10 @@ _CATEGORY_SPLIT_PATTERN = re.compile(r'[,，;；、\n\r]+')
 #: 一次最多接受多少个分类（防止把整段文本粘进来）。
 MAX_CATEGORY_ITEMS = 50
 
-#: 「最大标签数」的上限（与 manifest `config_schema.max_tags.maximum` 一致）。
-MAX_TOTAL_TAGS = 20
+#: 「最大总数量（一次最多打几个标签）」的上限。单一事实源在 `core.tagpool.MAX_LABEL_COUNT`
+#: （与 manifest `config_schema.max_tags.maximum` 一致）。之前写死 20，
+#: 导致用户在宿主配置页填 30 会被夹成 20（存下来的就是 20）。
+MAX_TOTAL_TAGS = tagpool_core.MAX_LABEL_COUNT
 
 #: 标签池 token 预算的上下限（与 manifest 一致）。
 MIN_TAG_BUDGET = 200
@@ -371,6 +516,21 @@ def _pull_models(store, provider_id, payload) -> dict:
 
 def register_routes(api, store) -> None:
     """注册全部插件路由。"""
+    # 启动时清掉历史遗留的 card_meta 镜像：它曾占 ~180 KiB，把 ui_data 顶到
+    # 宿主体积配额，导致待审批登记等写入被整次拒绝。失败不影响启动。
+    try:
+        store.sync_card_meta_ui()
+    except Exception:  # noqa: BLE001
+        logger.debug('清理 card_meta 镜像失败', exc_info=True)
+
+    # 配额腾出来之后，顺手清掉历史遗留、实际已无待审批条目的登记
+    try:
+        live_pending = _live_pending_reviews(api, store)
+        for run_id in list(store.list_pending_reviews().keys()):
+            if run_id not in live_pending:
+                store.clear_pending_review(run_id)
+    except Exception:  # noqa: BLE001
+        logger.debug('清理过期待审批登记失败', exc_info=True)
 
     # ---------------------------------------------------------- 状态与诊断
 
@@ -392,7 +552,7 @@ def register_routes(api, store) -> None:
             profiles={'count': len(profiles), 'active': store.active_profile_id()},
             providers={'count': len(providers), 'default_id': default_id},
             usage=store.usage_ledger(),
-            pending_reviews=store.list_pending_reviews(),
+            pending_reviews=_live_pending_reviews(api, store),
             suggestions=len(store.list_tag_suggestions()),
             outbound_acknowledged=store.outbound_acknowledged(),
         )
@@ -507,12 +667,15 @@ def register_routes(api, store) -> None:
     def save_tag_pool():
         """保存标签池：分类白/黑名单 + 最大总数量 + 每分类规则。
 
-        写的都是**已声明**的 `config_schema` 键：宿主的 `api.config.set()` 只接受
-        声明过的键，写内部结构（如 `tag_pool`）会被拒绝（实测 `set()` 返回 False，
-        前端报「配置未写入」）。读取时由 `config.normalize_config()` 再折回内部结构。
+        除「最大总数量」外都写**已声明**的 `config_schema` 键：宿主的
+        `api.config.set()` 只接受声明过的键，写内部结构（如 `tag_pool`）会被拒绝。
+
+        「最大总数量」写插件私有数据（`api.private`）：它只在 AI 助手设置里出现，
+        不进 `config_schema`（声明过的键一定会渲染在插件管理页）。
 
         `tag_category_rules` 存 JSON 字符串；保存前校验：
-        **各分类「设置数量」之和不得超过「最大总数量」**（用户要求：超了要拦下来）。
+        **各分类「设置数量」之和超过「最大总数量」只提醒、不拦保存**
+        （实际打标会按总上限截断）。
         """
         payload = _body()
         include = _split_category_list(payload.get('categories_include'))
@@ -562,7 +725,6 @@ def register_routes(api, store) -> None:
 
         try:
             saved = bool(api.config.set({
-                'max_tags': max_tags,
                 'tag_pool_categories_include': '，'.join(include),
                 'tag_pool_categories_exclude': '，'.join(exclude),
                 'tag_category_rules': (
@@ -576,6 +738,16 @@ def register_routes(api, store) -> None:
         if not saved:
             return _fail(CODE_INVALID_PAYLOAD, '配置未写入（主程序拒绝了本次保存）',
                          http_status=400)
+
+        # 「最大总数量」存插件私有数据：用户要求它**只**在 AI 助手设置里出现。
+        # 不能写进 config —— 只有 `config_schema` 声明过的键才允许写，而声明过的键
+        # 又一定会渲染在插件管理页。
+        if not config_module.write_private_settings(api, {'max_tags': max_tags}):
+            return _fail(
+                CODE_INVALID_PAYLOAD,
+                '最大总数量保存失败（写入后回读不一致，请重试）',
+                http_status=500,
+            )
 
         # 以**重新读回来的配置**为准（宿主可能做钳位/规范化），而不是拿请求体回显
         config = config_module.load_config(api)
@@ -934,7 +1106,15 @@ def register_routes(api, store) -> None:
                 and str(meta.get('model') or '') == str(model_name or '')
             )
             if skip_unchanged and not force and unchanged:
-                skipped.append({'card_id': card_id, 'reason': 'unchanged'})
+                # 把「为什么跳过」记全：前端要能区分「已处理过、内容没变」与
+                # 「读不到这张卡」，并告诉用户上次是谁在什么时候做的。
+                skipped.append({
+                    'card_id': card_id,
+                    'reason': 'unchanged',
+                    'profile_id': str(meta.get('profile_id') or ''),
+                    'model': str(meta.get('model') or ''),
+                    'analyzed_at': int(meta.get('analyzed_at') or 0),
+                })
                 continue
 
             items.append({
@@ -948,8 +1128,35 @@ def register_routes(api, store) -> None:
                 sample_cards.append(card)
 
         if not items:
-            return _ok(run_id='', total=0, skipped=len(skipped), details=skipped,
-                       message='没有需要处理的卡片（内容未变化或无法读取）')
+            # 「没有可提交的卡片」不是错误：它是幂等判定（或文件读不到）的结果。
+            # 这里把原因拆开返回，前端据此给出可操作的出口（强制重跑 / 修正路径），
+            # 而不是甩一句“提交失败”让用户无从下手。
+            reasons = {}
+            for entry in skipped:
+                reason = str(entry.get('reason') or 'unknown')
+                reasons[reason] = reasons.get(reason, 0) + 1
+            unchanged = int(reasons.get('unchanged') or 0)
+            unreadable = int(reasons.get('card_unreadable') or 0)
+            if unchanged and not unreadable:
+                message = (
+                    f'这 {unchanged} 张卡片已经在相同提示词档案/模型下分析过，且内容没有变化，'
+                    '所以没有提交。要重新打标，请取消勾选「跳过内容未变化的卡片」，'
+                    '或点下面的「仍然重新打标」。'
+                )
+            elif unreadable and not unchanged:
+                message = (
+                    f'这 {unreadable} 张卡片读取失败（文件可能已被移动、改名或损坏），'
+                    '请重新选择要处理的卡片。'
+                )
+            else:
+                message = (
+                    f'没有可提交的卡片：{unchanged} 张内容未变化、{unreadable} 张读取失败。'
+                )
+            return _ok(
+                run_id='', total=0, code='nothing_to_process',
+                skipped=len(skipped), reasons=reasons, details=skipped[:50],
+                message=message,
+            )
 
         estimate = preview_module.estimate_run(
             api=api, config=config, cards=sample_cards,
@@ -1545,11 +1752,11 @@ def register_routes(api, store) -> None:
             if len(jobs) >= limit:
                 break
 
-        pending = store.list_pending_reviews()
+        pending = _live_pending_reviews(api, store)
         return _ok(
             jobs=jobs,
             total=len(jobs),
-            pending_total=len([item for item in pending.values() if isinstance(item, dict)]),
+            pending_total=len(pending),
         )
 
     @api.http.route('/jobs/<run_id>', ['GET'])
@@ -1560,7 +1767,125 @@ def register_routes(api, store) -> None:
             return _fail(CODE_JOB_NOT_FOUND, f'作业不存在: {run_id}', http_status=404)
 
         items = _load_job_items(api, run_id)
-        return _ok(job=_job_summary(job), items=items, items_total=len(items))
+        visible = _visible_review_items(api, store, run_id, items)
+        return _ok(job=_job_summary(job), items=visible, items_total=len(visible))
+
+    @api.http.route('/review/queue', ['GET'])
+    @_handle_errors
+    def review_queue():
+        """**所有已完成作业**里「待审批 / 已接受待落地」的结果，按时间倒序。
+
+        审批面板不再按作业切换：作业跑完就把结果放进这条队列，用户逐条决定。
+        `run_id` 可选，用于从任务中心「查看结果」定位到某个作业。
+        """
+        run_filter = str(request.args.get('run_id') or '').strip()
+        items_out = []
+        runs_out = []
+        for record in store.list_runs():
+            if len(items_out) >= 500:
+                break
+            run_id = str(record.get('run_id') or '')
+            if not run_id or (run_filter and run_id != run_filter):
+                continue
+            try:
+                detail = api.jobs.get(run_id)
+            except Exception:  # noqa: BLE001 - 作业可能已被清理
+                detail = None
+            if not isinstance(detail, dict):
+                continue
+            job_type = str(detail.get('job_type') or record.get('job_type') or '')
+            if job_type not in (
+                jobs_module.JOB_ANALYZE, jobs_module.JOB_WI_REWRITE,
+                jobs_module.JOB_CLASSIFY, jobs_module.JOB_PROPOSE,
+                jobs_module.JOB_AGENT,
+            ):
+                continue
+            visible = _visible_review_items(
+                api, store, run_id, _load_job_items(api, run_id),
+            )
+            if not visible:
+                continue
+            task = str(record.get('task') or '')
+            created_at = float(record.get('created_at') or 0)
+            for position, item in enumerate(visible):
+                if len(items_out) >= 500:
+                    break
+                entry = dict(item)
+                entry['run_id'] = run_id
+                entry['job_type'] = job_type
+                entry['task'] = task
+                entry['run_created_at'] = created_at
+                entry['seq'] = int(item.get('seq') or position)
+                items_out.append(entry)
+            runs_out.append({
+                'run_id': run_id,
+                'job_type': job_type,
+                'task': task,
+                'count': len(visible),
+                'created_at': created_at,
+            })
+        return _ok(items=items_out, runs=runs_out, total=len(items_out))
+
+    @api.http.route('/jobs/<run_id>/items/<path:item_key>/manual-tags', ['POST'])
+    @_handle_errors
+    def save_manual_tags(run_id, item_key):
+        """用户手动给这张卡加标签：**立即写入卡片**，不要求该条目已落地。
+
+        - 不看 `applied_runs`：手动加标签是用户自己的操作，随时可做；
+        - 不走插件侧的标签库过滤（用户明确输入就是意图），交给宿主 `apply_tags`
+          裁决；黑名单 / 标签库锁挡下的标签在响应里如实返回；
+        - 记录写在插件数据文件里（`manual_tags.json`），不进 `ui_data`（体积配额）。
+        """
+        job = api.jobs.get(run_id)
+        if job is None:
+            return _fail(CODE_JOB_NOT_FOUND, f'作业不存在: {run_id}', http_status=404)
+
+        key = str(item_key or '').strip()
+        if not key:
+            return _fail(CODE_INVALID_PAYLOAD, '缺少条目 key')
+
+        items = _load_job_items(api, run_id)
+        target = None
+        for item in items:
+            if key in (
+                str(item.get('key') or ''), str(item.get('item_key') or ''),
+            ):
+                target = item
+                break
+        if target is None:
+            return _fail(CODE_INVALID_PAYLOAD, f'条目不存在: {key}', http_status=404)
+
+        result = target.get('result') if isinstance(target.get('result'), dict) else {}
+        card_id = str(result.get('card_id') or key)
+
+        names = normalize_manual_tags(_body().get('tags'))
+        if not names:
+            return _fail(CODE_INVALID_PAYLOAD, '没有可添加的标签')
+
+        card = api.cards.read(card_id)
+        if not isinstance(card, dict):
+            return _fail(CODE_CARD_UNREADABLE, f'无法读取卡片: {card_id}', http_status=404)
+
+        outcome = api.cards.apply_tags([card_id], add=names, remove=[], replace=False)
+        if outcome.get('failed'):
+            return _fail(CODE_WRITE_FAILED, '写入卡片失败', http_status=500)
+
+        skipped_unknown = [str(name) for name in (outcome.get('skipped_unknown') or [])]
+        skipped_blacklist = [str(name) for name in (outcome.get('skipped_blacklist') or [])]
+        added = [
+            name for name in names
+            if name not in skipped_unknown and name not in skipped_blacklist
+        ]
+
+        if added:
+            existing = store.manual_tags(run_id).get(key, {}).get('tags') or []
+            store.set_manual_tags(run_id, key, list(dict.fromkeys(existing + added)))
+            store.mark_manual_applied(run_id, key, added)
+
+        return _ok(
+            item_key=key, card_id=card_id, added=added,
+            skipped_unknown=skipped_unknown, skipped_blacklist=skipped_blacklist,
+        )
 
     @api.http.route('/jobs/<run_id>/apply', ['POST'])
     @_handle_errors
@@ -1641,6 +1966,7 @@ def register_routes(api, store) -> None:
             result = item.get('result') if isinstance(item.get('result'), dict) else {}
             ui_key = str(result.get('ui_key') or item.get('item_key') or '')
             card_id = str(result.get('card_id') or item.get('item_key') or '')
+            item_key = str(item.get('key') or item.get('item_key') or '').strip()
             if not card_id:
                 continue
 
@@ -1718,6 +2044,19 @@ def register_routes(api, store) -> None:
                     failed += 1
                     details.append({'card_id': card_id, 'error': 'write_failed'})
                     continue
+                skipped_unknown = [str(name) for name in (tag_result.get('skipped_unknown') or [])]
+                skipped_blacklist = [str(name) for name in (tag_result.get('skipped_blacklist') or [])]
+                if skipped_unknown or skipped_blacklist:
+                    # 黑名单 / 标签库锁（宿主治理）挡下的标签：如实回报，别让用户以为写进去了
+                    parts = []
+                    if skipped_blacklist:
+                        parts.append('黑名单：' + '、'.join(skipped_blacklist[:8]))
+                    if skipped_unknown:
+                        parts.append('标签库锁（未知标签）：' + '、'.join(skipped_unknown[:8]))
+                    details.append({
+                        'card_id': card_id,
+                        'warning': '宿主跳过的标签 — ' + '；'.join(parts),
+                    })
                 if tag_result.get('added') or tag_result.get('removed'):
                     details.append({
                         'card_id': card_id,
@@ -1734,6 +2073,24 @@ def register_routes(api, store) -> None:
                 'last_run_id': run_id,
             })
             applied += 1
+
+            # 落地成功 → 写一份历史快照（「AI打标历史记录」，按落地时间分组）
+            if item_key:
+                applied_at = int(time.time())
+                store.record_history({
+                    'entry_id': history_entry_id(run_id, item_key),
+                    'run_id': run_id,
+                    'item_key': item_key,
+                    'card_id': card_id,
+                    'ui_key': ui_key,
+                    'summary': summary_text,
+                    'tags': tags,
+                    'new_tags': result.get('new_tags') or [],
+                    'tag_removals': result.get('tag_removals') or [],
+                    'profile_id': str(result.get('profile_id') or ''),
+                    'applied_at': applied_at,
+                    'accepted': True,
+                })
 
         if applied:
             store.clear_pending_review(run_id)
@@ -1809,6 +2166,111 @@ def register_routes(api, store) -> None:
             ledger=store.usage_ledger(),
             recent=store.recent_usage(RECENT_USAGE_LIMIT),
         )
+
+    # ---------------------------------------------------------- AI 打标历史记录
+
+    @api.http.route('/history', ['GET'])
+    @_handle_errors
+    def get_history():
+        """历史列表：`{dates: [{date, count}], date, entries}`，按**落地时间**分组。"""
+        date = str(request.args.get('date') or '').strip()
+        dates = store.history_dates()
+        if not date:
+            date = time.strftime('%Y-%m-%d', time.localtime())
+            if dates and date not in {item['date'] for item in dates}:
+                date = dates[0]['date']
+        return _ok(date=date, dates=dates, entries=store.history_entries(date))
+
+    @api.http.route('/history/<entry_id>', ['DELETE'])
+    @_handle_errors
+    def delete_history(entry_id):
+        deleted = store.delete_history_entry(entry_id)
+        if not deleted:
+            return _fail(CODE_INVALID_PAYLOAD, '记录不存在', http_status=404)
+        return _ok(deleted=True)
+
+    @api.http.route('/history/clear', ['POST'])
+    @_handle_errors
+    def clear_history():
+        date = str(_body().get('date') or '').strip()
+        if not date:
+            return _fail(CODE_INVALID_PAYLOAD, '缺少日期')
+        return _ok(removed=store.clear_history_date(date), date=date)
+
+    @api.http.route('/history/<entry_id>/manual-tags', ['POST'])
+    @_handle_errors
+    def history_manual_tags(entry_id):
+        """历史卡片里手动加标签：立即写卡（不依赖原作业是否还在）。"""
+        entry = store.get_history_entry(entry_id)
+        if not entry:
+            return _fail(CODE_INVALID_PAYLOAD, '记录不存在', http_status=404)
+
+        card_id = str(entry.get('card_id') or '').strip()
+        if not card_id:
+            return _fail(CODE_INVALID_PAYLOAD, '记录里没有卡片 id')
+        card = api.cards.read(card_id)
+        if not isinstance(card, dict):
+            return _fail(CODE_CARD_UNREADABLE, f'无法读取卡片: {card_id}', http_status=404)
+
+        names = normalize_manual_tags(_body().get('tags'))
+        if not names:
+            return _fail(CODE_INVALID_PAYLOAD, '没有可添加的标签')
+
+        outcome = api.cards.apply_tags([card_id], add=names, remove=[], replace=False)
+        if outcome.get('failed'):
+            return _fail(CODE_WRITE_FAILED, '写入卡片失败', http_status=500)
+
+        skipped_unknown = [str(name) for name in (outcome.get('skipped_unknown') or [])]
+        skipped_blacklist = [str(name) for name in (outcome.get('skipped_blacklist') or [])]
+        added = [
+            name for name in names
+            if name not in skipped_unknown and name not in skipped_blacklist
+        ]
+
+        if added:
+            tags = entry.get('tags') if isinstance(entry.get('tags'), list) else []
+            known = {
+                str((tag or {}).get('name') if isinstance(tag, dict) else tag or '').strip()
+                for tag in tags
+            }
+            for name in added:
+                if name not in known:
+                    tags.append({'name': name})
+                    known.add(name)
+            store.update_history_entry(entry_id, {'tags': tags})
+
+        return _ok(added=added, skipped_unknown=skipped_unknown,
+                   skipped_blacklist=skipped_blacklist)
+
+    @api.http.route('/history/<entry_id>/reopen', ['POST'])
+    @_handle_errors
+    def reopen_history(entry_id):
+        """「改回待审批」的插件侧清理：删历史 + 清掉落地标记。
+
+        宿主的条目状态由前端另行调用其 review 路由（`awaiting_review`）——
+        那是主程序自己的 REST 能力，插件后端没有对应方法。
+        """
+        entry = store.get_history_entry(entry_id)
+        if not entry:
+            return _fail(CODE_INVALID_PAYLOAD, '记录不存在', http_status=404)
+
+        run_id = str(entry.get('run_id') or '').strip()
+        if not run_id or api.jobs.get(run_id) is None:
+            return _fail(
+                CODE_JOB_NOT_FOUND,
+                '原作业已被清理，无法改回待审批（历史记录可以删除）',
+                http_status=409,
+            )
+
+        ui_key = str(entry.get('ui_key') or entry.get('card_id') or '')
+        meta = store.get_card_meta(ui_key)
+        applied_runs = [
+            str(item) for item in (meta.get('applied_runs') or [])
+            if str(item) != run_id
+        ]
+        store.update_card_meta(ui_key, {'applied_runs': applied_runs})
+        store.delete_history_entry(entry_id)
+        return _ok(reopened=True, run_id=run_id)
 
     @api.http.route('/outbound/ack', ['POST'])
     @_handle_errors

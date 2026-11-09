@@ -33,7 +33,7 @@ import {
   skeleton,
   statsRow,
 } from '../ui.js';
-import { checkbox, createUi, field, input } from '../dom.js';
+import { checkbox, createUi, field, formatTime, input } from '../dom.js';
 import {
   ScopeError,
   describeScope,
@@ -72,6 +72,8 @@ export function createTaskPanel(api, client, context, taskId) {
     applyMode: 'review',
     running: false,
     runId: '',
+    /** 用户点「仍然重新打标」时置 true：这一次提交绕过内容未变化判定。 */
+    forceOnce: false,
     lastRunId: readLastRun(api, taskId),
     /** 由 `onOpen` 注入；`null` 表示本面板自己还没收到作用域。 */
     target: null,
@@ -147,8 +149,24 @@ export function createTaskPanel(api, client, context, taskId) {
   });
   openResultBtn.dataset.marqueeIgnore = 'true';
   openResultBtn.hidden = true;
-  actions.append(submitBtn, previewBtn, openResultBtn);
+  // AI打标历史记录：入口先放好，点开的具体界面后续再接（`context.openHistory` 钩子）。
+  const historyBtn = api.ui.button({
+    label: 'AI打标历史记录',
+    variant: 'secondary',
+    onClick: () => openHistory(),
+  });
+  historyBtn.dataset.marqueeIgnore = 'true';
+  historyBtn.classList.add('plugin-stm-ai-assistant-history-btn');
+  actions.append(submitBtn, previewBtn, openResultBtn, historyBtn);
   actionsHost.append(actions);
+
+  function openHistory() {
+    if (context && typeof context.openHistory === 'function') {
+      context.openHistory(taskId);
+      return;
+    }
+    api.host.toast('AI打标历史记录：界面还没接上（下一步做）', 3000, 'check');
+  }
 
   // ---------------------------------------------------------------- 任务专属参数
 
@@ -478,7 +496,7 @@ export function createTaskPanel(api, client, context, taskId) {
         // 用户在别的落点也能看到「这个任务正在跑」。
         context.setTaskProgress && context.setTaskProgress(taskId, { done: event.completed, total });
       },
-      onDone({ runId, job }) {
+      onDone({ runId, job, response }) {
         state.running = false;
         state.runId = runId;
         submitBtn.disabled = false;
@@ -494,17 +512,32 @@ export function createTaskPanel(api, client, context, taskId) {
         });
         openResultBtn.hidden = false;
         renderResultHint();
+        // 部分卡片被跳过时必须说出来：否则用户以为「全都处理了」，
+        // 回头发现少了卡还以为是作业丢了（内容未变化 / 读不到会走这条路）。
+        const skippedCount = Number((response && response.skipped) || 0);
+        if (skippedCount > 0) {
+          resultHost.append(banner(
+            `另有 ${formatNumber(skippedCount)} 张卡片没有提交（内容未变化或读取失败）。`,
+            'warn',
+          ));
+        }
         context.setTaskProgress && context.setTaskProgress(taskId, null);
         context.notifyReview && context.notifyReview();
         if (status === 'completed') api.host.toast('作业已完成，去「结果与审批」确认', 3200, 'check');
         else if (status === 'failed') api.host.toast('作业失败，详情见进度', 3600, 'close');
       },
-      onError(error) {
+      onError(error, info) {
         state.running = false;
         submitBtn.disabled = false;
         progress.hide();
         context.setTaskProgress && context.setTaskProgress(taskId, null);
         clear(resultHost);
+        // 空提交是幂等判定 / 读不到卡片的结果，不是「提交失败」：
+        // 给出原因明细和「仍然重新打标」的出口，别让用户对着红条无从下手。
+        if (info && info.empty) {
+          resultHost.append(renderNothingToProcess(error));
+          return;
+        }
         resultHost.append(banner(`提交失败：${error.message}`, 'error'));
       },
     });
@@ -525,6 +558,76 @@ export function createTaskPanel(api, client, context, taskId) {
     bar.append(open);
     resultHost.append(bar);
     openResultBtn.hidden = false;
+  }
+
+  /**
+   * 「这次没有可提交的卡片」的说明块。
+   *
+   * 后端把原因拆成 `unchanged` / `card_unreadable` 两类返回：
+   * - 内容未变化时给一条「仍然重新打标」的出口 —— 用户已经选好了卡再点开始，
+   *   那就是明确想跑，不该被幂等判定拦死（原来只能去猜「取消勾选跳过…」）；
+   * - 读取失败时说明是文件层面的问题，让用户回去查路径，而不是反复重试。
+   */
+  function renderNothingToProcess(error) {
+    const payload = (error && error.payload) || {};
+    const details = Array.isArray(payload.details) ? payload.details : [];
+    const reasons = (payload.reasons && typeof payload.reasons === 'object') ? payload.reasons : {};
+    const unchanged = Number(reasons.unchanged || 0);
+
+    const actions = [];
+    if (unchanged > 0 && taskId === 'analyze') {
+      const retry = api.ui.button({
+        label: '仍然重新打标',
+        variant: 'primary',
+        onClick: () => retryWithForce(),
+      });
+      retry.dataset.marqueeIgnore = 'true';
+      actions.push(retry);
+    }
+
+    const wrap = el('div', 'plugin-stm-ai-assistant-nothing-to-process');
+    wrap.append(banner(
+      String((error && error.message) || '没有需要处理的卡片'),
+      unchanged > 0 ? 'warn' : 'error',
+      actions,
+    ));
+    details.slice(0, 10).forEach((item) => {
+      wrap.append(el(
+        'div',
+        'plugin-stm-ai-assistant-note',
+        `${item.card_id || '(未知卡片)'} · ${skipReasonLabel(item)}`,
+      ));
+    });
+    if (details.length > 10) {
+      wrap.append(el(
+        'div',
+        'plugin-stm-ai-assistant-note',
+        `……另有 ${details.length - 10} 张未列出`,
+      ));
+    }
+    return wrap;
+  }
+
+  /** 跳过原因 → 一句人话（后端 reason 是稳定标识，不直接当文案）。 */
+  function skipReasonLabel(item) {
+    const reason = String((item && item.reason) || '');
+    if (reason === 'unchanged') {
+      const parts = ['内容未变化'];
+      const who = [item.profile_id, item.model].filter(Boolean).join(' / ');
+      if (who) parts.push(`上次：${who}`);
+      const at = formatTime(Number(item.analyzed_at || 0));
+      if (at && at !== '-') parts.push(at);
+      return parts.join(' · ');
+    }
+    if (reason === 'card_unreadable') return '读取失败（文件可能已移动 / 改名 / 损坏）';
+    return reason || '已跳过';
+  }
+
+  /** 这一次提交绕过「内容未变化」判定（`force` 只对本次生效）。 */
+  function retryWithForce() {
+    if (state.running) return;
+    state.forceOnce = true;
+    submit().finally(() => { state.forceOnce = false; });
   }
 
   function openReview(runId) {
@@ -713,7 +816,9 @@ function buildAnalyzeOptions(host, state, client) {
         card_ids: cards.map((card) => card.id),
         mode: 'both',
         skip_unchanged: skipUnchanged.querySelector('input').checked,
-        force: false,
+        // 手动选卡时用户点「开始」就是明确意图：空提交的说明块里再点
+        // 「仍然重新打标」会置 `forceOnce`，只对这一次提交生效。
+        force: Boolean(current.forceOnce),
         budget_tokens: Number(budget.querySelector('input').value) || 0,
       });
     },

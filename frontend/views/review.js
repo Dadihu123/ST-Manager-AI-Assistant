@@ -9,8 +9,9 @@
  * 落地走插件自己的 `/jobs/<run_id>/apply`。
  */
 
-import { banner, clear, emptyState, formatNumber, jobStatusLabel, readLastRun, skeleton, statsRow } from '../ui.js';
+import { banner, clear, emptyState, formatNumber, skeleton, statsRow } from '../ui.js';
 import { el } from '../dom.js';
+import { createManualTagInput } from './manualTags.js';
 import { TASKS } from '../tasks.js';
 
 const ITEM_STATUS_LABELS = {
@@ -64,10 +65,9 @@ function hasBlockIssues(item) {
 export function createReview(api, client, context) {
   const root = el('div', 'plugin-stm-ai-assistant-view is-review');
   const state = {
-    runId: '',
-    job: {},
     items: [],
     runs: [],
+    filterRunId: '',
     lastApply: null,
     busy: false,
     // 「写什么」在落地时决定：打标任务的概览 / 标签各一个开关。
@@ -76,13 +76,12 @@ export function createReview(api, client, context) {
   };
 
   const alertHost = el('div', 'plugin-stm-ai-assistant-alert-host');
-  const runBarHost = el('div', 'plugin-stm-ai-assistant-run-bar-host');
   const summaryHost = el('div', 'plugin-stm-ai-assistant-review-summary');
   const toolbarHost = el('div', 'plugin-stm-ai-assistant-review-toolbar');
   const listHost = el('div', 'plugin-stm-ai-assistant-review-list');
   const detailHost = el('div', 'plugin-stm-ai-assistant-review-detail');
 
-  root.append(alertHost, runBarHost, summaryHost, toolbarHost, listHost, detailHost);
+  root.append(alertHost, summaryHost, toolbarHost, listHost, detailHost);
 
   // ---------------------------------------------------------------- 工具条
 
@@ -96,96 +95,101 @@ export function createReview(api, client, context) {
     variant: 'secondary',
     onClick: () => bulkReview('skipped'),
   });
-  const retryBtn = api.ui.button({
-    label: '只重跑失败项',
-    variant: 'secondary',
-    onClick: () => retryFailed(),
-  });
   const applyBtn = api.ui.button({
     label: '落地已接受的',
     variant: 'primary',
     onClick: () => applyAccepted(),
   });
-  [acceptAllBtn, rejectAllBtn, retryBtn, applyBtn].forEach((node) => {
+  const refreshBtn = api.ui.button({
+    label: '刷新',
+    variant: 'ghost',
+    onClick: () => refresh(),
+  });
+  const historyBtn = api.ui.button({
+    label: 'AI打标历史记录',
+    variant: 'secondary',
+    onClick: () => openHistory(),
+  });
+  historyBtn.classList.add('plugin-stm-ai-assistant-history-btn');
+  [acceptAllBtn, rejectAllBtn, applyBtn, refreshBtn, historyBtn].forEach((node) => {
     node.dataset.marqueeIgnore = 'true';
     toolbarHost.append(node);
   });
 
-  // ---------------------------------------------------------------- 作业选择条
-
-  function renderRunBar() {
-    clear(runBarHost);
-    if (!state.runs.length && !state.runId) {
-      runBarHost.append(emptyState('还没有作业。到「任务中心」选一个任务开始。'));
+  function openHistory() {
+    if (context && typeof context.openHistory === 'function') {
+      context.openHistory();
       return;
     }
-    const bar = el('div', 'plugin-stm-ai-assistant-run-bar');
-    bar.append(el('span', 'plugin-stm-ai-assistant-run-bar-label', '作业'));
-    const select = el('select', 'plugin-stm-ai-assistant-run-bar-select');
-    select.dataset.marqueeIgnore = 'true';
-    state.runs.forEach((run) => {
-      const option = el('option');
-      option.value = String(run.run_id || '');
-      const task = TASKS[String(run.task || '')];
-      option.textContent = `${task ? task.label : run.job_type || '作业'} · ${String(run.run_id).slice(0, 8)} · ${jobStatusLabel(run.status)}`;
-      if (String(run.run_id) === state.runId) option.selected = true;
-      select.append(option);
-    });
-    select.addEventListener('change', () => selectRun(select.value));
-    bar.append(select);
+    api.host.toast('AI打标历史记录：界面还没接上（下一步做）', 3000, 'check');
+  }
 
-    const refreshBtn = api.ui.button({ label: '刷新', variant: 'ghost', onClick: () => refresh() });
-    refreshBtn.dataset.marqueeIgnore = 'true';
-    bar.append(refreshBtn);
-    runBarHost.append(bar);
+  // ---------------------------------------------------------------- 数据
+
+  async function refresh() {
+    clear(alertHost);
+    clear(listHost);
+    listHost.append(skeleton('读取结果…'));
+    try {
+      const data = await client.reviewQueue(state.filterRunId);
+      state.items = Array.isArray(data.items) ? data.items : [];
+      state.runs = Array.isArray(data.runs) ? data.runs : [];
+    } catch (error) {
+      clear(listHost);
+      listHost.append(banner(`读取结果失败：${error.message}`, 'error'));
+      return;
+    }
+    renderSummary();
+    renderItems();
+    renderDetail();
   }
 
   // ---------------------------------------------------------------- 摘要
 
   function renderSummary() {
     clear(summaryHost);
-    if (!state.runId) return;
-
-    const counts = { awaiting_review: 0, done: 0, failed: 0, skipped: 0 };
+    const tally = { awaiting_review: 0, done: 0, failed: 0, skipped: 0 };
     state.items.forEach((item) => {
-      if (counts[item.status] !== undefined) counts[item.status] += 1;
+      if (tally[item.status] !== undefined) tally[item.status] += 1;
     });
 
-    const jobType = String(state.job.job_type || '');
-    const task = TASKS[TASK_OF_JOB[jobType] || ''] || null;
-
     summaryHost.append(statsRow([
-      { label: '任务', value: task ? task.label : jobType || '-' },
-      { label: '状态', value: jobStatusLabel(state.job.status) },
-      { label: '待审批', value: formatNumber(counts.awaiting_review) },
-      { label: '已接受', value: formatNumber(counts.done) },
-      { label: '失败', value: formatNumber(counts.failed) },
-      { label: '跳过', value: formatNumber(counts.skipped) },
+      { label: '待审批', value: formatNumber(tally.awaiting_review) },
+      { label: '待落地', value: formatNumber(tally.done) },
+      { label: '作业', value: formatNumber(state.runs.length) },
     ]));
 
-    // 作业级错误（例如 LLM 校验未通过）必须显式呈现，不能只留在条目里
-    if (state.job.error) {
-      summaryHost.append(banner(`作业错误：${state.job.error}`, 'error'));
-    }
-    const summary = state.job.summary || {};
-    if (summary.prompt_tokens || summary.completion_tokens) {
-      summaryHost.append(el(
-        'p',
+    if (state.filterRunId) {
+      const row = el('div', 'plugin-stm-ai-assistant-row');
+      row.append(el(
+        'span',
         'plugin-stm-ai-assistant-note',
-        `用量：prompt ${formatNumber(summary.prompt_tokens || 0)} · `
-        + `completion ${formatNumber(summary.completion_tokens || 0)} token`,
+        `只显示作业 ${state.filterRunId.slice(0, 8)} 的结果`,
       ));
+      const showAll = api.ui.button({
+        label: '显示全部结果',
+        variant: 'ghost',
+        onClick: () => {
+          state.filterRunId = '';
+          refresh();
+        },
+      });
+      showAll.dataset.marqueeIgnore = 'true';
+      row.append(showAll);
+      summaryHost.append(row);
     }
 
-    const pending = counts.awaiting_review;
-    // 打标任务：「写什么」在落地时决定（提交时不再有「分析目标」这个假控件）
-    if (jobType === 'ai.analyze') {
+    if (state.items.some((item) => item.job_type === 'ai.analyze')) {
       summaryHost.append(renderWriteToggles());
     }
-    applyBtn.disabled = state.busy || pending > 0 && counts.done === 0;
-    applyBtn.textContent = pending > 0
-      ? `落地已接受的（还有 ${pending} 条待审批）`
+
+    const pending = tally.awaiting_review;
+    applyBtn.disabled = state.busy || tally.done === 0;
+    applyBtn.textContent = tally.done > 0
+      ? `落地已接受的（${tally.done} 条）`
       : '落地已接受的';
+    acceptAllBtn.disabled = state.busy || pending === 0;
+    rejectAllBtn.disabled = state.busy || pending === 0;
   }
 
   /** 打标落地时的「写什么」开关。 */
@@ -210,75 +214,125 @@ export function createReview(api, client, context) {
     return row;
   }
 
-
   // ---------------------------------------------------------------- 条目
 
   function renderItems() {
     clear(listHost);
-    if (!state.runId) return;
     if (!state.items.length) {
-      listHost.append(emptyState('这个作业还没有条目结果。'));
+      listHost.append(emptyState(
+        state.filterRunId
+          ? '这个作业没有待处理的结果了。'
+          : '没有待处理的结果。作业跑完的结果会自动出现在这里。',
+      ));
+      const button = state.filterRunId
+        ? api.ui.button({
+          label: '显示全部结果',
+          variant: 'secondary',
+          onClick: () => {
+            state.filterRunId = '';
+            refresh();
+          },
+        })
+        : api.ui.button({
+          label: '打开 AI打标历史记录',
+          variant: 'secondary',
+          onClick: () => openHistory(),
+        });
+      button.dataset.marqueeIgnore = 'true';
+      listHost.append(button);
       return;
     }
+    state.items.forEach((item) => listHost.append(renderCard(item)));
+  }
 
-    const jobType = String(state.job.job_type || '');
-    const renderItem = JOB_RENDERERS[jobType] || renderAnalyzeItem;
+  function renderCard(item) {
+    const jobType = String(item.job_type || '');
+    const result = item.result || {};
+    const row = el('div', 'plugin-stm-ai-assistant-review-item');
+    row.dataset.status = String(item.status || '');
+    if (hasBlockIssues(item)) {
+      row.classList.add('is-blocked');
+      row.dataset.blocked = 'true';
+    }
 
-    state.items.forEach((item) => {
-      const result = item.result || {};
-      const row = el('div', 'plugin-stm-ai-assistant-review-item');
-      row.dataset.status = String(item.status || '');
-      // 有 block 级问题的条目单独标出来：批量「全部接受」不会带走它们（§6.2）。
-      if (hasBlockIssues(item)) {
-        row.classList.add('is-blocked');
-        row.dataset.blocked = 'true';
-      }
+    const head = el('div', 'plugin-stm-ai-assistant-review-head');
+    const label = item.status === 'done'
+      ? '已接受 · 待落地'
+      : (ITEM_STATUS_LABELS[item.status] || item.status);
+    head.append(toneBadge(label, item.status));
+    head.append(el(
+      'span',
+      'plugin-stm-ai-assistant-review-key',
+      String(result.card_id || item.key || ''),
+    ));
+    const task = TASKS[String(item.task || '')];
+    head.append(el(
+      'span',
+      'plugin-stm-ai-assistant-note',
+      `${task ? task.label : jobType} · ${String(item.run_id || '').slice(0, 8)}`,
+    ));
+    // 有 block 级问题的条目单独标出来：批量「全部接受」不会带走它们。
+    if (hasBlockIssues(item)) {
+      head.append(toneBadge(
+        result.held_by_checker ? '检查拦下 · 需单独确认' : '有问题 · 需单独确认',
+        'error',
+      ));
+    }
 
-      const head = el('div', 'plugin-stm-ai-assistant-review-head');
-      head.append(toneBadge(ITEM_STATUS_LABELS[item.status] || item.status, item.status));
-      head.append(el('span', 'plugin-stm-ai-assistant-review-key',
-        String(result.card_id || itemKeyOf(item))));
-      if (hasBlockIssues(item)) {
-        head.append(toneBadge(
-          result.held_by_checker ? '检查拦下 · 需单独确认' : '有问题 · 需单独确认',
-          'error',
-        ));
-      }
-
-      const actions = el('div', 'plugin-stm-ai-assistant-review-actions');
-      if (item.status === 'awaiting_review') {
-        actions.append(
-          api.ui.button({
-            label: '接受',
-            variant: 'secondary',
-            onClick: () => reviewOne(item, 'done'),
-          }),
-          api.ui.button({
-            label: '拒绝',
-            variant: 'ghost',
-            onClick: () => reviewOne(item, 'skipped'),
-          }),
-        );
-      } else if (item.status === 'done') {
-        actions.append(api.ui.button({
+    const actions = el('div', 'plugin-stm-ai-assistant-review-actions');
+    if (item.status === 'awaiting_review') {
+      actions.append(
+        api.ui.button({
+          label: '接受',
+          variant: 'secondary',
+          onClick: () => reviewOne(item, 'done'),
+        }),
+        api.ui.button({
+          label: '拒绝',
+          variant: 'ghost',
+          onClick: () => reviewOne(item, 'skipped'),
+        }),
+      );
+    } else if (item.status === 'done') {
+      // 接受后**不提供逐条落地**：统一用顶部「落地已接受的」。
+      // 这里保留按钮外观但置灰、不可点（避免误以为可以单条落地）。
+      const landBtn = api.ui.button({
+        label: '落地这条',
+        variant: 'primary',
+        onClick: () => {},
+      });
+      landBtn.disabled = true;
+      landBtn.title = '用上方「落地已接受的」统一落地';
+      actions.append(
+        landBtn,
+        api.ui.button({
           label: '改回待审批',
           variant: 'ghost',
           onClick: () => reviewOne(item, 'awaiting_review'),
-        }));
-      }
-      actions.querySelectorAll('button').forEach((node) => {
-        node.dataset.marqueeIgnore = 'true';
-      });
-      head.append(actions);
-      row.append(head);
-
-      row.append(renderItem(result, item, jobType));
-
-      if (item.error) {
-        row.append(el('div', 'plugin-stm-ai-assistant-warning', String(item.error)));
-      }
-      listHost.append(row);
+        }),
+      );
+    }
+    actions.querySelectorAll('button').forEach((node) => {
+      node.dataset.marqueeIgnore = 'true';
     });
+    head.append(actions);
+    row.append(head);
+
+    const renderItem = JOB_RENDERERS[jobType] || renderAnalyzeItem;
+    row.append(renderItem(result, item, jobType));
+
+    if (jobType === 'ai.analyze' && itemKeyOf(item)) {
+      row.append(createManualTagInput({
+        api,
+        note: '手动添加标签（直接写入卡片）',
+        onAdd: (names) => client.saveManualTags(item.run_id, itemKeyOf(item), names),
+      }));
+    }
+
+    if (item.error) {
+      row.append(el('div', 'plugin-stm-ai-assistant-warning', String(item.error)));
+    }
+    return row;
   }
 
   function toneBadge(label, status) {
@@ -288,212 +342,14 @@ export function createReview(api, client, context) {
     return api.ui.badge({ value: label, tone });
   }
 
-  // ---------------------------------------------------------------- 落地
-
-  function renderDetail() {
-    clear(detailHost);
-    if (!state.lastApply) return;
-    const data = state.lastApply;
-
-    if (data.categories !== undefined || data.created_categories) {
-      detailHost.append(banner(
-        `已创建 ${(data.created_categories || []).length} 个分类、${(data.created_tags || []).length} 个标签`,
-        'ok',
-      ));
-    } else if (data.applied !== undefined) {
-      detailHost.append(banner(
-        `已落地 ${data.applied} 条 · 已应用过 ${data.skipped || 0} · `
-        + `内容已变化 ${data.stale || 0} · 失败 ${data.failed || 0}`,
-        data.failed ? 'warn' : 'ok',
-      ));
-    }
-
-    (data.details || []).slice(0, 12).forEach((detail) => {
-      detailHost.append(el('div', 'plugin-stm-ai-assistant-warning',
-        String(detail.message || detail.error || detail.warning || '').trim()));
-    });
-  }
-
-  async function applyAccepted() {
-    if (!state.runId) return;
-    // 落地前一次确认：`api.ui.confirm` 返回 Promise（宿主模态框），必须 await，
-    // 否则「取消」也会照常写入。
-    const confirmed = await confirmApply();
-    if (!confirmed) return;
-
-    state.busy = true;
-    applyBtn.disabled = true;
-    try {
-      const payload = buildApplyPayload();
-      state.lastApply = await client.applyJob(state.runId, payload);
-      const data = state.lastApply;
-      if (data.applied) {
-        api.host.refresh('cards');
-        api.host.refresh('worldinfo');
-      }
-      api.host.toast(
-        data.applied !== undefined ? `已落地 ${data.applied} 条` : '已创建结构',
-        3200,
-        'check',
-      );
-      renderDetail();
-      await refresh();
-      context.notifyReview && context.notifyReview();
-    } catch (error) {
-      clear(detailHost);
-      detailHost.append(banner(`落地失败：${error.message}`, 'error'));
-    } finally {
-      state.busy = false;
-      applyBtn.disabled = false;
-    }
-  }
-
-  /** 落地前一次确认：把「将发生什么」写清楚，而不是点了就写。 */
-  async function confirmApply() {
-    const jobType = String(state.job.job_type || '');
-    const accepted = state.items.filter((item) => item.status === 'done');
-    if (!accepted.length) {
-      api.host.toast('没有已接受的条目可落地', 2800, 'settings-help-entry');
-      return false;
-    }
-
-    let action = '';
-    if (jobType === 'ai.analyze') {
-      const notes = accepted.filter((item) => String((item.result || {}).summary || '').trim()).length;
-      const tagCount = state.writeTags ? accepted.length : 0;
-      action = `写 ${notes} 张卡片的概览、为 ${tagCount} 张写入已有标签`;
-    } else if (jobType === 'ai.wi_rewrite') {
-      action = `写回 ${accepted.length} 条世界书条目`;
-    } else if (jobType === 'ai.classify') {
-      const moves = accepted.filter((item) => (item.result || {}).category).length;
-      action = `移动 ${moves} 张卡片到目标分类`;
-    } else {
-      action = '创建提议里勾选的分类与标签（不动任何卡片）';
-    }
-
-    if (typeof api.ui.confirm === 'function') {
-      return Boolean(await api.ui.confirm({
-        title: '确认落地',
-        message: `将${action}。此操作会修改主程序数据。`,
-        confirmLabel: '确认写入',
-      }));
-    }
-    return window.confirm(`将${action}。继续？`);
-  }
-
-  function buildApplyPayload() {
-    const jobType = String(state.job.job_type || '');
-    const accepted = state.items
-      .filter((item) => item.status === 'done')
-      .map((item) => itemKeyOf(item) || String((item.result || {}).card_id || ''))
-      .filter(Boolean);
-
-    if (jobType === 'ai.propose' || jobType === 'ai.agent') {
-      const result = (state.items[0] || {}).result || {};
-      const plan = result.plan || {};
-      const payload = {
-        items: accepted,
-        categories: selectedOf('categories', plan.create_categories || []),
-        tags: selectedOf('tags', plan.create_tags || []),
-      };
-      // P1-5：勾选的合并建议才执行（默认全不勾 —— 合并会删掉来源标签）。
-      const allMerges = Array.isArray(plan.tag_merges) ? plan.tag_merges : [];
-      const picked = selectedOf('merge', null);
-      if (Array.isArray(picked) && picked.length) {
-        payload.merges = picked
-          .map((index) => allMerges[Number(index)])
-          .filter(Boolean)
-          .map((merge) => ({
-            from: Array.isArray(merge.from) ? merge.from : [merge.from].filter(Boolean),
-            to: String(merge.to || ''),
-          }));
-      }
-      return payload;
-    }
-    if (jobType === 'ai.analyze') {
-      const payload = {
-        items: accepted,
-        write: {
-          note: state.writeNote,
-          tags: state.writeTags,
-        },
-      };
-      // C13：勾选的删除项才提交（没有勾选框时 `selectedOf` 返回 null = 不删）。
-      const removals = selectedOf('removal', null);
-      if (Array.isArray(removals) && removals.length) {
-        payload.remove_tags = removals;
-      }
-      return payload;
-    }
-    return { items: accepted };
-  }
-
-  /** 勾选式裁剪：UI 上打勾的才落地；没有渲染勾选框时退化为「全部」。 */
-  function selectedOf(kind, fallback) {
-    const nodes = Array.from(listHost.querySelectorAll(`input[data-${kind}]`));
-    if (!nodes.length) return fallback;
-    return nodes.filter((node) => node.checked).map((node) => node.dataset[kind]);
-  }
-
-  // ---------------------------------------------------------------- 数据
-
-  async function refresh() {
-    clear(alertHost);
-    await loadRuns();
-    if (!state.runId) {
-      const last = readLastRun(api, 'analyze');
-      state.runId = last || (state.runs[0] && String(state.runs[0].run_id)) || '';
-    }
-    renderRunBar();
-    await loadJob();
-  }
-
-  async function loadRuns() {
-    try {
-      const data = await client.jobs(20);
-      state.runs = data.jobs || [];
-    } catch (error) {
-      state.runs = [];
-      alertHost.append(banner(`读取作业列表失败：${error.message}`, 'warn'));
-    }
-  }
-
-  async function loadJob() {
-    if (!state.runId) {
-      state.job = {};
-      state.items = [];
-      renderSummary();
-      renderItems();
-      renderRunBar();
-      return;
-    }
-    clear(listHost);
-    listHost.append(skeleton('读取作业…'));
-    try {
-      const data = await client.job(state.runId);
-      state.job = data.job || {};
-      state.items = data.items || [];
-    } catch (error) {
-      state.job = {};
-      state.items = [];
-      clear(listHost);
-      listHost.append(banner(`读取作业失败：${error.message}`, 'error'));
-      return;
-    }
-    renderSummary();
-    renderItems();
-    renderRunBar();
-  }
-
-  function selectRun(runId) {
-    state.runId = String(runId || '');
-    loadJob();
-  }
+  // ---------------------------------------------------------------- 审批与落地
 
   async function reviewOne(item, status) {
-    if (!state.runId) return;
+    if (state.busy) return;
     try {
-      await client.reviewItem(state.runId, itemKeyOf(item), status);
+      await client.reviewItem(item.run_id, itemKeyOf(item), status);
+      // 接受/拒绝只改本地状态，**不重拉队列**（重拉要扫几十个作业，很慢）；
+      // 等真正落地时再刷新，把已落地/已跳过的条目移出队列。
       item.status = status;
       renderSummary();
       renderItems();
@@ -503,76 +359,171 @@ export function createReview(api, client, context) {
   }
 
   async function bulkReview(status) {
-    if (!state.runId) return;
-    let targets = state.items.filter((item) => item.status === 'awaiting_review');
-    // §6.2 硬规则 2：「全部接受」只接受**没有问题**的条目。
-    // 有 block 级 issue 的必须单独点，避免 0.35 置信度的错误归类被一把带走。
-    let heldByChecker = 0;
+    const targets = state.items.filter((item) => item.status === 'awaiting_review');
+    let held = 0;
+    let picked = targets;
     if (status === 'done') {
-      const clean = targets.filter((item) => !hasBlockIssues(item));
-      heldByChecker = targets.length - clean.length;
-      targets = clean;
+      picked = targets.filter((item) => !hasBlockIssues(item));
+      held = targets.length - picked.length;
     }
-    if (!targets.length) {
+    if (!picked.length) {
       api.host.toast(
-        heldByChecker
-          ? `${heldByChecker} 条有问题，需要逐条确认`
-          : '没有待审批条目',
+        held ? `${held} 条有问题，需要逐条确认` : '没有待审批的结果',
         3600,
         'close',
       );
       return;
     }
+
+    const groups = new Map();
+    picked.forEach((item) => {
+      const runId = String(item.run_id || '');
+      if (!groups.has(runId)) groups.set(runId, []);
+      groups.get(runId).push({ key: itemKeyOf(item), status });
+    });
+
     state.busy = true;
+    let failed = 0;
     try {
-      const result = await client.reviewItems(
-        state.runId,
-        targets.map((item) => ({ key: itemKeyOf(item), status })),
-      );
-      // 批量结果以服务端为准，避免个别失败被本地状态掩盖
-      await loadJob();
-      if (result.failed.length) {
-        api.host.toast(`${result.total - result.failed.length} 条已更新，${result.failed.length} 条失败`, 3600, 'close');
-      } else {
-        api.host.toast(
-          `已批量标记 ${targets.length} 条` + (heldByChecker ? `，跳过 ${heldByChecker} 条有问题的` : ''),
-          3000,
-          'check',
-        );
+      for (const [runId, updates] of groups) {
+        try {
+          const result = await client.reviewItems(runId, updates);
+          failed += (result.failed || []).length;
+        } catch (error) {
+          failed += updates.length;
+        }
       }
-    } catch (error) {
-      api.host.toast(`批量审批失败：${error.message}`, 3600, 'close');
     } finally {
       state.busy = false;
+    }
+    api.host.toast(
+      `已更新 ${picked.length - failed} 条` + (held ? `，跳过 ${held} 条有问题的` : ''),
+      3600,
+      failed ? 'close' : 'check',
+    );
+    if (failed) {
+      // 有失败才重拉，保证服务端状态为准；全部成功只更新本地状态，避免卡顿。
+      await refresh();
+    } else {
+      picked.forEach((item) => {
+        item.status = status;
+      });
       renderSummary();
+      renderItems();
     }
   }
 
-  async function retryFailed() {
-    if (!state.runId) return;
-    try {
-      const data = await client.retryJob(state.runId, true);
-      if (data.run_id) state.runId = String(data.run_id);
-      api.host.toast('已重新入队', 3000, 'check');
-      await refresh();
-    } catch (error) {
-      api.host.toast(`重跑失败：${error.message}`, 3600, 'close');
+  async function applyAccepted() {
+    const done = state.items.filter((item) => item.status === 'done');
+    if (!done.length) {
+      api.host.toast('没有已接受的结果', 2800, 'close');
+      return;
     }
+    const confirmed = await confirmApply(done);
+    if (!confirmed) return;
+
+    const groups = new Map();
+    done.forEach((item) => {
+      const runId = String(item.run_id || '');
+      if (!groups.has(runId)) groups.set(runId, []);
+      groups.get(runId).push(itemKeyOf(item));
+    });
+
+    state.busy = true;
+    applyBtn.disabled = true;
+    applyBtn.textContent = `落地中… 0/${done.length}`;
+    // 落地要逐张写卡（可能几十张），必须先给反馈，否则就是「点了没反应」
+    const progressNode = el(
+      'div',
+      'plugin-stm-ai-assistant-warning',
+      `正在落地 0/${done.length} 条，请稍候…`,
+    );
+    clear(detailHost);
+    detailHost.append(progressNode);
+
+    let applied = 0;
+    let failed = 0;
+    let skipped = 0;
+    let stale = 0;
+    let handled = 0;
+    const details = [];
+    try {
+      for (const [runId, keys] of groups) {
+        try {
+          const data = await client.applyJob(runId, {
+            items: keys,
+            write: { note: state.writeNote, tags: state.writeTags },
+          });
+          applied += Number(data.applied || 0);
+          skipped += Number(data.skipped || 0);
+          stale += Number(data.stale || 0);
+          failed += Number(data.failed || 0);
+          (data.details || []).forEach((detail) => details.push(detail));
+        } catch (error) {
+          failed += keys.length;
+          details.push({ error: error.message });
+        }
+        handled += keys.length;
+        progressNode.textContent = `正在落地 ${Math.min(handled, done.length)}/${done.length} 条…`;
+        applyBtn.textContent = `落地中… ${Math.min(handled, done.length)}/${done.length}`;
+      }
+    } finally {
+      state.busy = false;
+    }
+
+    state.lastApply = { applied, skipped, stale, failed, details };
+    api.host.toast(`已落地 ${applied} 条`, 3200, 'check');
+    if (applied) {
+      api.host.refresh('cards');
+      api.host.refresh('worldinfo');
+      if (typeof context.notifyReview === 'function') context.notifyReview();
+    }
+    await refresh();
+  }
+
+  /** 落地前一次确认：把「将发生什么」写清楚，而不是点了就写。 */
+  async function confirmApply(done) {
+    const notes = done.filter((item) => String((item.result || {}).summary || '').trim()).length;
+    const tagCount = state.writeTags ? done.length : 0;
+    const message = `将写 ${notes} 张卡片的概览、为 ${tagCount} 张写入已有标签。`
+      + '此操作会修改主程序数据。';
+    if (typeof api.ui.confirm === 'function') {
+      return Boolean(await api.ui.confirm({
+        title: '确认落地',
+        message,
+        confirmLabel: '确认写入',
+      }));
+    }
+    return window.confirm(`${message}继续？`);
+  }
+
+  function renderDetail() {
+    clear(detailHost);
+    if (!state.lastApply) return;
+    const data = state.lastApply;
+    detailHost.append(banner(
+      `已落地 ${data.applied} 条 · 已应用过 ${data.skipped || 0} · `
+      + `内容已变化 ${data.stale || 0} · 失败 ${data.failed || 0}`,
+      data.failed ? 'warn' : 'ok',
+    ));
+    (data.details || []).slice(0, 12).forEach((detail) => {
+      const text = String(detail.message || detail.error || detail.warning || '').trim();
+      if (text) detailHost.append(el('div', 'plugin-stm-ai-assistant-warning', text));
+    });
   }
 
   return {
     element: root,
     refresh,
     applyContext(ctx) {
-      // 宿主已删除 `targetId`（改为 `entryId`）；审批面板只认显式的 runId，
-      // 入口 id 与 runId 是两件事，不能互相兜底。
       const runId = String((ctx && ctx.runId) || '');
       if (runId) {
-        state.runId = runId;
+        state.filterRunId = runId;
+        refresh();
       }
     },
     focusRun(runId) {
-      state.runId = String(runId || '');
+      state.filterRunId = String(runId || '');
     },
     destroy() {
       clear(root);
@@ -582,7 +533,7 @@ export function createReview(api, client, context) {
 
 // ---------------------------------------------------------------- 按类型渲染
 
-function renderAnalyzeItem(result) {
+export function renderAnalyzeItem(result) {
   const wrap = el('div', 'plugin-stm-ai-assistant-review-body');
   const summary = String(result.summary || '').trim();
   if (summary) wrap.append(el('p', 'plugin-stm-ai-assistant-review-summary', summary));

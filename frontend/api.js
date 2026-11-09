@@ -110,6 +110,26 @@ export function createClient(api) {
         body: { status },
       }),
 
+    /** 审批页「手动添加标签」：整组替换（增删都走这里）。 */
+    saveManualTags: (runId, itemKey, tags) => call(
+      `/jobs/${encodeURIComponent(runId)}/items/${encodeURIComponent(itemKey)}/manual-tags`,
+      { method: 'POST', body: { tags } },
+    ),
+
+    // AI 打标历史记录
+    history: (date) => call(`/history${date ? `?date=${encodeURIComponent(date)}` : ''}`),
+    reviewQueue: (runId) => call(`/review/queue${runId ? `?run_id=${encodeURIComponent(runId)}` : ''}`),
+    deleteHistory: (entryId) => call(`/history/${encodeURIComponent(entryId)}`, { method: 'DELETE' }),
+    clearHistory: (date) => call('/history/clear', { method: 'POST', body: { date } }),
+    historyManualTags: (entryId, tags) => call(
+      `/history/${encodeURIComponent(entryId)}/manual-tags`,
+      { method: 'POST', body: { tags } },
+    ),
+    reopenHistory: (entryId) => call(
+      `/history/${encodeURIComponent(entryId)}/reopen`,
+      { method: 'POST', body: {} },
+    ),
+
     /** 批量审批：并发提交，逐条失败不影响其余。 */
     async reviewItems(runId, updates) {
       const list = Array.isArray(updates) ? updates : [];

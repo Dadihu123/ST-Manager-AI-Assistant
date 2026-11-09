@@ -367,6 +367,31 @@ function createFakeApi({ providers = 1, pending = 0 } = {}) {
         '/providers': { success: true, items: [{ id: 'p1', name: 'P1', is_default: true, model: 'm1' }] },
         '/profiles': { success: true, items: [{ id: 'builtin-analyze', name: '打标档案', task: 'analyze' }] },
         '/jobs': { success: true, jobs: [{ run_id: 'abcdef123456', task: 'analyze', status: 'completed', counts: { total: 2, completed: 2 }, created_at: 1700000000 }] },
+        '/review/queue': {
+          success: true,
+          items: [
+            {
+              key: 'a.json', status: 'awaiting_review', run_id: 'abcdef123456',
+              job_type: 'ai.analyze', task: 'analyze', seq: 0, run_created_at: 1700000000,
+              result: {
+                card_id: 'a.json', summary: '概览',
+                tags: [{ name: '标签A', confidence: 0.9 }],
+                new_tags: [{ name: '新标签' }],
+                tag_removals: [{ name: '奇幻', reason: '与卡片无关' }],
+              },
+            },
+            {
+              key: 'b.json', status: 'done', run_id: 'abcdef123456',
+              job_type: 'ai.analyze', task: 'analyze', seq: 1, run_created_at: 1700000000,
+              result: { card_id: 'b.json', summary: '概览B', tags: [] },
+            },
+          ],
+          runs: [{
+            run_id: 'abcdef123456', job_type: 'ai.analyze', task: 'analyze',
+            count: 2, created_at: 1700000000,
+          }],
+          total: 2,
+        },
         '/categories': { success: true, items: [{ path: '科幻', count: 3 }] },
         '/prompt/preview': { success: true, messages: [{ role: 'system', content: 'hi' }], tokens: { total: 10 }, profile: { id: 'x', name: 'X' }, provider: { model: 'm1' } },
         // 与真实接口一致：既有 `books`（前端按书分组渲染）也有展平后的 `items`。
@@ -422,6 +447,7 @@ function createFakeApi({ providers = 1, pending = 0 } = {}) {
         },
       };
       if (path.startsWith('/jobs/') && path.endsWith('/apply')) return { success: true, applied: 2, skipped: 0, stale: 0, failed: 0, details: [] };
+      if (path.startsWith('/review/queue')) return table['/review/queue'];
       if (path.startsWith('/jobs/') && path.includes('/items/')) return { success: true };
       if (path.startsWith('/jobs?')) return table['/jobs'];
       if (path.startsWith('/jobs/') && !path.includes('/apply')) {
@@ -498,6 +524,7 @@ async function main() {
       assert.ok(registered.has(`${id}`), id);
     }
     assert.ok(registered.has('prompt-preview'));
+    assert.ok(registered.has('history'), 'AI打标历史记录 surface 未注册');
   });
 
   await check('hub 打开并渲染', async () => {
@@ -882,8 +909,26 @@ async function main() {
     const patched = {
       ...base.api,
       api: (path, options = {}) => {
-        if (path.startsWith('/jobs/') && !path.includes('/apply') && !path.includes('/items/')) {
-          return job;
+        if (path.startsWith('/review/queue')) {
+          return {
+            success: true,
+            items: [{
+              key: 'proposal',
+              status: 'awaiting_review',
+              run_id: 'run-merges',
+              job_type: 'ai.propose',
+              task: 'propose',
+              result: {
+                plan: {
+                  create_categories: ['题材/奇幻'],
+                  create_tags: [],
+                  tag_merges: [{ from: ['旧名', '别称'], to: '规范名', reason: '近义' }],
+                },
+              },
+            }],
+            runs: [{ run_id: 'run-merges', job_type: 'ai.propose', task: 'propose', count: 1 }],
+            total: 1,
+          };
         }
         return base.api.api(path, options);
       },
@@ -892,9 +937,8 @@ async function main() {
     const { createReview } = await import('../frontend/views/review.js');
     const { createClient } = await import('../frontend/api.js');
     const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
-    await review.refresh();
     review.focusRun('run-merges');
-    review.applyContext({ runId: 'run-merges' });
+    await review.refresh();
     await new Promise((resolve) => setTimeout(resolve, 80));
 
     const texts = allNodes.map((node) => String(node.textContent || '')).filter(Boolean);
@@ -935,8 +979,27 @@ async function main() {
     const patched = {
       ...base.api,
       api: (path, options = {}) => {
-        if (path.startsWith('/jobs/') && !path.includes('/apply') && !path.includes('/items/')) {
-          return jobWithIssue;
+        if (path.startsWith('/review/queue')) {
+          return {
+            success: true,
+            items: [{
+              key: 'a.json',
+              status: 'awaiting_review',
+              run_id: 'run-issues',
+              job_type: 'ai.wi_rewrite',
+              task: 'polish',
+              result: {
+                card_id: 'a.json',
+                original: '<analysis>原文</analysis>',
+                candidate: '<analysis>候选',
+                issues: ['标签消失: analysis'],
+                warnings: ['删得偏多：只剩原文的 40%'],
+                metrics: { orig_tokens: 100, cand_tokens: 90, delta: -10 },
+              },
+            }],
+            runs: [{ run_id: 'run-issues', job_type: 'ai.wi_rewrite', task: 'polish', count: 1 }],
+            total: 1,
+          };
         }
         return base.api.api(path, options);
       },
@@ -945,9 +1008,8 @@ async function main() {
     const { createReview } = await import('../frontend/views/review.js');
     const { createClient } = await import('../frontend/api.js');
     const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
-    await review.refresh();
     review.focusRun('run-issues');
-    review.applyContext({ runId: 'run-issues' });
+    await review.refresh();
     await new Promise((resolve) => setTimeout(resolve, 80));
 
     const texts = allNodes.map((node) => String(node.textContent || '')).filter(Boolean);
@@ -1025,7 +1087,11 @@ async function main() {
     const { createTaskPanel } = await import('../frontend/views/task.js');
     const { createClient } = await import('../frontend/api.js');
     const client = createClient(api);
-    const ctx = { providerId: 'p1', model: 'm1', profileId: '', notifyReview: () => {} };
+    let historyCalls = 0;
+    const ctx = {
+      providerId: 'p1', model: 'm1', profileId: '', notifyReview: () => {},
+      openHistory: () => { historyCalls += 1; },
+    };
     const panel = createTaskPanel(api, client, ctx, 'analyze');
     await panel.refresh();
     panel.applyContext({ source: 'context', targetKind: 'folder', targetPath: '科幻' });
@@ -1038,6 +1104,10 @@ async function main() {
       node.children.forEach(walk);
     })(panel.element);
     assert.ok(buttons.length, '面板没有渲染出按钮');
+    const history = buttons.find((node) => String(node.textContent).includes('AI打标历史记录'));
+    assert.ok(history, `任务面板缺少「AI打标历史记录」按钮：${buttons.map((b) => b.textContent).join(',')}`);
+    history.click();
+    assert.equal(historyCalls, 1, '点「AI打标历史记录」应触发 openHistory 钩子');
     const submit = buttons.find((node) => String(node.textContent).includes('开始'));
     assert.ok(submit, `缺少「开始」按钮：${buttons.map((b) => b.textContent).join(',')}`);
     submit.click();
@@ -1053,6 +1123,11 @@ async function main() {
     review.focusRun('abcdef123456');
     review.applyContext({ runId: 'abcdef123456' });
     await new Promise((resolve) => setTimeout(resolve, 60));
+    const buttons = collect(review.element, (node) => node.tagName === 'BUTTON');
+    assert.ok(
+      buttons.some((node) => String(node.textContent).includes('AI打标历史记录')),
+      '审批面板缺少「AI打标历史记录」按钮',
+    );
   });
 
   // §9 的 P2-9：宿主返回的条目字段是 `key`，旧前端统一读 `item_key`，
@@ -1086,6 +1161,385 @@ async function main() {
     );
   });
 
+  await check('审批面板：手动添加标签（输入 → 添加 → 立即写卡）', async () => {
+    const base = createFakeApi({ pending: 1 });
+    const posted = [];
+    const toasts = [];
+    const patched = {
+      ...base.api,
+      host: {
+        ...base.api.host,
+        toast: (message) => { toasts.push(String(message)); return true; },
+      },
+      api: (path, options = {}) => {
+        if (path.includes('/manual-tags')) {
+          base.calls.push(['api', path, options && options.body]);
+          const tags = (options && options.body && options.body.tags) || [];
+          posted.push(tags);
+          return { success: true, item_key: 'a.json', added: tags, skipped_blacklist: [], skipped_unknown: [] };
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
+    await review.refresh();
+    review.focusRun('abcdef123456');
+    review.applyContext({ runId: 'abcdef123456' });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const blocks = collect(
+      review.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-manual-tags'),
+    );
+    assert.ok(blocks.length >= 1, '打标条目下面要有手动添加标签区域');
+
+    const box = collect(
+      blocks[0],
+      (node) => node.tagName === 'INPUT' && node.classList.contains('plugin-stm-ai-assistant-input'),
+    )[0];
+    assert.ok(box, '手动添加标签区域缺少输入框');
+    box.value = '塔罗、占卜师/塔罗';
+
+    const addButton = collect(
+      blocks[0],
+      (node) => node.tagName === 'BUTTON' && node.textContent === '添加',
+    )[0];
+    assert.ok(addButton, '缺少「添加」按钮');
+    addButton.click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    assert.deepEqual(posted[0], ['塔罗', '占卜师'], '分隔符要拆开去重后提交');
+    const postedPath = base.calls.find(([, path]) => String(path).includes('/manual-tags'));
+    assert.ok(postedPath && postedPath[1].includes('/items/a.json/manual-tags'), '请求要带条目 key');
+    assert.equal(
+      toasts.some((text) => text.includes('已添加标签') && text.includes('塔罗')),
+      true,
+      `添加后要用 toast 提示（实际：${toasts.join(' / ')}）`,
+    );
+  });
+
+  await check('AI打标历史记录：日期栏 → 选日期 → 卡片操作', async () => {
+    const base = createFakeApi({ pending: 1 });
+    const entry = {
+      entry_id: 'e1',
+      run_id: 'run-1',
+      item_key: 'a.json',
+      card_id: 'a.json',
+      applied_at: 1794200000,
+      summary: 'AI 生成的概览',
+      tags: [{ name: '奇幻', confidence: 0.9 }],
+      new_tags: [{ name: '塔罗' }],
+      tag_removals: [],
+      accepted: true,
+    };
+    const skippedEntry = {
+      entry_id: 'e2',
+      run_id: 'run-1',
+      item_key: 'b.json',
+      card_id: 'b.json',
+      applied_at: 1794199000,
+      summary: '被拒绝的条目',
+      tags: [],
+      new_tags: [],
+      tag_removals: [],
+      accepted: false,
+    };
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        const method = (options && options.method) || 'GET';
+        if (path.includes('/manual-tags')) {
+          base.calls.push(['api', path, options && options.body]);
+          return { success: true, added: (options.body.tags || []), skipped_blacklist: [], skipped_unknown: [] };
+        }
+        if (path.includes('/reopen')) {
+          base.calls.push(['api', path, options && options.body]);
+          return { success: true, reopened: true };
+        }
+        if (path.includes('/history/') && method === 'DELETE') {
+          base.calls.push(['api', path, options && options.body]);
+          return { success: true, deleted: true };
+        }
+        if (path.includes('/history')) {
+          base.calls.push(['api', path, options && options.body]);
+          return {
+            success: true,
+            date: '2026-11-09',
+            dates: [{ date: '2026-11-09', count: 2 }, { date: '2026-11-08', count: 2 }],
+            entries: [entry, skippedEntry],
+          };
+        }
+        if (path.includes('/review')) {
+          base.calls.push(['api', path, options && options.body]);
+          return { success: true };
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createHistory } = await import('../frontend/views/history.js');
+    const { createClient } = await import('../frontend/api.js');
+    let notified = 0;
+    const history = createHistory(
+      patched,
+      createClient(patched),
+      { notifyReview: () => { notified += 1; } },
+    );
+    await history.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const days = collect(
+      history.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-history-day'),
+    );
+    assert.ok(days.length >= 2, '日期栏要渲染出天数');
+    const cards = collect(
+      history.element,
+      (node) => node.classList && node.classList.contains('is-history-card'),
+    );
+    assert.equal(cards.length, 2, '当天应渲染两张卡片（已接受 / 未接受）');
+    const cardNodes = collect(cards[0], () => true);
+    const cardTexts = cardNodes.map((node) => String(node.textContent || '').trim());
+    assert.ok(cardTexts.includes('a.json'), `卡片要有卡名（实际：${cardTexts.slice(0, 12).join('|')}）`);
+    assert.ok(cardTexts.includes('已接受'), '落地记录要有已接受标记');
+    assert.ok(
+      cardTexts.some((text) => text.startsWith('奇幻')),
+      `卡片要有标签（实际：${cardTexts.join('|')}）`,
+    );
+    const skippedCard = cards.find((card) => collect(card, () => true)
+      .some((node) => String(node.textContent || '').trim() === 'b.json'));
+    assert.ok(skippedCard, '缺少「未接受」的卡片');
+    const skippedTexts = collect(skippedCard, () => true)
+      .map((node) => String(node.textContent || '').trim());
+    assert.ok(skippedTexts.includes('未接受'), `跳过的记录要标未接受（实际：${skippedTexts.join('|')}）`);
+    const clockNode = collect(
+      cards[0],
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-history-time'),
+    )[0];
+    assert.ok(clockNode && /^\d{2}:\d{2}$/.test(String(clockNode.textContent).trim()),
+      `时间应是 24 小时制 HH:MM（实际：${clockNode && clockNode.textContent}）`);
+
+    // 日期栏是折叠式：点月份收起/展开
+    const monthToggle = collect(
+      history.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-history-month'),
+    )[0];
+    assert.ok(monthToggle, '缺少月份折叠按钮');
+    monthToggle.click();
+    const collapsedDays = collect(
+      history.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-history-day'),
+    );
+    assert.equal(collapsedDays.length, 0, '收起月份后不应再渲染日期');
+    monthToggle.click();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const expandedDays = collect(
+      history.element,
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-history-day'),
+    );
+    assert.ok(expandedDays.length >= 2, '展开月份后日期应恢复');
+
+    // 选 11-08 → 请求带日期
+    const eight = expandedDays.find((node) => String(node.textContent).trim() === '8');
+    assert.ok(eight, '缺少 11-08 的日期按钮');
+    eight.click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const historyCalls = base.calls.filter(([, path]) => String(path).includes('/history?'));
+    assert.ok(
+      historyCalls.some(([, path]) => String(path).includes('2026-11-08')),
+      `切日期应带 date 参数：${historyCalls.map(([, p]) => p).join(', ')}`,
+    );
+
+    // 删除 → DELETE
+    const deleteBtn = collect(
+      cards[0],
+      (node) => node.classList && node.classList.contains('plugin-stm-ai-assistant-history-delete'),
+    )[0];
+    assert.ok(deleteBtn, '卡片缺少删除按钮');
+    const beforeDelete = base.calls.length;
+    deleteBtn.click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const deleteCalls = base.calls.slice(beforeDelete)
+      .filter(([, path, body]) => String(path).includes('/history/e1') && body);
+    assert.ok(
+      base.calls.slice(beforeDelete).some(([, path]) => String(path).includes('/history/e1')),
+      '删除应请求 /history/e1',
+    );
+    void deleteCalls;
+
+    // 改回待审批 → 先调宿主 review，再调插件 reopen
+    const reopenBtn = collect(
+      cards[0],
+      (node) => node.tagName === 'BUTTON' && String(node.textContent) === '改回待审批',
+    )[0];
+    assert.ok(reopenBtn, '卡片缺少「改回待审批」');
+    const beforeReopen = base.calls.length;
+    reopenBtn.click();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const reopenPaths = base.calls.slice(beforeReopen).map(([, path]) => String(path));
+    assert.ok(
+      reopenPaths.some((path) => path.includes('/review')),
+      `改回待审批应先调宿主 review：${reopenPaths.join(', ')}`,
+    );
+    assert.ok(
+      reopenPaths.some((path) => path.includes('/reopen')),
+      `改回待审批还要调插件 reopen：${reopenPaths.join(', ')}`,
+    );
+    assert.equal(notified, 1, '改回后要通知审批面板刷新');
+  });
+
+  await check('审批面板：结果队列合并多个作业，不需切换作业', async () => {
+    const base = createFakeApi({ pending: 1 });
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (String(path).startsWith("/review/queue")) {
+          return {
+            success: true,
+            items: [
+              {
+                key: 'one.json', status: 'awaiting_review', run_id: 'run-alpha',
+                job_type: 'ai.analyze', task: 'analyze', seq: 0,
+                result: { card_id: 'one.json', summary: '来自作业A的概览', tags: [] },
+              },
+              {
+                key: 'two.json', status: 'awaiting_review', run_id: 'run-beta',
+                job_type: 'ai.analyze', task: 'analyze', seq: 0,
+                result: { card_id: 'two.json', summary: '来自作业B的概览', tags: [] },
+              },
+            ],
+            runs: [
+              { run_id: 'run-alpha', job_type: 'ai.analyze', task: 'analyze', count: 1 },
+              { run_id: 'run-beta', job_type: 'ai.analyze', task: 'analyze', count: 1 },
+            ],
+            total: 2,
+          };
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
+    await review.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const texts = collect(review.element, () => true)
+      .map((node) => String(node.textContent || '').trim());
+    assert.ok(texts.includes('one.json'), `作业 A 的结果要出现：${texts.slice(0, 12).join('|')}`);
+    assert.ok(texts.includes('two.json'), `作业 B 的结果要出现：${texts.slice(0, 12).join('|')}`);
+    assert.equal(
+      texts.filter((text) => text === '待审批').length >= 2,
+      true,
+      '两张结果卡片都要渲染',
+    );
+  });
+
+  await check('已接受的条目：不提供逐条落地（按钮置灰不可点）', async () => {
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const client = createClient(api);
+    const review = createReview(api, client, { notifyReview: () => {} });
+    await review.refresh();
+    const landButtons = collect(
+      review.element,
+      (node) => node.tagName === 'BUTTON' && String(node.textContent) === '落地这条',
+    );
+    assert.ok(landButtons.length >= 1, '已接受的条目应保留「落地这条」按钮（置灰）');
+    assert.equal(
+      landButtons.every((node) => node.disabled === true),
+      true,
+      '「落地这条」必须置灰不可点',
+    );
+  });
+
+  await check('点接受不重拉队列（只有落地后才刷新）', async () => {
+    const base = createFakeApi({ pending: 1 });
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(base.api, createClient(base.api), { notifyReview: () => {} });
+    await review.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const queueCalls = () => base.calls.filter(([, path]) => String(path).includes('/review/queue')).length;
+    const before = queueCalls();
+
+    const accept = collect(
+      review.element,
+      (node) => node.tagName === 'BUTTON' && String(node.textContent) === '接受',
+    )[0];
+    assert.ok(accept, '缺少「接受」按钮');
+    accept.click();
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    assert.equal(queueCalls(), before, '点接受后不应重拉结果队列');
+    const texts = collect(review.element, () => true)
+      .map((node) => String(node.textContent || '').trim());
+    assert.ok(
+      texts.includes('已接受 · 待落地'),
+      `接受后本地状态要立刻变成「已接受 · 待落地」（实际：${texts.slice(0, 16).join('|')}）`,
+    );
+  });
+
+  await check('落地时先给进度反馈（不是点了没反应）', async () => {
+    const base = createFakeApi({ pending: 1 });
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(base.api, createClient(base.api), { notifyReview: () => {} });
+    await review.refresh();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const applyBtn = collect(
+      review.element,
+      (node) => node.tagName === 'BUTTON'
+        && String(node.textContent).includes('落地已接受的'),
+    )[0];
+    assert.ok(applyBtn, '缺少「落地已接受的」按钮');
+    applyBtn.click();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const texts = collect(review.element, () => true)
+      .map((node) => String(node.textContent || '').trim());
+    assert.ok(
+      texts.some((text) => text.includes('正在落地') || text.includes('已落地')),
+      `落地过程要有文字反馈（实际：${texts.slice(0, 16).join('|')}）`,
+    );
+  });
+
+  await check('作业进度：item 帧要累计（不会一直停在 0/N）', async () => {
+    const { runTaskJob } = await import('../frontend/ui.js');
+    const seen = [];
+    const fake = {
+      storage: { get: () => '', set: () => {} },
+      subscribeJob: (runId, handlers) => {
+        handlers.snapshot({ status: 'running', total: 7, completed: 0, failed: 0, skipped: 0 });
+        setTimeout(() => {
+          handlers.item({ key: 'a', status: 'done' });
+          handlers.item({ key: 'b', status: 'awaiting_review' });
+          handlers.done({ status: 'completed', total: 7, completed: 2, failed: 0, skipped: 1 });
+        }, 5);
+        return () => {};
+      },
+    };
+    await runTaskJob({
+      api: fake,
+      taskId: 'analyze',
+      submit: async () => ({ run_id: 'r1' }),
+      onProgress: (event) => seen.push(event),
+      onDone: () => {},
+      onError: () => {},
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    assert.ok(seen.length >= 3, `item 帧应推进进度（实际推进 ${seen.length} 次）`);
+    assert.equal(seen[1].completed, 1, '第一个 item 完成后应显示 1/7');
+    assert.equal(seen[2].skipped, 1, '待审批条目计入 skipped');
+    assert.ok(seen[2].percent > 0, '百分比要动，不能一直是 0');
+  });
+
   await check('世界书结果渲染 diff（不抛错）', async () => {
     const { createReview } = await import('../frontend/views/review.js');
     const { createClient } = await import('../frontend/api.js');
@@ -1112,6 +1566,71 @@ async function main() {
       node.children.forEach(walk);
     })(hub.element);
     assert.equal(cards, 4, `任务卡数量应为 4，实际 ${cards}`);
+  });
+
+  // 「没有需要处理的卡片」曾被渲染成红色「提交失败」，用户既不知道原因也没有出口。
+  // 现在：说明内容未变化 → 给一条「仍然重新打标」→ 重跑必须带 force=true。
+  await check('空提交：说明原因而不是「提交失败」，并能一键强制重跑', async () => {
+    const base = createFakeApi();
+    let forced = null;
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (String(path).startsWith('/jobs/analyze')) {
+          base.calls.push(['api', path, options && options.body]);
+          const body = (options && options.body) || {};
+          if (body.force) {
+            forced = body;
+            return { success: true, run_id: 'run-forced', total: 1, skipped: 0 };
+          }
+          return {
+            success: true,
+            run_id: '',
+            total: 0,
+            code: 'nothing_to_process',
+            skipped: 1,
+            reasons: { unchanged: 1 },
+            details: [{
+              card_id: 'a.json', reason: 'unchanged',
+              profile_id: 'builtin-analyze', model: 'm1', analyzed_at: 1700000000,
+            }],
+            message: '这 1 张卡片已经在相同提示词档案/模型下分析过，且内容没有变化，所以没有提交。',
+          };
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createTaskPanel } = await import('../frontend/views/task.js');
+    const { createClient } = await import('../frontend/api.js');
+    const client = createClient(patched);
+    const panel = createTaskPanel(
+      patched, client, { providerId: 'p1', model: 'm1', notifyReview: () => {} }, 'analyze',
+    );
+    await panel.refresh();
+    panel.applyContext({
+      source: 'context',
+      target: { kind: 'folder', mode: 'cards', path: '科幻' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    const start = collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes('开始'));
+    assert.ok(start, '缺少「开始」按钮');
+    start.click();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    const texts = collect(panel.element, () => true).map((node) => String(node.textContent || ''));
+    assert.equal(texts.some((text) => text.includes('提交失败')), false, '空提交不该显示「提交失败」');
+    assert.ok(texts.some((text) => text.includes('内容未变化')), '没有说明「内容未变化」');
+    assert.ok(texts.some((text) => text.includes('a.json')), '没有列出被跳过的卡片');
+
+    const retry = collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes('仍然重新打标'));
+    assert.ok(retry, '没有「仍然重新打标」按钮');
+    retry.click();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.ok(forced && forced.force === true, '重跑没有带 force=true');
   });
 
   for (const [name, verdict, message] of results) {

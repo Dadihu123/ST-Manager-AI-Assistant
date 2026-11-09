@@ -381,6 +381,10 @@ def resolve_candidates(tag_library, pool, *, card=None) -> dict:
 #: 没有单独设置的分类，默认置信度门槛（用户定的：未展开 = 0.5）
 DEFAULT_CATEGORY_CONFIDENCE = 0.5
 
+#: 一次最多打几个标签的上限（与 manifest `config_schema.max_tags.maximum` 保持一致）。
+#: 之前是 20，用户在宿主配置页填 30 会被夹成 20，看起来像「两个地方数量对不上」。
+MAX_LABEL_COUNT = 99
+
 #: 一次最多接受多少个分类规则（防脏数据）
 MAX_RULE_CATEGORIES = 100
 
@@ -408,7 +412,7 @@ def _to_quota(value):
         number = int(float(value))
     except (TypeError, ValueError):
         return None
-    return max(0, number)
+    return max(0, min(MAX_LABEL_COUNT, number))
 
 
 def normalize_rules(raw) -> dict:

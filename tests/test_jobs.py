@@ -222,6 +222,25 @@ def test_saved_limits_reach_prompt_and_truncation(api, store, monkeypatch, stub_
     assert len(result['summary']) == 500, '概览 500 字在 600 字上限内，不得被截'
 
 
+def test_auto_mode_marks_applied_and_records_history(api, store, stub_llm, stub_bridge):
+    """auto 模式真的写了卡，就要记「已落地」并进历史。
+
+    否则结果队列会把它当成「已接受 · 待落地」再显示一遍，用户以为没自动落地。
+    """
+    ctx = run_job(api, store, payload={'apply_mode': 'auto'})
+
+    meta = store.get_card_meta('Alice.png')
+    assert ctx.run_id in (meta.get('applied_runs') or []), 'auto 落地要记 applied_runs'
+    assert int(meta.get('applied_at') or 0) > 0
+
+    dates = store.history_dates()
+    assert dates and dates[0]['count'] == 1
+    entry = store.history_entries(dates[0]['date'])[0]
+    assert entry['accepted'] is True
+    assert entry['run_id'] == ctx.run_id
+    assert entry['card_id'] == 'Alice.png'
+
+
 def test_auto_mode_records_card_meta(api, store, stub_llm, stub_bridge):
     run_job(api, store, payload={'apply_mode': 'auto'})
     meta = store.get_card_meta('Alice.png')
