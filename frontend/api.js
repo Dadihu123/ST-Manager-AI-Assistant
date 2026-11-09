@@ -110,6 +110,31 @@ export function createClient(api) {
         body: { status },
       }),
 
+    /** 审批页「手动添加标签」：整组替换（增删都走这里）。 */
+    saveManualTags: (runId, itemKey, tags) => call(
+      `/jobs/${encodeURIComponent(runId)}/items/${encodeURIComponent(itemKey)}/manual-tags`,
+      { method: 'POST', body: { tags } },
+    ),
+
+    // AI 打标历史记录
+    history: (date) => call(`/history${date ? `?date=${encodeURIComponent(date)}` : ''}`),
+    reviewQueue: (runId) => call(`/review/queue${runId ? `?run_id=${encodeURIComponent(runId)}` : ''}`),
+    /** 让主程序走一次完整保存，刷新卡片网格的「本地备注」缓存（落地后调用）。 */
+    syncCardNoteCache: (payload) => call('/cards/note-cache-sync', {
+      method: 'POST',
+      body: payload,
+    }),
+    deleteHistory: (entryId) => call(`/history/${encodeURIComponent(entryId)}`, { method: 'DELETE' }),
+    clearHistory: (date) => call('/history/clear', { method: 'POST', body: { date } }),
+    historyManualTags: (entryId, tags) => call(
+      `/history/${encodeURIComponent(entryId)}/manual-tags`,
+      { method: 'POST', body: { tags } },
+    ),
+    reopenHistory: (entryId) => call(
+      `/history/${encodeURIComponent(entryId)}/reopen`,
+      { method: 'POST', body: {} },
+    ),
+
     /** 批量审批：并发提交，逐条失败不影响其余。 */
     async reviewItems(runId, updates) {
       const list = Array.isArray(updates) ? updates : [];

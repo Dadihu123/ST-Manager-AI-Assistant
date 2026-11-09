@@ -222,6 +222,146 @@ def test_saved_limits_reach_prompt_and_truncation(api, store, monkeypatch, stub_
     assert len(result['summary']) == 500, '概览 500 字在 600 字上限内，不得被截'
 
 
+REMOVAL_REPLY = json.dumps({
+    'summary': '北境骑士，性格沉稳。',
+    'tags': [{'name': '奇幻', 'confidence': 0.9}],
+    'suggested_new_tags': [],
+    'tag_removals': [{'name': '奇幻', 'reason': '与卡片无关'}],
+}, ensure_ascii=False)
+
+
+def _patch_removal_llm(monkeypatch):
+    def fake_chat(messages, **kwargs):
+        return {
+            'content': REMOVAL_REPLY,
+            'usage': {'prompt_tokens': 100, 'completion_tokens': 20},
+            'usage_estimated': False,
+            'model': kwargs.get('model') or 'test-model',
+            'latency_ms': 5,
+            'attempts': 1,
+        }
+
+    monkeypatch.setattr(jobs_module.llm, 'chat', fake_chat)
+
+
+def test_auto_mode_defers_removal_suggestion_to_review(api, store, stub_bridge, monkeypatch):
+    """auto 模式未授权删除时：整条移到审批面板，等用户确认，不静默丢弃建议。"""
+    _patch_removal_llm(monkeypatch)
+
+    ctx = run_job(api, store, payload={'apply_mode': 'auto', 'apply_removals': False})
+
+    assert ctx.reports[0]['status'] == 'awaiting_review'
+    assert ctx.reports[0]['result']['needs_removal_review'] is True
+    assert ctx.reports[0]['result']['tag_removals'][0]['name'] == '奇幻'
+    assert api.applied_tags == [], '未授权时不能写标签/删标签'
+    assert stub_bridge == {}, '未授权时也不该写概览'
+    assert store.get_card_meta('Alice.png').get('applied_runs') in (None, [], ''), '不能标已落地'
+
+
+def test_auto_mode_deletes_removal_suggestion_when_authorized(api, store, stub_bridge, monkeypatch):
+    """勾选「删除模型建议删除的标签」后：auto 落地时一起删。"""
+    _patch_removal_llm(monkeypatch)
+
+    ctx = run_job(api, store, payload={'apply_mode': 'auto', 'apply_removals': True})
+
+    assert ctx.reports[0]['status'] == 'done'
+    assert api.applied_tags[-1]['remove'] == ['奇幻']
+    assert stub_bridge['Alice.png']
+
+
+def test_two_cards_review_mode_defers_all(api, store, stub_llm, stub_bridge):
+    """2 张卡 + 逐条审批：都进待审批，不写卡、不进历史。"""
+    ctx = run_job(
+        api, store,
+        items=make_items(('Alice.png', 'Bob.png')),
+        payload={'apply_mode': 'review'},
+    )
+
+    assert [report['status'] for report in ctx.reports] == [
+        'awaiting_review', 'awaiting_review',
+    ]
+    assert api.applied_tags == []
+    assert stub_bridge == {}
+    assert store.history_dates() == []
+
+
+def test_two_cards_auto_mode_lands_both(api, store, stub_llm, stub_bridge):
+    """2 张卡 + 分析完直接写入（无删除建议）：都落地、都进历史。"""
+    ctx = run_job(
+        api, store,
+        items=make_items(('Alice.png', 'Bob.png')),
+        payload={'apply_mode': 'auto'},
+    )
+
+    assert [report['status'] for report in ctx.reports] == ['done', 'done']
+    assert len(api.applied_tags) == 2
+    assert set(stub_bridge) == {'Alice.png', 'Bob.png'}
+    dates = store.history_dates()
+    assert dates and dates[0]['count'] == 2
+    assert all(entry['accepted'] is True for entry in store.history_entries(dates[0]['date']))
+
+
+def test_two_cards_auto_without_removal_permission_defers_both(
+    api, store, stub_bridge, monkeypatch,
+):
+    """2 张卡 + 不勾「删除建议标签」：两条都转待审批，不写卡、不删标签。"""
+    _patch_removal_llm(monkeypatch)
+
+    ctx = run_job(
+        api, store,
+        items=make_items(('Alice.png', 'Bob.png')),
+        payload={'apply_mode': 'auto', 'apply_removals': False},
+    )
+
+    assert [report['status'] for report in ctx.reports] == [
+        'awaiting_review', 'awaiting_review',
+    ]
+    assert all(report['result']['needs_removal_review'] for report in ctx.reports)
+    assert api.applied_tags == [], '未授权时不能删标签'
+    assert stub_bridge == {}, '未授权时也不能写概览'
+    assert store.history_dates() == [], '还没落地，不该进历史'
+
+
+def test_two_cards_auto_with_removal_permission_deletes_both(
+    api, store, stub_bridge, monkeypatch,
+):
+    """2 张卡 + 勾选「删除建议标签」：两条都落地、都删标签、都进历史。"""
+    _patch_removal_llm(monkeypatch)
+
+    ctx = run_job(
+        api, store,
+        items=make_items(('Alice.png', 'Bob.png')),
+        payload={'apply_mode': 'auto', 'apply_removals': True},
+    )
+
+    assert [report['status'] for report in ctx.reports] == ['done', 'done']
+    assert len(api.applied_tags) == 2
+    assert all(row['remove'] == ['奇幻'] for row in api.applied_tags)
+    assert set(stub_bridge) == {'Alice.png', 'Bob.png'}
+    dates = store.history_dates()
+    assert dates and dates[0]['count'] == 2
+    assert all(entry['accepted'] is True for entry in store.history_entries(dates[0]['date']))
+
+
+def test_auto_mode_marks_applied_and_records_history(api, store, stub_llm, stub_bridge):
+    """auto 模式真的写了卡，就要记「已落地」并进历史。
+
+    否则结果队列会把它当成「已接受 · 待落地」再显示一遍，用户以为没自动落地。
+    """
+    ctx = run_job(api, store, payload={'apply_mode': 'auto'})
+
+    meta = store.get_card_meta('Alice.png')
+    assert ctx.run_id in (meta.get('applied_runs') or []), 'auto 落地要记 applied_runs'
+    assert int(meta.get('applied_at') or 0) > 0
+
+    dates = store.history_dates()
+    assert dates and dates[0]['count'] == 1
+    entry = store.history_entries(dates[0]['date'])[0]
+    assert entry['accepted'] is True
+    assert entry['run_id'] == ctx.run_id
+    assert entry['card_id'] == 'Alice.png'
+
+
 def test_auto_mode_records_card_meta(api, store, stub_llm, stub_bridge):
     run_job(api, store, payload={'apply_mode': 'auto'})
     meta = store.get_card_meta('Alice.png')

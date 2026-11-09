@@ -603,6 +603,41 @@ def test_submit_analyze_skips_unchanged_cards(env):
     assert payload['details'][0]['reason'] == 'unchanged'
 
 
+def test_submit_analyze_empty_result_is_explained_not_failed(env):
+    """空提交不是失败：带 code / reasons / message，前端据此给出「仍然重新打标」。
+
+    回归：以前只回一句「没有需要处理的卡片（内容未变化或无法读取）」，
+    前端把它画成红色「提交失败」，用户既不知道是哪张卡、也不知道能强制重跑。
+    """
+    client, _api, store = env
+    from conftest import load_backend_submodule as _load  # noqa: PLC0415
+
+    hashing = _load('core.hashing')
+    store.update_card_meta('Alice.png', {
+        'content_hash': hashing.card_content_hash(dict(CARD)),
+        'profile_id': 'builtin-default',
+        'model': '',
+        'analyzed_at': 1700000000,
+    })
+
+    payload = client.post('/jobs/analyze', json={'card_ids': ['Alice.png']}).get_json()
+    assert payload['success'] is True
+    assert payload['code'] == 'nothing_to_process'
+    assert payload['reasons'] == {'unchanged': 1}
+    assert payload['details'][0]['reason'] == 'unchanged'
+    # 明细要能说清「谁在什么时候处理过」，否则用户无法判断该不该重跑
+    assert payload['details'][0]['analyzed_at'] == 1700000000
+    assert payload['details'][0]['profile_id'] == 'builtin-default'
+    assert '内容没有变化' in payload['message']
+    assert '仍然重新打标' in payload['message']
+
+    # 同一次请求带 force 就能绕过幂等（前端「仍然重新打标」走这条）
+    forced = client.post(
+        '/jobs/analyze', json={'card_ids': ['Alice.png'], 'force': True},
+    ).get_json()
+    assert forced['total'] == 1
+
+
 def test_submit_analyze_force_bypasses_idempotency(env):
     client, _api, store = env
     store.update_card_meta('Alice.png', {'content_hash': 'anything'})
@@ -615,6 +650,9 @@ def test_submit_analyze_reports_unreadable_card(env):
     payload = client.post('/jobs/analyze', json={'card_ids': ['Missing.png']}).get_json()
     assert payload['total'] == 0
     assert payload['details'][0]['reason'] == 'card_unreadable'
+    # 读不到卡片时提示必须指向「文件层面」，而不是让人去关「跳过内容未变化」
+    assert payload['reasons'] == {'card_unreadable': 1}
+    assert '读取失败' in payload['message']
 
 
 def test_submit_analyze_estimates_usage(env):
@@ -1292,7 +1330,7 @@ def test_tag_pool_saves_per_category_rules_and_total(tmp_path):
     assert payload['rules']['题材'] == {'confidence_min': 0.6, 'max_tags': 3}
     assert payload['allocation']['total'] == 5
     assert payload['allocation']['over'] == 0
-    assert api._config['max_tags'] == 6
+    assert api._ui['tag_pool_settings']['max_tags'] == 6, '最大总数量存插件私有数据'
     assert '题材' in api._config['tag_category_rules'], '规则以 JSON 字符串存'
 
     again = client.get('/tag-pool').get_json()
@@ -1318,7 +1356,7 @@ def test_tag_pool_warns_but_saves_when_quota_sum_over_total(tmp_path):
         '超过最大总数量' in text and '按总上限' in text for text in payload['warnings']
     ), payload['warnings']
     # 规则照样落盘
-    assert api._config['max_tags'] == 5
+    assert api._ui['tag_pool_settings']['max_tags'] == 5
     assert '场景' in api._config['tag_category_rules']
 
 
@@ -1333,6 +1371,70 @@ def test_tag_pool_allows_total_greater_than_quota_sum(tmp_path):
     assert payload['allocation'] == {
         'total': 2, 'max_tags': 20, 'over': 0, 'quotas': {'题材': 2},
     }
+
+
+def test_tag_pool_accepts_total_up_to_99(tmp_path):
+    """回归：最大总数量上限从 20 提到 99。
+
+    以前 schema / config / 路由三处都夹到 20，用户在宿主配置页填 30，
+    存下来的就是 20 —— 表现为「宿主显示 30、插件显示 20」。
+    """
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+
+    payload = client.post('/tag-pool', json={'max_tags': 30}).get_json()
+    assert payload['success'] is True
+    assert payload['max_tags'] == 30, '30 不该再被夹成 20'
+    assert api._ui['tag_pool_settings']['max_tags'] == 30, '30 不该再被夹成 20'
+
+    assert client.get('/tag-pool').get_json()['max_tags'] == 30, '读回来也要是 30'
+
+    payload = client.post('/tag-pool', json={'max_tags': 99}).get_json()
+    assert payload['success'] is True and payload['max_tags'] == 99
+
+    response = client.post('/tag-pool', json={'max_tags': 100})
+    assert response.status_code == 400
+
+
+def test_tag_pool_saves_even_when_private_update_returns_none(tmp_path):
+    """回归：主程序 `api.private.update()` 成功时返回 `None`。
+
+    拿返回值判断会把「写成功了」误判成「私有数据不可写」——
+    真机现象就是弹窗「最大总数量保存失败（插件私有数据不可写）」，
+    而 `ui_data` 里其实已经写进去了。
+    """
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    real_update = api.private.update
+
+    def update_returns_none(mutator):
+        real_update(mutator)   # 真正写入
+        return None            # 但返回值是 None（宿主实测）
+
+    api.private.update = update_returns_none
+
+    payload = client.post('/tag-pool', json={'max_tags': 30}).get_json()
+
+    assert payload['success'] is True
+    assert payload['max_tags'] == 30
+    assert api._ui['tag_pool_settings']['max_tags'] == 30
+
+
+def test_tag_pool_migrates_legacy_config_max_tags_to_private(tmp_path):
+    """旧版本把 max_tags 存在主程序配置里；首次读取要搬到插件私有数据。
+
+    否则用户在插件管理页保存一次配置，宿主会把这个「未声明」的键丢掉，
+    最大总数量就悄悄回到默认值。
+    """
+    client, api, _store = build_app(tag_library=TAG_LIBRARY, tmp_path=tmp_path)
+    api._config['max_tags'] = 30
+
+    payload = client.get('/tag-pool').get_json()
+
+    assert payload['max_tags'] == 30
+    assert api._ui['tag_pool_settings']['max_tags'] == 30, '首次读取应迁移到私有数据'
+
+    # 私有数据优先于旧的 config 值
+    api._ui['tag_pool_settings'] = {'max_tags': 12}
+    assert client.get('/tag-pool').get_json()['max_tags'] == 12
 
 
 def test_tag_pool_rejects_invalid_total(tmp_path):
@@ -1472,6 +1574,363 @@ def test_suggestions_clear_still_works(tmp_path):
     assert payload['success'] is True
     assert payload['removed'] == ['真的新标签']
     assert store.list_tag_suggestions() == {}
+
+
+# ------------------------------------------------------------------ 手动添加标签（审批页）
+#
+# 用户定的行为：**落地之后**才允许手动加；点「添加」立即写卡（不再等下一次落地）。
+
+
+def _manual_env(tmp_path):
+    client, api, store = build_app(
+        cards={'Alice.png': dict(CARD, tags=[])},
+        db_rows=[job_item_row()],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+    return client, api, store
+
+
+def test_manual_tags_apply_immediately(tmp_path):
+    client, api, store = _manual_env(tmp_path)
+
+    payload = client.post(
+        '/jobs/run-1/items/Alice.png/manual-tags',
+        json={'tags': '塔罗、占卜师/塔罗'},
+    ).get_json()
+
+    assert payload['success'] is True
+    assert payload['added'] == ['塔罗', '占卜师'], '分隔符全认 + 去重 + 立即写入'
+    assert 'manual-tags' not in str(payload), '响应不再有「保存到队列」的语义'
+
+    written = [row for row in api.applied_tags if row['add']]
+    assert written[-1]['add'] == ['塔罗', '占卜师'], '立即写卡'
+    # 记录仍留一份（文件），但不影响卡片行为
+    assert store.manual_tags('run-1')['Alice.png']['tags'] == ['塔罗', '占卜师']
+
+
+def test_manual_tags_do_not_require_landed_item(tmp_path):
+    """用户手动加标签是用户自己的操作：**不判断是否落地**，随时可加、立即写卡。"""
+    client, api, _store = _manual_env(tmp_path)
+
+    payload = client.post(
+        '/jobs/run-1/items/Alice.png/manual-tags', json={'tags': ['塔罗']},
+    ).get_json()
+
+    assert payload['success'] is True
+    assert payload['added'] == ['塔罗']
+    assert api.applied_tags[-1]['add'] == ['塔罗']
+
+
+def test_manual_tags_rejects_unknown_item(tmp_path):
+    client, _api, _store = _manual_env(tmp_path)
+
+    response = client.post(
+        '/jobs/run-1/items/nope.png/manual-tags', json={'tags': ['塔罗']},
+    )
+
+    assert response.status_code == 404
+    assert response.get_json()['success'] is False
+
+
+def test_manual_tags_report_skipped_blacklist(tmp_path):
+    """宿主黑名单/库锁挡下的标签：如实返回，且不算「已添加」。"""
+    client, api, store = _manual_env(tmp_path)
+
+    def apply_tags(card_ids, *, add=(), remove=(), replace=False):
+        api.applied_tags.append({
+            'card_ids': list(card_ids), 'add': list(add), 'remove': list(remove),
+            'replace': replace,
+        })
+        skipped = ['现代'] if '现代' in add else []
+        return {
+            'updated': len(card_ids),
+            'added': [name for name in add if name not in skipped],
+            'removed': list(remove),
+            'failed': [],
+            'skipped_unknown': [],
+            'skipped_blacklist': skipped,
+        }
+
+    api.cards.apply_tags = apply_tags
+    payload = client.post(
+        '/jobs/run-1/items/Alice.png/manual-tags', json={'tags': ['现代', '塔罗']},
+    ).get_json()
+
+    assert payload['added'] == ['塔罗']
+    assert payload['skipped_blacklist'] == ['现代']
+    assert store.manual_tags('run-1')['Alice.png']['tags'] == ['塔罗']
+
+
+def test_manual_tags_save_when_private_update_returns_none(tmp_path):
+    """回归：宿主 `private.update()` 成功时返回 None，不能被当成失败。"""
+    client, api, _store = _manual_env(tmp_path)
+    real_update = api.private.update
+
+    def update_returns_none(mutator):
+        real_update(mutator)
+        return None
+
+    api.private.update = update_returns_none
+
+    payload = client.post(
+        '/jobs/run-1/items/Alice.png/manual-tags', json={'tags': ['塔罗']},
+    ).get_json()
+
+    assert payload['success'] is True
+    assert payload['added'] == ['塔罗']
+    assert store_module.PluginStore(api).manual_tags('run-1')['Alice.png']['tags'] == ['塔罗']
+
+
+def test_note_cache_sync_saves_full_card_payload(tmp_path, monkeypatch):
+    """备注图标修复：按主程序完整保存流程提交「当前卡片数据 + 新备注」。"""
+    client, _api, _store = build_app(
+        cards={'Alice.png': dict(CARD)}, tmp_path=tmp_path,
+    )
+    calls = []
+
+    def fake_post(url, payload, timeout=15):
+        calls.append((url, payload))
+        if 'get_card_detail' in url:
+            return {
+                'success': True,
+                'card': {
+                    'char_name': CARD['name'],
+                    'description': CARD['description'],
+                    'first_mes': CARD['first_mes'],
+                    'tags': [],
+                    'character_book': dict(CARD['character_book']),
+                },
+            }
+        return {'success': True}
+
+    monkeypatch.setattr(routes_module, '_http_post_json', fake_post)
+
+    payload = client.post('/cards/note-cache-sync', json={
+        'base_url': 'http://127.0.0.1:5000',
+        'card_ids': ['Alice.png'],
+    }).get_json()
+
+    assert payload['success'] is True and payload['synced'] == 1
+    url, data = calls[0]
+    assert url.endswith('/api/update_card')
+    assert data['id'] == 'Alice.png'
+    assert data['name'] == 'Alice', '必须带完整卡片字段，不能只传 id+备注'
+    assert 'description' in data and 'first_mes' in data
+    assert 'ui_summary' in data
+
+    # 保存失败要如实回报（并且尝试回滚快照）
+    monkeypatch.setattr(
+        routes_module, '_http_post_json',
+        lambda url, data, timeout=15: (_ for _ in ()).throw(RuntimeError('boom')),
+    )
+    failed = client.post('/cards/note-cache-sync', json={
+        'base_url': 'http://127.0.0.1:5000',
+        'card_ids': ['Alice.png'],
+    }).get_json()
+    assert failed['synced'] == 0
+    assert failed['failed'] and failed['failed'][0]['card_id'] == 'Alice.png'
+
+
+def test_note_cache_sync_requires_base_url(tmp_path):
+    client, _api, _store = build_app(cards={'Alice.png': dict(CARD)}, tmp_path=tmp_path)
+    payload = client.post('/cards/note-cache-sync', json={'card_ids': ['Alice.png']}).get_json()
+    assert payload['success'] is False
+
+
+# ------------------------------------------------------------------ AI 打标历史记录
+
+
+def _history_env(tmp_path):
+    client, api, store = build_app(
+        cards={'Alice.png': dict(CARD, tags=[])},
+        db_rows=[job_item_row()],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+    return client, api, store
+
+
+def test_apply_writes_history_and_hides_item_from_review(tmp_path):
+    client, _api, store = _history_env(tmp_path)
+
+    client.post('/jobs/run-1/apply', json={}).get_json()
+
+    dates = store.history_dates()
+    assert len(dates) == 1 and dates[0]['count'] == 1
+    entry = store.history_entries(dates[0]['date'])[0]
+    assert entry['card_id'] == 'Alice.png'
+    assert entry['summary'] == 'AI 生成的概览'
+    assert entry['accepted'] is True, '落地成功的记录标已接受'
+    assert entry['tags'][0]['name'] == '奇幻'
+
+    # 「结果与审批」里不再出现已落地的条目
+    job = client.get('/jobs/run-1').get_json()
+    assert job['items_total'] == 0
+    assert job['items'] == []
+
+
+def test_history_endpoints(tmp_path):
+    client, _api, store = _history_env(tmp_path)
+    client.post('/jobs/run-1/apply', json={}).get_json()
+    entry = store.history_entries(store.history_dates()[0]['date'])[0]
+    entry_id = entry['entry_id']
+
+    data = client.get('/history').get_json()
+    assert data['date'] == store.history_dates()[0]['date']
+    assert [item['entry_id'] for item in data['entries']] == [entry_id]
+
+    saved = client.post(
+        f'/history/{entry_id}/manual-tags', json={'tags': '塔罗、占卜师'},
+    ).get_json()
+    assert saved['added'] == ['塔罗', '占卜师']
+    assert [tag['name'] for tag in store.get_history_entry(entry_id)['tags']] == [
+        '奇幻', '塔罗', '占卜师',
+    ]
+
+    cleared = client.post('/history/clear', json={'date': data['date']}).get_json()
+    assert cleared['removed'] == 1
+    assert client.get('/history').get_json()['entries'] == []
+
+
+def test_history_delete_entry(tmp_path):
+    client, _api, store = _history_env(tmp_path)
+    client.post('/jobs/run-1/apply', json={}).get_json()
+    entry = store.history_entries(store.history_dates()[0]['date'])[0]
+
+    assert client.delete(f"/history/{entry['entry_id']}").status_code == 200
+    assert store.history_entries(store.history_dates()[0]['date'] if store.history_dates() else '') == []
+    assert client.delete(f"/history/{entry['entry_id']}").status_code == 404
+
+
+def test_history_reopen_restores_review_item(tmp_path):
+    client, _api, store = _history_env(tmp_path)
+    client.post('/jobs/run-1/apply', json={}).get_json()
+    entry = store.history_entries(store.history_dates()[0]['date'])[0]
+
+    payload = client.post(f"/history/{entry['entry_id']}/reopen").get_json()
+
+    assert payload['reopened'] is True
+    assert store.get_history_entry(entry['entry_id']) == {}
+    assert store.get_card_meta('Alice.png')['applied_runs'] == []
+    job = client.get('/jobs/run-1').get_json()
+    assert job['items_total'] == 1, '改回待审批后条目应重新出现在审批列表'
+
+
+def test_history_reopen_requires_existing_job(tmp_path):
+    client, api, store = _history_env(tmp_path)
+    client.post('/jobs/run-1/apply', json={}).get_json()
+    entry = store.history_entries(store.history_dates()[0]['date'])[0]
+    api.job_detail = None  # 原作业被清理
+
+    response = client.post(f"/history/{entry['entry_id']}/reopen")
+
+    assert response.status_code == 409
+    assert '已被清理' in response.get_json()['msg']
+
+
+
+
+
+def test_status_counts_pending_from_actual_items(tmp_path):
+    """任务中心的「待审批」按实际条目算，不依赖可能写不进去的登记表。"""
+    client, api, store = build_app(db_rows=[job_item_row(status='done')], tmp_path=tmp_path)
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+    store.record_run({
+        'run_id': 'run-1', 'task': 'analyze', 'job_type': 'ai.analyze',
+        'counts': {'review': 1},
+    })
+    store.mark_pending_review('run-1', 'ai.analyze', 1)
+
+    data = client.get('/status').get_json()
+    assert data['pending_reviews'] == {}, '条目都已接受（无待审批）时不该再算待审批'
+
+    # 还有待审批条目时，即使登记表是空的也要算出来
+    api._db_rows[0]['status'] = 'awaiting_review'
+    store.clear_pending_review('run-1')
+    data = client.get('/status').get_json()
+    assert 'run-1' in data['pending_reviews']
+    assert data['pending_reviews']['run-1']['items'] == 1
+
+
+def test_review_queue_returns_pending_and_done_across_runs(tmp_path):
+    """审批面板不再按作业切换：队列返回所有作业里待处理的结果。"""
+    client, api, store = build_app(
+        cards={'Alice.png': dict(CARD, tags=[]), 'Bob.png': dict(CARD, tags=[])},
+        db_rows=[
+            job_item_row(),
+            job_item_row(
+                item_key='Bob.png',
+                status='done',
+                result_overrides={'card_id': 'Bob.png', 'ui_key': 'Bob.png'},
+            ),
+        ],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+    store.record_run({'run_id': 'run-1', 'task': 'analyze', 'job_type': 'ai.analyze'})
+
+    data = client.get('/review/queue').get_json()
+
+    assert [item['key'] for item in data['items']] == ['Alice.png', 'Bob.png']
+    assert all(item['run_id'] == 'run-1' for item in data['items'])
+    assert all(item['job_type'] == 'ai.analyze' for item in data['items'])
+    assert data['runs'][0]['count'] == 2
+
+    assert client.get('/review/queue?run_id=run-1').get_json()['total'] == 2
+    assert client.get('/review/queue?run_id=other').get_json()['total'] == 0
+
+
+def test_review_hides_skipped_item_and_marks_not_accepted(tmp_path):
+    """被拒绝（已跳过）的条目也进历史，并标「未接受」。"""
+    client, api, store = build_app(
+        cards={'Alice.png': dict(CARD, tags=[])},
+        db_rows=[job_item_row(status='skipped')],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+
+    job = client.get('/jobs/run-1').get_json()
+    assert job['items_total'] == 0, '已跳过的条目不该再出现在审批列表'
+
+    dates = store.history_dates()
+    assert dates and dates[0]['count'] == 1
+    entry = store.history_entries(dates[0]['date'])[0]
+    assert entry['accepted'] is False, '跳过的记录要标未接受'
+    assert entry['card_id'] == 'Alice.png'
+
+
+def test_review_hides_legacy_auto_applied_and_backfills(tmp_path):
+    """旧版 auto 结果（result.applied=true）没有落地标记：补记后从队列隐藏。"""
+    client, api, store = build_app(
+        cards={'Alice.png': dict(CARD, tags=[])},
+        db_rows=[job_item_row(result_overrides={'applied': True})],
+        tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+
+    job = client.get('/jobs/run-1').get_json()
+
+    assert job['items_total'] == 0
+    dates = store.history_dates()
+    assert dates and dates[0]['count'] == 1
+    assert store.history_entries(dates[0]['date'])[0]['accepted'] is True
+    assert 'run-1' in (store.get_card_meta('Alice.png').get('applied_runs') or [])
+
+
+def test_review_hides_legacy_applied_and_backfills_history(tmp_path):
+    """功能上线前就落地的条目：审批列表隐藏，并自动补一份历史快照。"""
+    client, _api, store = _history_env(tmp_path)
+    store.update_card_meta('Alice.png', {'applied_runs': ['run-1'], 'applied_at': 1794200000})
+
+    job = client.get('/jobs/run-1').get_json()
+
+    assert job['items_total'] == 0, '已落地的条目不该再出现在审批列表'
+    dates = store.history_dates()
+    assert dates and dates[0]['count'] == 1
+    entry = store.history_entries(dates[0]['date'])[0]
+    assert entry['card_id'] == 'Alice.png'
+    assert entry['summary'] == 'AI 生成的概览'
 
 
 # ------------------------------------------------------------------ 归类落地：弃权不得移动

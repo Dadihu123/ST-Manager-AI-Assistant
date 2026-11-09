@@ -147,6 +147,12 @@ def test_normalize_rules_accepts_dict_and_json():
     assert tagpool.normalize_rules(None) == {}
 
 
+def test_normalize_rules_clamps_quota_to_max_label_count():
+    rules = tagpool.normalize_rules({'人设': {'max_tags': 500}})
+    assert rules['人设']['max_tags'] == tagpool.MAX_LABEL_COUNT
+    assert tagpool.MAX_LABEL_COUNT == 99
+
+
 def test_rule_for_uses_default_confidence_and_unlimited_quota():
     rule = tagpool.rule_for({}, '人设')
     assert rule['confidence_min'] == 0.5

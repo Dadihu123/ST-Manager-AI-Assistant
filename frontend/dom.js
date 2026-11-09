@@ -307,6 +307,9 @@ export function createUi(api) {
       if (destroyed || trigger.disabled) return;
       fitMenu();
       menu.hidden = false;
+      // 某些宿主容器的 `[hidden]` 会被组件自身的 display:flex 覆盖；
+      // 这里直接压内联样式，保证「收起」一定看得见。
+      menu.style.display = '';
       trigger.setAttribute('aria-expanded', 'true');
       wrapper.classList.add('is-open');
       const selected = menu.querySelector('[aria-selected="true"]')
@@ -355,6 +358,7 @@ export function createUi(api) {
     function close(focusTrigger = false) {
       if (menu.hidden) return;
       menu.hidden = true;
+      menu.style.display = 'none';
       trigger.setAttribute('aria-expanded', 'false');
       wrapper.classList.remove('is-open');
       // 复位内联高度，避免窗口尺寸变化后沿用上一次的钳位结果

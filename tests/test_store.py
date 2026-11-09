@@ -319,29 +319,34 @@ def test_card_meta_is_persisted_to_jsonl(store):
     assert records and records[-1]['ui_key'] == 'card-a'
 
 
-def test_card_meta_ui_snapshot_is_size_limited(store, api):
-    for index in range(20):
-        store.update_card_meta(f'card-{index}', {'blob': 'x' * 20000})
+def test_card_meta_is_not_mirrored_into_ui_data(store, api):
+    """card_meta 不再镜像进 ui_data（镜像曾占 ~180 KiB，顶爆宿主配额）。"""
+    store.update_card_meta('card-a', {'summary': '概览'})
 
-    snapshot = api.private.read().get('card_meta') or {}
-    size = len(json.dumps(snapshot, ensure_ascii=False).encode('utf-8'))
-    assert size <= store_module.CARD_META_UI_BYTES_LIMIT
+    assert 'card_meta' not in (api.private.read() or {}), 'ui_data 里不该再有镜像'
+    assert store.get_card_meta('card-a')['summary'] == '概览', '数据仍从文件缓存读取'
 
 
-def test_card_meta_ui_snapshot_is_count_limited(store, api):
-    for index in range(store_module.CARD_META_UI_LIMIT + 50):
+def test_card_meta_ui_mirror_is_migrated_before_removal(store, api):
+    """迁移：只在 ui_data 镜像里的记录要先落文件，再删镜像（不能丢 applied_runs）。"""
+    ui = api.private.read()
+    ui['card_meta'] = {'legacy-card': {
+        'ui_key': 'legacy-card', 'n': 1, 'applied_runs': ['run-old'],
+    }}
+    api.private.update(lambda entry: entry.update({'card_meta': ui['card_meta']}))
+
+    store.sync_card_meta_ui()
+
+    assert 'card_meta' not in (api.private.read() or {})
+    assert store.get_card_meta('legacy-card')['applied_runs'] == ['run-old']
+
+
+def test_full_card_meta_survives_ui_removal(store):
+    for index in range(120):
         store.update_card_meta(f'card-{index}', {'n': index})
 
-    snapshot = api.private.read().get('card_meta') or {}
-    assert len(snapshot) <= store_module.CARD_META_UI_LIMIT
-
-
-def test_full_card_meta_survives_ui_trimming(store):
-    for index in range(store_module.CARD_META_UI_LIMIT + 20):
-        store.update_card_meta(f'card-{index}', {'n': index})
-
-    # 热缓存被裁剪，但 jsonl 里仍能查到最早那张卡
     assert store.get_card_meta('card-0')['n'] == 0
+    assert store.get_card_meta('card-119')['n'] == 119
 
 
 # ------------------------------------------------------------------ 建议队列与用量
@@ -399,3 +404,111 @@ def test_atomic_write_leaves_no_temp_file(store):
     store.save_profile(make_profile('atomic', name='A'))
     directory = store.prompts_dir()
     assert not [name for name in os.listdir(directory) if name.endswith('.tmp')]
+
+# ------------------------------------------------------------------ 手动标签（审批页）
+
+
+def test_manual_tags_normalize_input():
+    """分隔符全认；去空白/去重/限长/限个数。"""
+    assert store_module.normalize_manual_tags('塔罗、占卜师/塔罗，都市异能;预知')
+    assert store_module.normalize_manual_tags('塔罗、占卜师/塔罗，都市异能;预知') == [
+        '塔罗', '占卜师', '都市异能', '预知',
+    ]
+    assert store_module.normalize_manual_tags('  ') == []
+    assert store_module.normalize_manual_tags(None) == []
+    assert store_module.normalize_manual_tags('x' * 40) == [], '超长标签直接丢'
+    many = ','.join(f't{i}' for i in range(50))
+    assert len(store_module.normalize_manual_tags(many)) == store_module.MANUAL_TAGS_PER_ITEM
+
+
+def test_manual_tags_set_and_mark_applied(store):
+    store.record_run({'run_id': 'run-1', 'task': 'analyze'})
+
+    saved = store.set_manual_tags('run-1', 'Alice.png', ['塔罗', '占卜师'])
+    assert saved['tags'] == ['塔罗', '占卜师']
+    assert store.manual_tags('run-1')['Alice.png']['tags'] == ['塔罗', '占卜师']
+
+    assert store.mark_manual_applied('run-1', 'Alice.png', ['塔罗']) is True
+    entry = store.manual_tags('run-1')['Alice.png']
+    assert entry['applied'] == ['塔罗']
+
+    # 整组替换时：移除的标签不再保留「已写」状态
+    store.set_manual_tags('run-1', 'Alice.png', ['占卜师'])
+    entry = store.manual_tags('run-1')['Alice.png']
+    assert entry['tags'] == ['占卜师']
+    assert entry['applied'] == [], '被移除的标签不该还记着已写入'
+
+
+def test_manual_tags_follow_run_lifecycle(store):
+    for index in range(3):
+        store.record_run({'run_id': f'run-{index}', 'task': 'analyze', 'created_at': index})
+        store.set_manual_tags(f'run-{index}', 'Alice.png', [f'tag{index}'])
+
+    assert set(store.manual_tags('run-1')) == {'Alice.png'}
+    store.forget_run('run-1')
+    assert store.manual_tags('run-1') == {}, '作业被遗忘时，手动标签一起清掉'
+    assert store.manual_tags('run-2'), '别的作业不受影响'
+
+
+def test_manual_tags_are_pruned_with_ledger(store):
+    # 先给「老作业」写手动标签，再灌满台账把它挤掉
+    store.record_run({'run_id': 'run-0', 'task': 'analyze', 'created_at': 0})
+    store.set_manual_tags('run-0', 'Alice.png', ['旧标签'])
+    for index in range(1, 55):
+        store.record_run({'run_id': f'run-{index}', 'task': 'analyze', 'created_at': index})
+
+    ui_runs = store.read_ui().get('runs') or {}
+    assert 'run-0' not in ui_runs, '台账只保留最近 50 条'
+    assert store.manual_tags('run-0') == {}, '被台账裁掉的作业，手动标签一起清掉'
+
+    store.set_manual_tags('run-54', 'Alice.png', ['塔罗'])
+    assert store.manual_tags('run-54')['Alice.png']['tags'] == ['塔罗']
+
+# ------------------------------------------------------------------ AI 打标历史记录
+
+
+def test_history_record_and_group_by_local_date(store):
+    now = int(store_module.time.time())
+    store.record_history({
+        'entry_id': 'e1', 'run_id': 'r1', 'item_key': 'a', 'card_id': 'a',
+        'applied_at': now, 'tags': [{'name': '奇幻', 'confidence': 0.9}],
+    })
+    store.record_history({
+        'entry_id': 'e2', 'run_id': 'r1', 'item_key': 'b', 'card_id': 'b',
+        'applied_at': now - 86400,
+    })
+
+    dates = store.history_dates()
+    assert len(dates) == 2
+    assert dates[0]['count'] == 1
+    today = store.history_entries(dates[0]['date'])
+    assert [entry['entry_id'] for entry in today] == ['e1']
+    assert today[0]['tags'][0]['name'] == '奇幻'
+
+
+def test_history_upsert_delete_and_clear(store):
+    now = int(store_module.time.time())
+    day = store_module.history_day(now)
+    store.record_history({'entry_id': 'e1', 'run_id': 'r1', 'item_key': 'a', 'applied_at': now})
+    store.record_history({'entry_id': 'e1', 'run_id': 'r1', 'item_key': 'a', 'applied_at': now,
+                          'summary': '更新过的概览'})
+
+    entry = store.get_history_entry('e1')
+    assert entry['summary'] == '更新过的概览', '同一条目重复落地应更新而不是重复'
+    assert len(store.history_entries(day)) == 1
+
+    store.record_history({'entry_id': 'e2', 'run_id': 'r1', 'item_key': 'b', 'applied_at': now})
+    assert store.clear_history_date(day) == 2
+    assert store.history_dates() == []
+
+
+def test_history_update_entry(store):
+    now = int(store_module.time.time())
+    store.record_history({'entry_id': 'e1', 'run_id': 'r1', 'item_key': 'a',
+                          'applied_at': now, 'tags': []})
+
+    updated = store.update_history_entry('e1', {'tags': [{'name': '塔罗'}]})
+
+    assert updated['tags'] == [{'name': '塔罗'}]
+    assert store.get_history_entry('e1')['tags'] == [{'name': '塔罗'}]
+    assert store.update_history_entry('missing', {'tags': []}) == {}
