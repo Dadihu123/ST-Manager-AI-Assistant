@@ -9,6 +9,7 @@
 - 写 `data/plugins/<id>/data/` 不需要 `suppress_fs_events()`（该目录不在扫描器监视范围）。
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -40,9 +41,12 @@ PROVIDERS_FILENAME = 'providers.json'
 CARD_META_FILENAME = 'card_meta.jsonl'
 USAGE_FILENAME = 'usage.jsonl'
 
-CARD_META_UI_LIMIT = 800
-CARD_META_UI_BYTES_LIMIT = 200 * 1024
 JSONL_COMPACT_BYTES = 8 * 1024 * 1024
+
+#: 热缓存最多镜像多少条卡片元数据（条数上限）。
+CARD_META_UI_LIMIT = 800
+#: 热缓存的自身体积上限；实际预算还会被 `card_meta_budget()` 按配额余额压低。
+CARD_META_UI_BYTES_LIMIT = 200 * 1024
 
 #: 宿主给单个插件命名空间的配额（`core/plugins/api.py:72`，超出即整笔拒写）。
 HOST_UI_QUOTA_BYTES = 256 * 1024
@@ -72,6 +76,67 @@ TAG_SUGGESTION_CARDS_MAX = 50
 
 PROVIDER_ID_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,31}$')
 DEFAULT_BASE_URL = 'https://api.openai.com/v1'
+
+#: 审批页里用户手写的标签：存**插件数据目录的文件**（不进 ui_data）。
+#: 为什么不用 ui_data：宿主对插件命名空间有体积配额（约 256 KiB），超了会整次拒绝写入。
+MANUAL_TAGS_FILENAME = 'manual_tags.json'
+MANUAL_TAGS_PER_ITEM = 20
+MANUAL_TAG_MAX_CHARS = 32
+
+#: AI 打标历史记录：落地成功时写一份快照（文件存储，不进 ui_data）。
+#: 为什么快照：主程序的作业条目会被清理/重跑覆盖，历史要能独立查看。
+HISTORY_FILENAME = 'history.json'
+
+
+def normalize_manual_tags(raw) -> list:
+    """把用户输入收敛成标签列表：去空白、去重、限长、限个数。
+
+    输入既接受数组，也接受一串文本（分隔符与 UI 一致：中英文逗号/分号/顿号/斜杠/换行）。
+    """
+    if isinstance(raw, str):
+        parts = re.split(r'[,，;；、/\n\r]+', raw)
+    elif isinstance(raw, (list, tuple, set)):
+        parts = [str(item or '') for item in raw]
+    else:
+        return []
+
+    result = []
+    for part in parts:
+        name = str(part or '').strip()
+        if not name or len(name) > MANUAL_TAG_MAX_CHARS:
+            continue
+        if name not in result:
+            result.append(name)
+        if len(result) >= MANUAL_TAGS_PER_ITEM:
+            break
+    return result
+
+
+def _prune_manual_tags(manual, ledger) -> dict:
+    """只保留仍在作业台账里的 run（手动标签的生命周期跟随作业）。"""
+    if not isinstance(manual, dict):
+        return {}
+    known = set(ledger.keys()) if isinstance(ledger, dict) else set()
+    if not known:
+        return manual
+    return {run_id: value for run_id, value in manual.items() if run_id in known}
+
+
+def history_entry_id(run_id, item_key) -> str:
+    """历史记录稳定 id：同一作业的同一条目重复落地时**更新**而不是新增。"""
+    raw = f'{run_id}\x00{item_key}'.encode('utf-8')
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def history_day(applied_at) -> str:
+    """落地时间 → 本地日期 `YYYY-MM-DD`（历史列表按这个分组）。"""
+    try:
+        stamp = int(applied_at or 0)
+    except (TypeError, ValueError):
+        return ''
+    if stamp <= 0:
+        return ''
+    return time.strftime('%Y-%m-%d', time.localtime(stamp))
 
 #: 支持的 API 协议（唯一来源是 `backend/protocols.py`，这里只做本地引用以便校验）
 API_STYLES = protocols.PROTOCOLS
@@ -209,6 +274,12 @@ class PluginStore:
 
     def usage_path(self) -> str:
         return os.path.join(self.data_dir(), USAGE_DIRNAME, USAGE_FILENAME)
+
+    def manual_tags_path(self) -> str:
+        return os.path.join(self.data_dir(), MANUAL_TAGS_FILENAME)
+
+    def history_path(self) -> str:
+        return os.path.join(self.data_dir(), HISTORY_FILENAME)
 
     # ------------------------------------------------------------ 文件工具
 
@@ -369,6 +440,12 @@ class PluginStore:
 
         现在失败会记一行 warning 并写进 `last_write_state()`，供 `/status` 与
         日志侧排查。
+
+        返回值判定：**只有显式 `False` 才算失败**。当前宿主的
+        `_ui_data_update` 返回 `bool(update_ui_data(...))`，用 `bool()` 也对；
+        但某些调用路径（历史版本 / 将来的包装）成功时返回 `None`，`bool(None)`
+        会把每次成功都误判成失败（真机表现：手动标签保存报「写入未生效」，
+        其实已经写进去了）。用 `is not False` 同时兼容两种返回值。
         """
         self._write_attempts += 1
 
@@ -377,7 +454,7 @@ class PluginStore:
             return None
 
         try:
-            ok = bool(self._api.private.update(_inner))
+            ok = self._api.private.update(_inner) is not False
         except Exception as exc:  # noqa: BLE001
             logger.warning('写入插件 ui_data 命名空间失败', exc_info=True)
             self._note_write_failure(f'{type(exc).__name__}: {exc}')
@@ -1025,6 +1102,37 @@ class PluginStore:
 
         return self._mutate(mutator)
 
+    def _migrate_ui_card_meta(self) -> None:
+        """把只在 ui_data 镜像里、还没落文件的元数据补进文件（一次性迁移）。
+
+        只在**确认追加成功后**才允许调用方删除镜像：`_append_jsonl` 返回 bool，
+        失败时保留镜像，下次启动重试，避免「迁移失败 + 镜像已删」两边都丢。
+        """
+        ui_records = self.read_ui().get('card_meta')
+        if not isinstance(ui_records, dict) or not ui_records:
+            return
+        file_records = {
+            str(record.get('ui_key') or ''): record
+            for record in self._read_jsonl(self.card_meta_path())
+            if isinstance(record, dict)
+        }
+        for key, record in ui_records.items():
+            if not key or not isinstance(record, dict):
+                continue
+            existing = file_records.get(key)
+            # 文件里已有更新的版本就不要拿旧镜像覆盖它
+            if isinstance(existing, dict) and (
+                int(existing.get('updated_at') or 0) >= int(record.get('updated_at') or 0)
+            ):
+                continue
+            self._append_jsonl(self.card_meta_path(), record)
+    
+
+        def mutator(entry):
+            entry.pop('card_meta', None)
+
+        return self._mutate(mutator)
+
     def forget_card_meta(self, ui_key: str) -> bool:
         key = str(ui_key or '').strip()
         if not key:
@@ -1148,6 +1256,8 @@ class PluginStore:
             entry['runs'] = runs
 
         self._mutate(mutator)
+        # 手动标签（文件）跟随台账：台账裁掉的作业，其手动标签一并清掉
+        self._prune_manual_store(self.read_ui().get('runs'))
         return payload
 
     def update_run(self, run_id: str, patch) -> bool:
@@ -1191,7 +1301,215 @@ class PluginStore:
                 pending.pop(identifier, None)
                 entry['pending_reviews'] = pending
 
-        return self._mutate(mutator)
+        result = self._mutate(mutator)
+        store = self._read_manual_store()
+        if identifier in store:
+            store.pop(identifier, None)
+            self._write_manual_store(store)
+        return result
+
+    # ------------------------------------------------------------ 手动标签（审批页）
+    #
+    # 用户在审批页给某张卡手写的标签。存**插件数据目录的文件**（`manual_tags.json`）：
+    # 不改 runs / card_meta / tag_suggestions，也不参与幂等哈希；
+    # 作业被遗忘或台账裁掉时，对应条目一起清理。
+
+    def _read_manual_store(self) -> dict:
+        payload = self._read_json(self.manual_tags_path(), {})
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_manual_store(self, payload) -> bool:
+        return self._write_json(
+            self.manual_tags_path(),
+            payload if isinstance(payload, dict) else {},
+        )
+
+    def _prune_manual_store(self, ledger=None) -> None:
+        store = self._read_manual_store()
+        if not store:
+            return
+        if ledger is None:
+            ledger = self.read_ui().get('runs')
+        pruned = _prune_manual_tags(store, ledger)
+        if pruned != store:
+            self._write_manual_store(pruned)
+
+    def manual_tags(self, run_id: str) -> dict:
+        """读某个作业的全部手动标签：`{item_key: {'tags': [...], 'applied': [...]}}`。"""
+        identifier = str(run_id or '').strip()
+        if not identifier:
+            return {}
+        entry = self._read_manual_store().get(identifier)
+        if not isinstance(entry, dict):
+            return {}
+
+        result = {}
+        for key, value in entry.items():
+            if not isinstance(value, dict):
+                continue
+            tags = normalize_manual_tags(value.get('tags'))
+            applied = [str(item).strip() for item in (value.get('applied') or [])
+                       if str(item or '').strip()]
+            result[str(key)] = {'tags': tags, 'applied': applied}
+        return result
+
+    def set_manual_tags(self, run_id, item_key, tags) -> dict:
+        """整组替换某个条目的手动标签（增删都走这里）。"""
+        identifier = str(run_id or '').strip()
+        key = str(item_key or '').strip()
+        if not identifier or not key:
+            return {}
+
+        clean = normalize_manual_tags(tags)
+        current = self.manual_tags(identifier).get(key) or {}
+        # 已经写进卡片的那些继续保持「已写」状态（删掉的自然消失）
+        applied = [name for name in (current.get('applied') or []) if name in clean]
+
+        store = self._read_manual_store()
+        run = store.get(identifier) if isinstance(store.get(identifier), dict) else {}
+        run[key] = {
+            'tags': clean,
+            'applied': applied,
+            'updated_at': int(time.time()),
+        }
+        store[identifier] = run
+        if not self._write_manual_store(store):
+            return {}
+
+        # 回读校验（文件写入可能被权限/磁盘挡住）
+        saved = self.manual_tags(identifier).get(key) or {}
+        if list(saved.get('tags') or []) != clean:
+            return {}
+        return {'tags': clean, 'applied': applied}
+
+    def mark_manual_applied(self, run_id, item_key, tags) -> bool:
+        """把这些手动标签记为「已写进卡片」，避免重复补写。"""
+        identifier = str(run_id or '').strip()
+        key = str(item_key or '').strip()
+        names = normalize_manual_tags(tags)
+        if not identifier or not key or not names:
+            return False
+
+        store = self._read_manual_store()
+        run = store.get(identifier)
+        if not isinstance(run, dict):
+            return False
+        item = run.get(key)
+        if not isinstance(item, dict):
+            return False
+        applied = [str(name).strip() for name in (item.get('applied') or [])
+                   if str(name or '').strip()]
+        for name in names:
+            if name not in applied:
+                applied.append(name)
+        item['applied'] = applied
+        run[key] = item
+        store[identifier] = run
+        return self._write_manual_store(store)
+
+    # ------------------------------------------------------------ AI 打标历史记录
+    #
+    # 落地成功时写快照（`history.json`），独立于主程序作业条目：作业被清理后
+    # 历史仍可查看。按「落地时间」的本地日期分组。
+
+    def _read_history_store(self) -> dict:
+        payload = self._read_json(self.history_path(), {})
+        if not isinstance(payload, dict):
+            return {}
+        entries = payload.get('entries')
+        return entries if isinstance(entries, dict) else {}
+
+    def _write_history_store(self, entries) -> bool:
+        return self._write_json(
+            self.history_path(),
+            {'version': 1, 'entries': entries if isinstance(entries, dict) else {}},
+        )
+
+    def record_history(self, entry) -> bool:
+        payload = dict(entry or {})
+        key = str(payload.get('entry_id') or '').strip()
+        if not key or not history_day(payload.get('applied_at')):
+            return False
+        payload['entry_id'] = key
+        entries = self._read_history_store()
+        entries[key] = payload
+        return self._write_history_store(entries)
+
+    def history_dates(self) -> list:
+        counts = {}
+        for entry in self._read_history_store().values():
+            day = history_day(entry.get('applied_at'))
+            if not day:
+                continue
+            counts[day] = counts.get(day, 0) + 1
+        return [
+            {'date': day, 'count': count}
+            for day, count in sorted(counts.items(), reverse=True)
+        ]
+
+    def history_entries(self, date: str) -> list:
+        day = str(date or '').strip()
+        if not day:
+            return []
+        entries = [
+            entry for entry in self._read_history_store().values()
+            if history_day(entry.get('applied_at')) == day
+        ]
+        entries.sort(key=lambda item: int(item.get('applied_at') or 0), reverse=True)
+        return entries
+
+    def history_entries_for_run(self, run_id: str) -> list:
+        identifier = str(run_id or '').strip()
+        if not identifier:
+            return []
+        return [
+            entry for entry in self._read_history_store().values()
+            if str(entry.get('run_id') or '') == identifier
+        ]
+
+    def get_history_entry(self, entry_id: str) -> dict:
+        key = str(entry_id or '').strip()
+        if not key:
+            return {}
+        entry = self._read_history_store().get(key)
+        return entry if isinstance(entry, dict) else {}
+
+    def delete_history_entry(self, entry_id: str) -> bool:
+        key = str(entry_id or '').strip()
+        entries = self._read_history_store()
+        if key not in entries:
+            return False
+        entries.pop(key, None)
+        return self._write_history_store(entries)
+
+    def clear_history_date(self, date: str) -> int:
+        day = str(date or '').strip()
+        if not day:
+            return 0
+        entries = self._read_history_store()
+        doomed = [
+            key for key, entry in entries.items()
+            if history_day(entry.get('applied_at')) == day
+        ]
+        if not doomed:
+            return 0
+        for key in doomed:
+            entries.pop(key, None)
+        self._write_history_store(entries)
+        return len(doomed)
+
+    def update_history_entry(self, entry_id: str, patch) -> dict:
+        key = str(entry_id or '').strip()
+        entries = self._read_history_store()
+        entry = entries.get(key)
+        if not isinstance(entry, dict):
+            return {}
+        entry.update(dict(patch or {}))
+        entry['entry_id'] = key
+        entries[key] = entry
+        if not self._write_history_store(entries):
+            return {}
+        return entry
 
     def clear_runs(self) -> dict:
         """清空「最近作业」台账（**不**动累计用量）。"""

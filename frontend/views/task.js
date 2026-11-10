@@ -33,7 +33,7 @@ import {
   skeleton,
   statsRow,
 } from '../ui.js';
-import { checkbox, createUi, field, input } from '../dom.js';
+import { checkbox, createUi, field, formatTime, input } from '../dom.js';
 import {
   ScopeError,
   describeScope,
@@ -72,6 +72,8 @@ export function createTaskPanel(api, client, context, taskId) {
     applyMode: 'review',
     running: false,
     runId: '',
+    /** 用户点「仍然重新打标」时置 true：这一次提交绕过内容未变化判定。 */
+    forceOnce: false,
     lastRunId: readLastRun(api, taskId),
     /** 由 `onOpen` 注入；`null` 表示本面板自己还没收到作用域。 */
     target: null,
@@ -147,12 +149,36 @@ export function createTaskPanel(api, client, context, taskId) {
   });
   openResultBtn.dataset.marqueeIgnore = 'true';
   openResultBtn.hidden = true;
-  actions.append(submitBtn, previewBtn, openResultBtn);
+  // AI打标历史记录：入口先放好，点开的具体界面后续再接（`context.openHistory` 钩子）。
+  const historyBtn = api.ui.button({
+    label: 'AI打标历史记录',
+    variant: 'secondary',
+    onClick: () => openHistory(),
+  });
+  historyBtn.dataset.marqueeIgnore = 'true';
+  historyBtn.classList.add('plugin-stm-ai-assistant-history-btn');
+  actions.append(submitBtn, previewBtn, openResultBtn, historyBtn);
   actionsHost.append(actions);
+
+  function openHistory() {
+    if (context && typeof context.openHistory === 'function') {
+      context.openHistory(taskId);
+      return;
+    }
+    api.host.toast('AI打标历史记录：界面还没接上（下一步做）', 3000, 'check');
+  }
 
   // ---------------------------------------------------------------- 任务专属参数
 
   const extras = buildTaskOptions(taskId, taskOptionsHost, state, client, ui);
+
+  /** 安全默认：每次打开面板都回到「逐条审批后写入」+ 勾上「跳过内容未变化的卡片」。 */
+  function resetSafetyDefaults() {
+    state.applyMode = 'review';
+    state.forceOnce = false;
+    applySelect.value = 'review';
+    if (extras && typeof extras.reset === 'function') extras.reset();
+  }
 
   // ---------------------------------------------------------------- 作用域
 
@@ -467,18 +493,23 @@ export function createTaskPanel(api, client, context, taskId) {
       }),
       onProgress(event) {
         const total = event.total || (state.scope ? state.scope.count : 1);
+        // 进度数字要算「已处理完的」：待审批/跳过/失败也算跑完了，
+        // 否则 auto 模式下第 1 条转审批时，进度条动了但数字还是 0/N。
+        const finished = Number(event.completed || 0)
+          + Number(event.failed || 0)
+          + Number(event.skipped || 0);
         progress.update({
           percent: event.percent,
-          completed: event.completed,
+          completed: Math.min(finished, total),
           total,
           failed: event.failed,
-          message: jobStatusLabel(event.status),
+          message: event.message || jobStatusLabel(event.status),
         });
         // 同步到入口：宿主的批量菜单 / 右键菜单会画进度条，
         // 用户在别的落点也能看到「这个任务正在跑」。
         context.setTaskProgress && context.setTaskProgress(taskId, { done: event.completed, total });
       },
-      onDone({ runId, job }) {
+      onDone({ runId, job, response }) {
         state.running = false;
         state.runId = runId;
         submitBtn.disabled = false;
@@ -494,17 +525,48 @@ export function createTaskPanel(api, client, context, taskId) {
         });
         openResultBtn.hidden = false;
         renderResultHint();
+        // 部分卡片被跳过时必须说出来：否则用户以为「全都处理了」，
+        // 回头发现少了卡还以为是作业丢了（内容未变化 / 读不到会走这条路）。
+        const skippedCount = Number((response && response.skipped) || 0);
+        if (skippedCount > 0) {
+          resultHost.append(banner(
+            `另有 ${formatNumber(skippedCount)} 张卡片没有提交（内容未变化或读取失败）。`,
+            'warn',
+          ));
+        }
         context.setTaskProgress && context.setTaskProgress(taskId, null);
         context.notifyReview && context.notifyReview();
+        // auto 模式会直接写卡；刷新主程序列表，让标签/备注尽快显示
+        try {
+          api.host.refresh('cards');
+          api.host.refresh('worldinfo');
+        } catch (error) {
+          console.warn('[stm-ai] 作业完成后刷新列表失败:', error);
+        }
+        // 备注图标依赖主程序完整保存后的卡片缓存；按本次作业的落地记录补一次保存
+        if (status === 'completed' && state.runId) {
+          client.syncCardNoteCache({
+            run_id: state.runId,
+            base_url: (typeof window !== 'undefined' && window.location && window.location.origin) || '',
+          }).catch((error) => {
+            console.warn('[stm-ai] 刷新卡片备注缓存失败:', error);
+          });
+        }
         if (status === 'completed') api.host.toast('作业已完成，去「结果与审批」确认', 3200, 'check');
         else if (status === 'failed') api.host.toast('作业失败，详情见进度', 3600, 'close');
       },
-      onError(error) {
+      onError(error, info) {
         state.running = false;
         submitBtn.disabled = false;
         progress.hide();
         context.setTaskProgress && context.setTaskProgress(taskId, null);
         clear(resultHost);
+        // 空提交是幂等判定 / 读不到卡片的结果，不是「提交失败」：
+        // 给出原因明细和「仍然重新打标」的出口，别让用户对着红条无从下手。
+        if (info && info.empty) {
+          resultHost.append(renderNothingToProcess(error));
+          return;
+        }
         resultHost.append(banner(`提交失败：${error.message}`, 'error'));
       },
     });
@@ -525,6 +587,76 @@ export function createTaskPanel(api, client, context, taskId) {
     bar.append(open);
     resultHost.append(bar);
     openResultBtn.hidden = false;
+  }
+
+  /**
+   * 「这次没有可提交的卡片」的说明块。
+   *
+   * 后端把原因拆成 `unchanged` / `card_unreadable` 两类返回：
+   * - 内容未变化时给一条「仍然重新打标」的出口 —— 用户已经选好了卡再点开始，
+   *   那就是明确想跑，不该被幂等判定拦死（原来只能去猜「取消勾选跳过…」）；
+   * - 读取失败时说明是文件层面的问题，让用户回去查路径，而不是反复重试。
+   */
+  function renderNothingToProcess(error) {
+    const payload = (error && error.payload) || {};
+    const details = Array.isArray(payload.details) ? payload.details : [];
+    const reasons = (payload.reasons && typeof payload.reasons === 'object') ? payload.reasons : {};
+    const unchanged = Number(reasons.unchanged || 0);
+
+    const actions = [];
+    if (unchanged > 0 && taskId === 'analyze') {
+      const retry = api.ui.button({
+        label: '仍然重新打标',
+        variant: 'primary',
+        onClick: () => retryWithForce(),
+      });
+      retry.dataset.marqueeIgnore = 'true';
+      actions.push(retry);
+    }
+
+    const wrap = el('div', 'plugin-stm-ai-assistant-nothing-to-process');
+    wrap.append(banner(
+      String((error && error.message) || '没有需要处理的卡片'),
+      unchanged > 0 ? 'warn' : 'error',
+      actions,
+    ));
+    details.slice(0, 10).forEach((item) => {
+      wrap.append(el(
+        'div',
+        'plugin-stm-ai-assistant-note',
+        `${item.card_id || '(未知卡片)'} · ${skipReasonLabel(item)}`,
+      ));
+    });
+    if (details.length > 10) {
+      wrap.append(el(
+        'div',
+        'plugin-stm-ai-assistant-note',
+        `……另有 ${details.length - 10} 张未列出`,
+      ));
+    }
+    return wrap;
+  }
+
+  /** 跳过原因 → 一句人话（后端 reason 是稳定标识，不直接当文案）。 */
+  function skipReasonLabel(item) {
+    const reason = String((item && item.reason) || '');
+    if (reason === 'unchanged') {
+      const parts = ['内容未变化'];
+      const who = [item.profile_id, item.model].filter(Boolean).join(' / ');
+      if (who) parts.push(`上次：${who}`);
+      const at = formatTime(Number(item.analyzed_at || 0));
+      if (at && at !== '-') parts.push(at);
+      return parts.join(' · ');
+    }
+    if (reason === 'card_unreadable') return '读取失败（文件可能已移动 / 改名 / 损坏）';
+    return reason || '已跳过';
+  }
+
+  /** 这一次提交绕过「内容未变化」判定（`force` 只对本次生效）。 */
+  function retryWithForce() {
+    if (state.running) return;
+    state.forceOnce = true;
+    submit().finally(() => { state.forceOnce = false; });
   }
 
   function openReview(runId) {
@@ -634,8 +766,7 @@ export function createTaskPanel(api, client, context, taskId) {
         state.profileId = String((config.task_profiles || {})[taskId] || '');
       }
       if (config.apply_mode && state.applyMode === 'review') {
-        state.applyMode = config.apply_mode === 'auto' ? 'auto' : 'review';
-        applySelect.value = state.applyMode;
+        // 安全默认：面板每次打开都回到「逐条审批后写入」，不继承上次/配置里的 auto。
       }
     } catch (error) {
       clear(alertHost);
@@ -655,6 +786,7 @@ export function createTaskPanel(api, client, context, taskId) {
     refresh,
     /** 入口打开时调用：把宿主的 `ctx.target` 变成面板里的作用域。 */
     applyContext(ctx) {
+      resetSafetyDefaults();
       const target = normalizeTarget(ctx);
       const source = String((ctx && ctx.source) || '');
       if (target) {
@@ -702,9 +834,26 @@ function buildAnalyzeOptions(host, state, client) {
     '预算上限（token，0 = 不限）',
     input('0', 'number', '0'),
   );
-  host.append(skipUnchanged, budget);
+  // 自动写入模式下，模型建议删除的标签默认**不删**（删标签不可逆）；
+  // 不勾选时这些条目会被移到审批面板，等用户确认后再删。
+  const applyRemovals = checkbox(false, '删除模型建议删除的标签');
+  const removalHint = el(
+    'p',
+    'plugin-stm-ai-assistant-field-hint',
+    '勾选：运行时模型建议删除的标签直接删除后落地；'
+    + '不勾选：带「建议删除标签」的任务会移到「结果与审批」等你确认。'
+    + '以上只对「分析完直接写入」有效。',
+  );
+  host.append(skipUnchanged, budget, applyRemovals, removalHint);
 
   return {
+    /** 每次打开面板时复位「安全默认」，防止沿用上次的自动写入。 */
+    reset: () => {
+      const skipBox = skipUnchanged.querySelector('input');
+      if (skipBox) skipBox.checked = true;
+      const removalBox = applyRemovals.querySelector('input');
+      if (removalBox) removalBox.checked = false;
+    },
     submit: (current, base) => {
       const cards = (current.scope && current.scope.items) || [];
       if (!cards.length) return Promise.reject(new Error('作用域里没有卡片'));
@@ -713,8 +862,13 @@ function buildAnalyzeOptions(host, state, client) {
         card_ids: cards.map((card) => card.id),
         mode: 'both',
         skip_unchanged: skipUnchanged.querySelector('input').checked,
-        force: false,
+        // 手动选卡时用户点「开始」就是明确意图：空提交的说明块里再点
+        // 「仍然重新打标」会置 `forceOnce`，只对这一次提交生效。
+        force: Boolean(current.forceOnce),
         budget_tokens: Number(budget.querySelector('input').value) || 0,
+        // 逐条审批时删除由审批页勾选决定；这里只对 auto 模式生效。
+        apply_removals: applyRemovals.querySelector('input').checked
+          && String(current.applyMode || '') === 'auto',
       });
     },
   };

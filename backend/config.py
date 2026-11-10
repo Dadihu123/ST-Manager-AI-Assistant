@@ -170,7 +170,8 @@ def normalize_config(raw) -> dict:
 
     return {
         'default_profile_id': _to_text(data.get('default_profile_id'), '').strip(),
-        'max_tags': _to_int(data.get('max_tags'), DEFAULT_CONFIG['max_tags'], minimum=1, maximum=20),
+        'max_tags': _to_int(data.get('max_tags'), DEFAULT_CONFIG['max_tags'],
+                            minimum=1, maximum=tagpool_core.MAX_LABEL_COUNT),
         'summary_max_chars': _to_int(data.get('summary_max_chars'),
                                      DEFAULT_CONFIG['summary_max_chars'], minimum=50, maximum=2000),
         'tag_category_rules': tag_rules,
@@ -204,13 +205,96 @@ def normalize_config(raw) -> dict:
     }
 
 
+#: 插件私有数据里存「只属于插件界面」的设置（主程序配置表单里看不到它们）。
+#: 目前只有「最大总数量」：它必须在 AI 助手设置里改，不希望在插件管理页再出现一份。
+PRIVATE_SETTINGS_KEY = 'tag_pool_settings'
+
+
+def _read_private_settings(api) -> dict:
+    """读插件私有设置；读不到就返回空 dict（配置读取失败不该让插件不可用）。"""
+    try:
+        payload = api.private.read()
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    settings = payload.get(PRIVATE_SETTINGS_KEY)
+    return settings if isinstance(settings, dict) else {}
+
+
+def write_private_settings(api, patch) -> bool:
+    """把补丁写进插件私有设置，并**回读校验**是否真的写进去了。
+
+    注意：主程序的 `api.private.update()` 成功时**不保证返回 True**
+    （真机实测返回 `None`）。拿返回值判断会误报「私有数据不可写」，
+    所以这里只看回读结果。
+    """
+    if not isinstance(patch, dict):
+        return False
+
+    def mutator(entry):
+        current = entry.get(PRIVATE_SETTINGS_KEY)
+        if not isinstance(current, dict):
+            current = {}
+        current.update(patch)
+        entry[PRIVATE_SETTINGS_KEY] = current
+
+    try:
+        api.private.update(mutator)
+    except Exception:  # noqa: BLE001 - 写入失败交给调用方提示
+        return False
+
+    settings = _read_private_settings(api)
+    for key, value in patch.items():
+        current = settings.get(key)
+        if isinstance(value, bool) or isinstance(current, bool):
+            if bool(current) != bool(value):
+                return False
+        elif isinstance(value, (int, float)):
+            try:
+                if float(current) != float(value):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        elif str(current) != str(value):
+            return False
+    return True
+
+
 def load_config(api) -> dict:
-    """从主程序读取并规范化配置。"""
+    """从主程序读取并规范化配置，再把插件私有设置合并进来。
+
+    「最大总数量」只存在于插件私有设置里（`api.private`）：宿主的
+    `api.config.set()` 只接受 `config_schema` 声明过的键，而声明过的键又一定
+    会出现在插件管理页 —— 用户要求它只在 AI 助手设置里出现，所以另存。
+    老版本存在 `config.max_tags` 里的值仍作为首次的回落值。
+    """
     try:
         raw = api.config.get()
     except Exception:  # noqa: BLE001 - 配置读取失败不应让插件不可用
         raw = {}
-    return normalize_config(raw)
+
+    config = normalize_config(raw)
+
+    settings = _read_private_settings(api)
+    if settings:
+        max_tags = _to_int(
+            settings.get('max_tags'), config['max_tags'],
+            minimum=1, maximum=tagpool_core.MAX_LABEL_COUNT,
+        )
+        config['max_tags'] = max_tags
+    elif isinstance(raw, dict) and 'max_tags' in raw:
+        # 旧版本把 max_tags 存在主程序配置里。现在改存插件私有数据，
+        # 首次读取时顺手搬过去 —— 否则用户在插件管理页保存一次配置，
+        # 宿主把未声明的键丢掉，这个值就没了。
+        migrated = _to_int(
+            raw.get('max_tags'), config['max_tags'],
+            minimum=1, maximum=tagpool_core.MAX_LABEL_COUNT,
+        )
+        config['max_tags'] = migrated
+        if migrated != DEFAULT_CONFIG['max_tags']:
+            write_private_settings(api, {'max_tags': migrated})
+    return config
 
 
 def wi_keywords(config) -> list:
