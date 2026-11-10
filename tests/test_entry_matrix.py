@@ -146,7 +146,7 @@ def test_batch_actions_require_selection_and_matching_mode(mode, selection, expe
 def test_command_palette_lists_only_commands():
     """命令面板按落点收敛：不出现需要右键目标的条目（落点已经隔离）。"""
     palette = offered('commandPalette', {'mode': 'cards'})
-    assert palette == {'open-review', 'propose-library', 'open-profiles'}
+    assert palette == {'open-review', 'propose-library', 'open-profiles', 'open-history'}
 
     context_ids = {node['id'] for node in _items('context.folder')}
     assert context_ids, '本插件应声明 context.folder 入口'

@@ -219,6 +219,19 @@
           }
         },
         {
+          "id": "open-history",
+          "placement": "commandPalette",
+          "type": "item",
+          "label": "AI 打标历史",
+          "description": "按日期查看每次落地的概览与标签；可删除、清空或改回待审批。",
+          "icon": "frontend/assets/icon.svg",
+          "order": 48,
+          "action": {
+            "type": "command",
+            "id": "open-history"
+          }
+        },
+        {
           "id": "open-profiles",
           "placement": "commandPalette",
           "type": "item",
@@ -271,6 +284,14 @@
           "icon": "frontend/assets/icon.svg",
           "module": "frontend/commands.js",
           "export": "proposeLibrary"
+        },
+        {
+          "id": "open-history",
+          "title": "AI 打标历史",
+          "description": "按日期查看每次落地的概览与标签。",
+          "icon": "frontend/assets/icon.svg",
+          "module": "frontend/commands.js",
+          "export": "openHistory"
         },
         {
           "id": "open-profiles",

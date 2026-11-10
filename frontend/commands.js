@@ -37,3 +37,13 @@ export function proposeLibrary(ctx) {
 export function openProfiles(ctx) {
   return openSurface(ctx, "profiles", "palette");
 }
+
+/**
+ * 命令面板「AI 打标历史」。
+ *
+ * 历史面板原先只能从「结果与审批」里的按钮间接打开 —— 用户得先想到去审批面板，
+ * 而落地记录恰恰是「审批之后」才产生的东西。给一条直接入口。
+ */
+export function openHistory(ctx) {
+  return openSurface(ctx, "history", "palette");
+}

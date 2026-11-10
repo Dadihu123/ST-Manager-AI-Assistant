@@ -225,7 +225,7 @@ def test_manifest_passes_main_app_contract(manifest):
     assert set(normalized['capabilities']) == EXPECTED_CAPABILITIES
     assert normalized['frontend']['render_mode'] == 'declarative'
     assert normalized['frontend']['contributions']['menus']
-    assert len(normalized['frontend']['contributions']['commands']) == 4
+    assert len(normalized['frontend']['contributions']['commands']) == 5
 
 
 def test_backend_entry_declares_package_with_init(manifest):
@@ -413,10 +413,10 @@ def test_batch_group_requires_selection(nodes_by_id):
 
 
 def test_command_palette_entries(menus, commands):
-    """命令面板列出 3 条命令入口；它们没有 when（全局可用）。"""
+    """命令面板列出 4 条命令入口；它们没有 when（全局可用）。"""
     palette = [node for node in menus if node.get('placement') == 'commandPalette']
     assert {node['id'] for node in palette} == {
-        'open-review', 'propose-library', 'open-profiles',
+        'open-review', 'propose-library', 'open-profiles', 'open-history',
     }
     command_ids = {command.get('id') for command in commands}
     for node in palette:
@@ -857,7 +857,7 @@ def test_commands_module_uses_host_api():
         source = _strip_js_comments(handle.read())
     assert 'ctx.api' in source or 'ctx && ctx.api' in source
     assert 'api.entries' not in source
-    assert source.count('export function') == 4, '应有 4 个命令处理器导出'
+    assert source.count('export function') == 5, '应有 5 个命令处理器导出'
 
 
 # --------------------------------------------------------------- 真实校验器
@@ -902,6 +902,6 @@ def test_manifest_normalizes_without_warnings_through_main_app():
     assert parsed.has_backend and parsed.has_frontend
     assert parsed.frontend_render_mode == 'declarative'
     assert set(parsed.capabilities) == EXPECTED_CAPABILITIES
-    assert len(parsed.frontend_contributions['menus']) == 7
-    assert len(parsed.frontend_contributions['commands']) == 4
+    assert len(parsed.frontend_contributions['menus']) == 8
+    assert len(parsed.frontend_contributions['commands']) == 5
     assert parsed.warnings == [], parsed.warnings
