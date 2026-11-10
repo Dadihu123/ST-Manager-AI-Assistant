@@ -1,13 +1,13 @@
 {
   "id": "stm-ai-assistant",
   "name": "AI 角色卡分析助手",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "api_version": 3,
   "manifest_version": 3,
   "author": "ST-Manager",
   "description": "角色卡的 AI 工作台：打标（概览与标签）、世界书精简、自动归类、分类体系提议；批量作业、逐条审批与成本记账。",
   "license": "Apache-2.0",
-  "min_app_version": "1.0.0",
+  "min_app_version": "1.1.0",
   "backend": {
     "entry": "backend",
     "register": "register",

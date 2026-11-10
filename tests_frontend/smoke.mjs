@@ -323,8 +323,20 @@ function createFakeApi({ providers = 1, pending = 0 } = {}) {
       read: () => ({ entries: [] }),
       write: () => ({ success: true }),
       list_entries: () => [],
+      // 形状照抄宿主 `api.worldbook.sources()`：`id` 是世界书列表项 id
+      // （与 `api.host.selection()` 的选中集**同源**），`file_path` 是**绝对**路径。
+      // 以前这里把 `file_path` 写成 id 的路径后缀（`lorebooks/a.json`），等于把
+      // 「两者可以互推」这个错误假设固化进夹具——生产环境 `file_path` 来自
+      // 列表项的 `path`（绝对路径），于是全局/资源书选中后永远匹配不上。
       sources: ({ category = '' } = {}) => ([
-        { source_type: 'global', file_path: 'lorebooks/a.json', card_id: '', category, name: 'A 世界书' },
+        {
+          id: 'global::lorebooks/a.json',
+          source_type: 'global',
+          file_path: '/abs/library/lorebooks/a.json',
+          card_id: '',
+          category,
+          name: 'A 世界书',
+        },
       ]),
     },
     api: async (path, options = {}) => {
@@ -717,6 +729,22 @@ async function main() {
     const scope = await resolveScope(api, { kind: 'folder', mode: 'worldinfo', path: 'lore' });
     assert.equal(scope.kind, 'wi-folder');
     assert.equal(scope.count, 1);
+  });
+
+  // §9 断链三：「选中全局世界书 → 精简」报「无法识别选中的世界书（宿主接口版本不一致）」。
+  // 根因是插件拿 `source_type` + `file_path`（绝对路径）自拼 id，去和宿主选中集
+  // （列表项 id，形如 `global::<相对路径>`）求交集，全局/资源书永远匹配不上；
+  // 内嵌书因为只用 `card_id` 拼反而是唯一能用的。修法是直接用宿主回传的 `id`。
+  await check('选中全局世界书能解析（id 对齐宿主选中集）', async () => {
+    const { resolveScope } = await import('../frontend/scope.js');
+    const scope = await resolveScope(
+      api,
+      { kind: 'selection', mode: 'worldinfo', ids: ['global::lorebooks/a.json'] },
+    );
+    assert.equal(scope.kind, 'wi-selection');
+    assert.equal(scope.count, 1);
+    // file_path 保持绝对路径透传——后端读改写靠它，不能被 id 形状污染
+    assert.equal(scope.items[0].file_path, '/abs/library/lorebooks/a.json');
   });
 
   // §9 断链一、二：「选卡 → AI 世界书精简 → 预览」报「无法读取这本书」/ 0 条。

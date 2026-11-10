@@ -171,12 +171,18 @@ async function resolveSelection(api, target) {
     throw new ScopeError('这个入口没有带选中项：请先在列表里勾选，或从坞打开后手动选择', 'empty_selection');
   }
   if (target.mode === 'worldinfo') {
-    const { items: sources } = await listWorldbookSources(api);
     const wanted = new Set(ids);
-    const books = sources.filter((book) => wanted.has(bookIdOf(book)));
+    const { items: cached } = await listWorldbookSources(api);
+    let books = cached.filter((book) => wanted.has(bookIdOf(book)));
     if (!books.length) {
-      // 宿主给了 id 但我们认不出来：宁可报错也不静默分析 0 本
-      throw new ScopeError('无法识别选中的世界书（宿主接口版本不一致）', 'unknown_selection');
+      // 默认分支只覆盖世界书视图的**当前页**：选中项可能已被翻页/筛选挤出缓存。
+      // 补一次全量枚举再判断，否则「不在缓存里」会被误报成「接口不一致」。
+      const { items: everyBook } = await listWorldbookSources(api, { all: true });
+      books = everyBook.filter((book) => wanted.has(bookIdOf(book)));
+    }
+    if (!books.length) {
+      // 宿主给了 id 但全量枚举里也找不到：宁可报错也不静默分析 0 本
+      throw new ScopeError('无法识别选中的世界书（宿主列表里找不到这些 id）', 'unknown_selection');
     }
     return bookScope(books, 'selected');
   }
@@ -259,8 +265,25 @@ function bookScope(books, label, customLabel = '') {
   };
 }
 
-/** 世界书来源的稳定标识（与宿主 wiList 的 id 形状无关，插件自用）。 */
+/**
+ * 世界书来源的稳定标识。
+ *
+ * **优先取宿主回传的列表 `id`**：`resolveSelection` 要拿它和宿主选中集
+ * （`api.host.selection()` / `ctx.target.ids`）求交集，而选中集存的就是世界书
+ * 列表项 id。用 `source_type` + `file_path` 自己拼是对不上的：`file_path` 是
+ * **绝对路径**，而宿主 id 里带的是相对世界书根的路径——
+ *   global   → 宿主 `global::sub/a.json`，自拼 `global::D:/…/lorebooks/sub/a.json`
+ *   resource → 宿主 `resource::<key>::a.json`，自拼 `resource::D:/…/a.json`
+ * 于是全局/资源书永远筛不出东西，「精简选中的世界书」报「无法识别选中的世界书」；
+ * 内嵌书因为只用 `card_id` 拼，反而是唯一正常的。§9 断链三。
+ *
+ * `id` 缺席（宿主较旧、没回传该字段）时退回旧拼法：仍然解析不出全局/资源书，
+ * 但至少不自造出会误伤内嵌书的 id。
+ */
 export function bookIdOf(book) {
+  if (!book || typeof book !== 'object') return '';
+  const hostId = String(book.id || '');
+  if (hostId) return hostId;
   if (book.card_id && book.source_type === 'embedded') return `embedded::${book.card_id}`;
   return `${book.source_type}::${book.file_path}`;
 }

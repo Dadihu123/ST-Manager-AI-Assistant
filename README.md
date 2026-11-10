@@ -1,6 +1,6 @@
 # AI 角色卡分析助手（stm-ai-assistant）
 
-> **本副本是「非官方修改版」（版本 0.4.0）**，基于上游 v0.3.0 修改，按 **Apache-2.0** 分发。
+> **本副本是「非官方修改版」（版本 0.4.1）**，基于上游 v0.3.0 修改，按 **Apache-2.0** 分发。
 > 主要差异：每分类置信度/数量、标签池可视化设置、可调 token 预算、标签写入失败修复等，
 > 详见 **[FORK.md](FORK.md)** 与 `CHANGELOG.md`。上游版权归原作者；本副本未获官方背书。
 
@@ -28,8 +28,13 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 3. 入口坞（屏幕右侧的图标条）会出现「AI 助手」入口；点击打开宿主提供的**居中弹层**。
    也可以在命令面板里搜「AI 助手」。
 
-> **需要主程序 `PLUGIN_API_VERSION = 3`**（本插件 `api_version = 3`）；旧主程序会以
-> `PluginApiVersionError` 拒绝加载。
+> **需要主程序 `PLUGIN_API_VERSION = 3` 且 `APP_VERSION >= 1.1.0`**（本插件
+> `api_version = 3`、`min_app_version = 1.1.0`）。旧主程序会分别以
+> `PluginApiVersionError` / `PluginManifestError`（`min_app_version` 门槛）拒绝加载，
+> 安装阶段也会在下载归档之前就被拒。
+> 1.1.0 的下限来自 `api.worldbook.sources()` 回传 `id`：插件要拿它和
+> `api.host.selection()` 的选中集对交集，否则「精简选中的世界书」会报
+> 「无法识别选中的世界书」。
 >
 > 主程序以 `st_plugin_stm_ai_assistant` 模块名加载 `backend/`，**不注入 `sys.path`**，因此插件内部一律使用相对导入。
 > 插件私有数据（档案、缓存、用量）写在 `data/plugins/stm-ai-assistant/data/`，卸载时由主程序按需清理。
