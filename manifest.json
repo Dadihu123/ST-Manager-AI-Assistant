@@ -303,14 +303,6 @@
         "description": "未显式指定时使用的档案 id；留空表示按模型自动匹配。",
         "default": ""
       },
-      "max_tags": {
-        "type": "integer",
-        "title": "最大标签数（总上限）",
-        "description": "一次分析最多打多少个标签。各分类的「设置数量」之和不能超过它；没单独设置的分类只受这个总上限约束。",
-        "default": 8,
-        "minimum": 1,
-        "maximum": 20
-      },
       "summary_max_chars": {
         "type": "integer",
         "title": "概览字数上限",
@@ -387,7 +379,7 @@
       "tag_category_rules": {
         "type": "string",
         "title": "标签池：每个分类的置信度与数量（JSON）",
-        "description": "格式：{\"分类\": {\"confidence_min\": 0.6, \"max_tags\": 3}}。由插件设置页「AI 助手设置 → 标签池」维护，一般不用手填；各分类 max_tags 之和不能超过最大标签数。",
+        "description": "格式：{\"分类\": {\"confidence_min\": 0.6, \"max_tags\": 3}}。由插件设置页「AI 助手设置 → 标签池」维护，一般不用手填；各分类 max_tags 之和超过最大总数量时只提醒、不拦保存（实际按总数量截断）。",
         "default": ""
       },
       "tag_pool_budget_tokens": {

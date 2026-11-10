@@ -549,7 +549,7 @@ def test_all_action_surfaces_are_registered_in_frontend(menus, plugin_source, pa
     with open(os.path.join(ROOT, 'frontend', 'commands.js'), 'r', encoding='utf-8') as handle:
         action_surfaces |= set(re.findall(
             r"""openSurface\(ctx, ['"]([a-z-]+)['"]""", handle.read()))
-    programmatic = {'prompt-preview'}
+    programmatic = {'prompt-preview', 'history'}
     missing = registered - action_surfaces - programmatic
     assert not missing, f'以下 surface 没有任何入口，用户永远打不开: {sorted(missing)}'
 
@@ -659,6 +659,18 @@ def test_tag_pool_categories_are_declared_as_strings(manifest):
         assert spec['type'] == 'string', f'{key} 必须是 string（宿主表单只支持标量）'
         assert str(spec.get('title') or '').strip(), f'{key} 需要中文标题'
         assert str(spec.get('description') or '').strip(), f'{key} 需要填写说明'
+
+
+def test_max_tags_is_not_in_host_config_form(manifest):
+    """「最大总数量」只在 AI 助手设置里配置，不出现在插件管理页。
+
+    宿主的 `api.config.set()` 只接受 `config_schema` 声明过的键，而声明过的键
+    一定会渲染在插件管理页 —— 所以这个值改存插件私有数据
+    （`config.PRIVATE_SETTINGS_KEY = 'tag_pool_settings'`），manifest 里不再声明。
+    """
+    properties = manifest['config_schema']['properties']
+    assert 'max_tags' not in properties, '最大总数量不该出现在宿主配置表单里'
+    assert properties['tag_pool_budget_tokens']['type'] == 'integer', '预算仍在宿主表单里'
 
 
 def test_legacy_global_confidence_is_gone(manifest):
@@ -817,6 +829,18 @@ def test_contribution_writes_are_replayed_after_registry_ready(plugin_source):
         '自检结论必须走 reporter（直接写会因注册表未就绪而丢失）'
     )
     assert 'reporter.setStatus(' in outside, 'activate() 里应通过 reporter 写状态'
+
+
+def test_settings_surface_refreshes_every_time_it_opens(plugin_source):
+    """设置面板每次打开都要重新读配置。
+
+    宿主会**复用已挂载的容器**（`mount` 只跑一次，之后只投递 `onOpen`），而
+    「主程序 → 插件管理 → 配置」改的是同一份配置。不在 `onOpen` 里 refresh，
+    用户就会看到上一次的旧值（实测：宿主改成 30、插件里还是 20）。
+    """
+    source = _strip_js_comments(plugin_source)
+    assert "surfaceId === 'settings'" in source, '设置面板需要在 onOpen 里单独刷新'
+    assert 'view.refresh()' in source, '要调用设置视图的 refresh()'
 
 
 def test_pending_badge_goes_through_injected_writer(plugin_source):

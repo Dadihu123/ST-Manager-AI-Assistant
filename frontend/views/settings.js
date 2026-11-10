@@ -350,7 +350,7 @@ export function createSettings(api, client, context) {
     // ---- 最大总数量 ----
     const maxInput = numberInput(
       maxTags,
-      { min: 1, max: 20, step: 1 },
+      { min: 1, max: 99, step: 1 },
       (value) => {
         maxTags = Number(value) || maxTags;
         updateAllocation();
@@ -360,7 +360,8 @@ export function createSettings(api, client, context) {
       '最大总数量（一次最多打几个标签）',
       maxInput,
       helpNote('新的置信度 / 数量怎么用', HELP_RULES),
-      '范围 1–20。各分类的「设置数量」之和不能超过它；总上限可以大于各分类之和。',
+      '范围 1–99。各分类的「设置数量」之和超过它只提醒、不拦保存，实际按它截断。'
+        + '这项只在 AI 助手设置里配置（主程序「插件管理」页不再显示它）。',
     );
 
     // ---- 标签池 token 预算：列多少标签给模型看 ----
@@ -497,7 +498,7 @@ export function createSettings(api, client, context) {
       );
       const quotaInput = numberInput(
         rule.max_tags == null ? '' : rule.max_tags,
-        { min: 0, max: 20, step: 1, placeholder: '不限' },
+        { min: 0, max: 99, step: 1, placeholder: '不限' },
       );
 
       function applyRule() {
@@ -652,10 +653,10 @@ export function createSettings(api, client, context) {
       return;
     }
 
-    if (!Number.isInteger(maxTags) || maxTags < 1 || maxTags > 20) {
+    if (!Number.isInteger(maxTags) || maxTags < 1 || maxTags > 99) {
       await api.ui.confirm({
         title: '无法保存',
-        message: '「最大总数量」要是 1–20 之间的整数。',
+        message: '「最大总数量」要是 1–99 之间的整数。',
         danger: true,
       });
       return;
@@ -684,8 +685,8 @@ export function createSettings(api, client, context) {
       }
       if (rule.max_tags != null) {
         const quota = Number(rule.max_tags);
-        if (!Number.isInteger(quota) || quota < 0 || quota > 20) {
-          problems.push(`「${name}」的设置数量要是 0–20 的整数（现在填的是 ${rule.max_tags}）`);
+        if (!Number.isInteger(quota) || quota < 0 || quota > 99) {
+          problems.push(`「${name}」的设置数量要是 0–99 的整数（现在填的是 ${rule.max_tags}）`);
         } else {
           quotaTotal += quota;
           breakdown.push(`${name} ${quota}`);

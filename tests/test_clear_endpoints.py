@@ -114,14 +114,30 @@ def test_clear_pending_all_and_targeted(env):
 
 
 def test_status_reflects_cleared_pending(env):
-    """清空待审批后，`/status` 里 hub 用的那个计数必须归零。"""
-    client, _api, store = env
-    store.mark_pending_review('run-a', 'ai.analyze', 1)
-    assert client.get('/status').get_json()['pending_reviews']
+    """清空待审批后，`/status` 里 hub 用的那个计数必须归零。
+
+    合并后语义：`/status` 的 `pending_reviews` 以**真实条目状态**为准
+    （`_live_pending_reviews`），不再直接照抄登记表——因为登记表本身的写入
+    会被 ui_data 配额整次拒绝。所以这里必须造出真实作业条目，才能测到
+    「有待审批 → 清空 → 归零」这条链路。
+    """
+    client, api, store = env
+
+    api.job_detail = {'run_id': 'run-a', 'job_type': 'ai.analyze'}
+    api.job_items = [
+        {'key': 'card-1', 'status': 'awaiting_review'},
+        {'key': 'card-2', 'status': 'awaiting_review'},
+    ]
+    store.mark_pending_review('run-a', 'ai.analyze', 2)
+
+    pending = client.get('/status').get_json()['pending_reviews']
+    assert pending, '有待审批条目时必须出现在 /status'
+    assert pending['run-a']['items'] == 2
 
     client.post('/pending/clear')
 
     assert client.get('/status').get_json()['pending_reviews'] == {}
+
 
 
 def test_jobs_list_reflects_cleared_ledger(env):

@@ -207,12 +207,18 @@ export async function runTaskJob({
   onCancelled,
 }) {
   let runId = '';
+  let response = null;
   try {
-    const response = await submit();
+    response = await submit();
     runId = String((response && response.run_id) || '');
     if (!runId) {
+      // 空提交（「没有需要处理的卡片」）不是失败：把后端的 code / 原因带出去，
+      // 让面板能画出「为什么没提交 + 怎么办」，而不是一条红色「提交失败」。
       const message = (response && response.message) || '没有需要处理的内容';
-      onError && onError(new Error(message), { response, empty: true });
+      const empty = new Error(message);
+      empty.code = (response && response.code) || 'nothing_to_process';
+      empty.payload = response || {};
+      onError && onError(empty, { response, empty: true });
       return { runId: '', response };
     }
     rememberRun(api, taskId, runId);
@@ -222,12 +228,14 @@ export async function runTaskJob({
   }
 
   if (typeof api.subscribeJob !== 'function') {
-    onDone && onDone({ runId, response: null });
+    onDone && onDone({ runId, response });
     return { runId };
   }
 
   let unsubscribe = null;
   let settled = false;
+  /** 最近一次快照的进度（`item` 帧只带条目，不带计数，需要本地累加）。 */
+  let latest = normalizeProgress(null);
 
   const finish = (payload) => {
     if (settled) return;
@@ -237,25 +245,51 @@ export async function runTaskJob({
     } catch (error) {
       console.warn('[stm-ai] 取消作业订阅失败:', error);
     }
-    onDone && onDone({ runId, ...payload });
+    onDone && onDone({ runId, response, ...payload });
   };
 
   try {
     const maybe = api.subscribeJob(runId, {
       snapshot(job) {
-        onProgress && onProgress(normalizeProgress(job));
+        latest = normalizeProgress(job);
+        onProgress && onProgress(latest);
         const status = String((job && job.status) || '');
         if (['completed', 'failed', 'cancelled', 'aborted'].includes(status)) {
           finish({ job });
         }
       },
-      item() {
-        // 条目级事件（宿主逐条上报）：不单独刷新，等 snapshot 的计数即可，
-        // 否则一次作业会触发 N 次重排。
+      item(payload) {
+        // 宿主逐条上报的是 `item` 事件（snapshot 只在订阅开始时合成一次）。
+        // 不在这里累加，进度条会一直停在 0/N，直到作业结束 —— 用户会以为卡死。
+        const status = String((payload && payload.status) || '');
+        if (!['done', 'failed', 'skipped', 'awaiting_review'].includes(status)) return;
+        const next = {
+          ...latest,
+          status: latest.status === 'completed' ? 'completed' : 'running',
+          completed: latest.completed + (status === 'done' ? 1 : 0),
+          failed: latest.failed + (status === 'failed' ? 1 : 0),
+          skipped: latest.skipped
+            + (status === 'skipped' || status === 'awaiting_review' ? 1 : 0),
+        };
+        const total = Number(next.total || 0);
+        const finished = next.completed + next.failed + next.skipped;
+        next.percent = total
+          ? Math.min(100, Math.round((finished / total) * 100))
+          : 0;
+        // 让面板能显示「正在跑哪张卡」：宿主的 item 帧字段是 `item_key`。
+        const rawKey = String((payload && (payload.item_key || payload.key)) || '');
+        const itemName = rawKey ? rawKey.split('/').pop() : '';
+        if (itemName) {
+          next.message = total
+            ? `已完成 ${Math.min(finished, total)}/${total}：${itemName}`
+            : `已完成：${itemName}`;
+        }
+        latest = next;
+        onProgress && onProgress(next);
       },
       done(payload) {
         // `done` 帧只有状态与计数，没有 job_type/message，合并进最后一次 snapshot
-        finish({ job: { ...(payload || {}) } });
+        finish({ job: { ...latest, ...(payload || {}) } });
       },
       error(error) {
         if (settled) return;
