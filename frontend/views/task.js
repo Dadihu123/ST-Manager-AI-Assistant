@@ -87,11 +87,35 @@ export function createTaskPanel(api, client, context, taskId) {
   const previewHost = el('div', 'plugin-stm-ai-assistant-preview-host');
   // 面板高度是固定的（宿主 surface 尺寸），没有占位时下半屏是一大片空白，
   // 看起来像「内容没加载出来」。这里给一句说明，点预览后会被真实内容替换。
-  previewHost.append(el(
-    'div',
-    'plugin-stm-ai-assistant-preview-hint',
-    '点「预览」可先确认这次会读到哪些内容 —— 不调用模型，也不写回。',
-  ));
+  /**
+   * 清空预览区并回到「还没预览」的空态。
+   *
+   * 预览与作用域强绑定：作用域换了（面板重开 / 面板内更改作用域）就要撤掉旧预览，
+   * 否则旧条目的勾选框还留在屏幕上，用户会以为它们仍属于新作用域。
+   * 任务面板自己的勾选状态也要一起作废（`extras.invalidate`，世界书面板提供）。
+   *
+   * `extras` 在参数区之后才构造，这里用惰性读取：本函数只在后续调用时才会碰到它。
+   */
+  let extras = null;
+  /**
+   * 预览请求的序号（作用域一变就自增，在飞响应直接丢弃）。
+   *
+   * 预览是异步的，而作用域可以在请求在飞的时候被换掉（面板内「更改」/重开面板）。
+   * 没有这个令牌时，先发后到的旧响应会把旧作用域的条目画到新作用域上 —— 用户看到
+   * 的是 A 的条目、提交出去的却是 B 的书名 + A 的 uid，直接写错文件。
+   */
+  let previewSeq = 0;
+  function resetPreview() {
+    previewSeq += 1;
+    clear(previewHost);
+    if (extras && typeof extras.invalidate === 'function') extras.invalidate();
+    previewHost.append(el(
+      'div',
+      'plugin-stm-ai-assistant-preview-hint',
+      '点「预览」可先确认这次会读到哪些内容 —— 不调用模型，也不写回。',
+    ));
+  }
+  resetPreview();
   const actionsHost = el('div', 'plugin-stm-ai-assistant-actions-host');
   const progress = progressBlock({ onCancel: () => cancelRun() });
   const resultHost = el('div', 'plugin-stm-ai-assistant-result-host');
@@ -170,7 +194,7 @@ export function createTaskPanel(api, client, context, taskId) {
 
   // ---------------------------------------------------------------- 任务专属参数
 
-  const extras = buildTaskOptions(taskId, taskOptionsHost, state, client, ui);
+  extras = buildTaskOptions(taskId, taskOptionsHost, state, client, ui);
 
   /** 安全默认：每次打开面板都回到「逐条审批后写入」+ 勾上「跳过内容未变化的卡片」。 */
   function resetSafetyDefaults() {
@@ -186,6 +210,8 @@ export function createTaskPanel(api, client, context, taskId) {
     state.target = target || null;
     state.scopeError = '';
     state.scope = null;
+    // 作用域一变，旧预览立刻作废（勾选只对当次预览所属的作用域有效）。
+    resetPreview();
 
     if (!target) {
       renderScope();
@@ -378,6 +404,8 @@ export function createTaskPanel(api, client, context, taskId) {
   // ---------------------------------------------------------------- 预览
 
   async function runPreview() {
+    // `resetPreview()` 也自增这个序号：作用域一变，在飞的旧预览响应就作废。
+    const token = ++previewSeq;
     clear(previewHost);
     if (!state.scope && taskId !== 'propose') {
       previewHost.append(banner('请先确定作用域', 'warn'));
@@ -387,9 +415,11 @@ export function createTaskPanel(api, client, context, taskId) {
     try {
       const payload = extras.previewPayload ? extras.previewPayload(state) : {};
       const data = await previewRequest(payload);
+      if (token !== previewSeq) return;
       clear(previewHost);
       previewHost.append(renderPreviewData(data));
     } catch (error) {
+      if (token !== previewSeq) return;
       clear(previewHost);
       previewHost.append(banner(`预览失败：${error.message}`, 'error'));
     }
@@ -473,7 +503,6 @@ export function createTaskPanel(api, client, context, taskId) {
       return;
     }
 
-    clear(previewHost);
     clear(resultHost);
     state.running = true;
     submitBtn.disabled = true;
@@ -484,13 +513,22 @@ export function createTaskPanel(api, client, context, taskId) {
     await runTaskJob({
       api,
       taskId,
-      submit: () => extras.submit(state, {
-        provider_id: state.providerId,
-        model: state.model,
-        profile_id: state.profileId,
-        apply_mode: state.applyMode,
-        ...scopePayload(state.scope),
-      }),
+      // 预览区**提交成功后**才让位给进度：被前端拦下的提交（没预览/没勾选）必须
+      // 保留屏幕上的条目清单，否则用户只看到一条错误、却没有可勾的东西。
+      submit: async () => {
+        const response = await extras.submit(state, {
+          provider_id: state.providerId,
+          model: state.model,
+          profile_id: state.profileId,
+          apply_mode: state.applyMode,
+          ...scopePayload(state.scope),
+        });
+        if (response && response.run_id) {
+          // 真的提交出去了：本次勾选随预览一起作废，重跑要重新看一遍清单。
+          resetPreview();
+        }
+        return response;
+      },
       onProgress(event) {
         const total = event.total || (state.scope ? state.scope.count : 1);
         // 进度数字要算「已处理完的」：待审批/跳过/失败也算跑完了，
@@ -918,10 +956,53 @@ function buildPolishOptions(host, state, client, select) {
   );
   host.append(forceFiltered);
 
+  // 勾选状态显式跟踪，不靠提交时的 DOM 查询：
+  // - 勾选框渲染在 previewHost，而本函数的 `host` 只是参数区（两者是兄弟节点），
+  //   旧实现 `host.querySelectorAll(...)` 永远查不到；
+  // - submit() 在调用本函数前就 clear(previewHost)，即使查对容器也已被清空；
+  // - `dataset.uid` 设在 checkbox() 返回的 wrapper <label> 上，旧实现却按
+  //   `input.dataset.uid` 过滤，同样永远为空。
+  // 勾选还必须跟「这一次预览的作用域」绑定：作用域换了，旧勾选作废。
+  const selectedUids = new Set();
+  /** uid → 该 uid 的输入框（多本书里 uid 会重复，勾选必须联动，见 setUidChecked）。 */
+  const uidInputs = new Map();
+  let previewedScope = null;
+  let previewReady = false;
+
+  /**
+   * 勾选/取消一个 uid，并同步**所有**同 uid 的勾选框。
+   *
+   * 后端 `/jobs/wi-rewrite` 的 `entry_uids` 是**平坦的 uid 集合**（逐本按 uid 命中），
+   * 表达不了「A 书的 2 要改、B 书的 2 不改」。多本书里 uid 从 0 各自编号，因此
+   * 这里必须让同 uid 的勾选框联动 —— 否则用户取消 B 书的 2，A 书的 2 也会被静默
+   * 地带去（或反过来：看着只改 A，实际 B 也被改）。
+   */
+  function setUidChecked(uid, checked) {
+    const key = String(uid);
+    if (checked) selectedUids.add(key);
+    else selectedUids.delete(key);
+    (uidInputs.get(key) || []).forEach((input) => { input.checked = Boolean(checked); });
+  }
+
+  /** 作用域变更 / 作业结束：本次预览的勾选全部作废。 */
+  function invalidate() {
+    selectedUids.clear();
+    uidInputs.clear();
+    previewedScope = null;
+    previewReady = false;
+  }
+
   return {
+    /** 面板与作用域层用它作废勾选（预览之外还有别的路径会换作用域）。 */
+    invalidate,
     /** 预取条目清单：世界书任务的作用域是文件，条目在面板内按书分组勾选。 */
     previewPayload: (current) => {
       const books = (current.scope && current.scope.items) || [];
+      // 预览请求一发出，上一次预览的勾选就作废；成功后由 renderPreview 重填默认勾选。
+      previewedScope = current.scope;
+      previewReady = false;
+      selectedUids.clear();
+      uidInputs.clear();
       return {
         worldbook_source: books.map((book) => ({
           source_type: book.source_type || 'global',
@@ -932,6 +1013,12 @@ function buildPolishOptions(host, state, client, select) {
     },
     renderPreview(wrap, data) {
       const books = Array.isArray(data.books) ? data.books : [];
+      // 预览重渲染 = 重新读条目：勾选以这次预览为准，默认勾选 = 世界书里启用的条目。
+      selectedUids.clear();
+      uidInputs.clear();
+      // 响应可能属于已经作废的作用域（见 runPreview 的 previewSeq）：那种情况下
+      // 勾选状态不能作数，只把内容画出来给人看。
+      previewReady = previewedScope === state.scope;
       if (!books.length) {
         wrap.append(emptyState('这本书没有可改写的条目。', null));
         return;
@@ -946,6 +1033,20 @@ function buildPolishOptions(host, state, client, select) {
         ));
       }
       // 按书分组：同名条目（uid 在各自文件里独立编号）必须能区分归属
+      //
+      // 默认勾选以 **uid** 为单位算（同一 uid 在多本书里出现时，只要有一处启用就
+      // 默认勾上，并且所有同位勾选框显示同一个状态）——提交用的是平坦
+      // `entry_uids`，UI 必须和它语义一致，不能让用户以为可以「只改其中一本」。
+      // 停用条目（`enabled=false`）后端必跳过，所以它们的行永远不显示成勾上。
+      const uidDefault = new Map();
+      books.forEach((book) => {
+        (book.items || []).forEach((entry) => {
+          const uid = String(entry.uid);
+          uidDefault.set(uid, Boolean(uidDefault.get(uid)) || Boolean(entry.enabled));
+        });
+      });
+      uidDefault.forEach((checked, uid) => { if (checked) selectedUids.add(uid); });
+
       books.forEach((book) => {
         const source = book.source || {};
         const label = source.file_path || source.card_id || '（未知来源）';
@@ -970,14 +1071,40 @@ function buildPolishOptions(host, state, client, select) {
             const skipped = entry.skip_reason
               ? ` · 会被跳过：${entry.skip_label || entry.skip_reason}`
               : '';
+            // 停用条目后端必跳过（`entry.disable`），这里如实标出来。
+            const disabledNote = entry.enabled ? '' : ' · 已停用（不会被改写）';
+            // 多本书里 uid 会重复：同 uid 的所有勾选框联动，并在标签上说明
+            // （`entry_uids` 是平坦 uid 集合，表达不了「只改其中一本」）。
+            const shared = uidInputs.has(uid) && uidInputs.get(uid).length > 0;
             const box = checkbox(
-              Boolean(entry.enabled),
-              `${entry.name || '(未命名)'} · ${formatNumber(entry.tokens)} token${skipped}`,
+              selectedUids.has(uid),
+              `${entry.name || '(未命名)'} · ${formatNumber(entry.tokens)} token${skipped}${disabledNote}`,
+              (event) => {
+                // 勾选状态跟着数据走：提交成功后预览区会被清空，不能回头查 DOM。
+                const input = event && event.target ? event.target : null;
+                setUidChecked(uid, Boolean(input && input.checked));
+              },
             );
             box.dataset.uid = uid;
-            // 勾选回传时需要知道属于哪本书
+            const uidInput = box.querySelector('input');
+            if (uidInput) {
+              // 同 uid 的所有输入框登记在一处：勾选要联动（`setUidChecked`）。
+              if (!uidInputs.has(uid)) uidInputs.set(uid, []);
+              uidInputs.get(uid).push(uidInput);
+            }
+            // 勾选回传时需要知道属于哪本书（调试与测试用；提交已不再读 DOM）
             box.dataset.book = label;
-            if (!entry.enabled) box.classList.add('is-disabled');
+            if (shared) {
+              const note = el('span', 'plugin-stm-ai-assistant-field-hint', '（与其他书同 uid，勾选联动）');
+              box.append(note);
+            }
+            if (!entry.enabled) {
+              // 停用条目后端必跳过，勾它没有任何作用；锁死输入框，避免用户以为
+              // 「勾上就能改」，也避免它把同 uid 的启用条目一起联动掉。
+              box.classList.add('is-disabled');
+              const disabledInput = box.querySelector('input');
+              if (disabledInput) disabledInput.disabled = true;
+            }
             if (entry.skip_reason) {
               box.classList.add('is-protected');
               box.dataset.skipReason = String(entry.skip_reason);
@@ -993,14 +1120,19 @@ function buildPolishOptions(host, state, client, select) {
       const books = (current.scope && current.scope.items) || [];
       if (!books.length) return Promise.reject(new Error('作用域里没有世界书'));
 
-      const boxes = Array.from(host.querySelectorAll('input[type="checkbox"]'))
-        .filter((node) => node.checked && node.dataset.uid);
-      if (!boxes.length) {
+      // 作用域在预览之后被换掉：旧勾选属于旧作用域，不能拿来提交（重新走预览）。
+      if (!previewReady || previewedScope !== current.scope) {
+        selectedUids.clear();
+        previewedScope = null;
+        previewReady = false;
         return Promise.reject(new Error('请先点「预览」读取条目，并勾选要改写的内容'));
+      }
+      if (!selectedUids.size) {
+        return Promise.reject(new Error('预览里没有勾选任何条目，请勾选要改写的内容'));
       }
 
       // 条目 → 所属书：同一批作业可以横跨多本书，后端按 worldbook_source 分组回写
-      const wantedUids = new Set(boxes.map((node) => String(node.dataset.uid)));
+      const wantedUids = new Set(selectedUids);
       const sources = books
         .filter((book) => book.source_type !== 'embedded' || book.card_id)
         .map((book) => ({

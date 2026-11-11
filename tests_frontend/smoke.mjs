@@ -922,6 +922,267 @@ async function main() {
     assert.equal(protectedBox.classList.contains('is-protected'), true);
   });
 
+  // §9 断链四：预览后点「开始精简」永远报「提交失败：请先点「预览」读取条目」。
+  // 根因三连：
+  // 1) 勾选框渲染在 previewHost，而 submit 的参数 `host` 只是参数区（兄弟节点）；
+  // 2) `box.dataset.uid` 设在 checkbox() 返回的 wrapper <label> 上，旧提交查的是
+  //    `input[type=checkbox]` 的 dataset.uid，永远筛不出东西；
+  // 3) submit() 在调用任务 submit 前就 clear(previewHost)，DOM 即使查对也已没了。
+  // 回归锁定：预览 → 勾选 → 提交，请求体必须带上（且只带）勾选的 uid。
+  await check('世界书精简：预览勾选后提交必须带上 entry_uids', async () => {
+    const base = createFakeApi({ pending: 0 });
+    let submitted = null;
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (String(path).startsWith('/jobs/wi-rewrite')) {
+          base.calls.push(['api', path, options && options.body]);
+          submitted = (options && options.body) || null;
+          return { success: true, run_id: 'run-wi', total: 2, apply_mode: 'review' };
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createTaskPanel } = await import('../frontend/views/task.js');
+    const { createClient } = await import('../frontend/api.js');
+    const panel = createTaskPanel(
+      patched, createClient(patched), { providerId: 'p1', model: 'm1', notifyReview: () => {} }, 'polish',
+    );
+    await panel.refresh();
+    panel.applyContext({
+      source: 'context',
+      target: { kind: 'card', id: 'a.json', mode: 'cards' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const buttonByText = (text) => collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes(text));
+
+    const preview = buttonByText('预览');
+    assert.ok(preview, '缺少「预览」按钮');
+    preview.click();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const wrappers = collect(panel.element, (node) => node.dataset && node.dataset.uid);
+    assert.ok(wrappers.length >= 2, `预览没渲染条目勾选框（实际 ${wrappers.length} 个）`);
+    const inputs = wrappers.map((wrapper) => collect(wrapper, (node) => node.tagName === 'INPUT')[0]);
+    assert.equal(inputs.every(Boolean), true, '勾选框缺少 input');
+    assert.equal(inputs.every((node) => node.checked === true), true, 'enabled 条目应默认勾选');
+
+    // 取消勾选第二条（uid=2）：提交必须只带用户勾选的条目，而不是把预览默认值全带上
+    inputs[1].checked = false;
+    inputs[1].fire('change');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const start = buttonByText('开始');
+    assert.ok(start, '缺少「开始精简」按钮');
+    start.click();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    const texts = collect(panel.element, () => true).map((node) => String(node.textContent || ''));
+    assert.equal(texts.some((text) => text.includes('请先点「预览」读取条目')), false, '预览勾选后不该再报「提交失败」');
+    assert.ok(submitted, '预览勾选后提交没有发出 /jobs/wi-rewrite');
+    assert.deepEqual(submitted.entry_uids, ['1'], '提交必须只带勾选的 uid（2 已被取消勾选）');
+    assert.equal((submitted.worldbook_source || []).length, 1, 'worldbook_source 应带 1 本书');
+    assert.equal(submitted.worldbook_source[0].source_type, 'embedded', '内嵌世界书来源要透传');
+    assert.equal(submitted.worldbook_source[0].card_id, 'a.json', '内嵌世界书要带 card_id');
+    // 提交成功后本次勾选作废：屏幕上的清单让位给进度，「重跑」必须重新预览。
+    assert.equal(
+      collect(panel.element, (node) => node.dataset && node.dataset.uid).length,
+      0,
+      '提交成功后预览清单应收起（勾选已随作业作废）',
+    );
+  });
+
+  // 守卫的另一半：没预览就直接提交必须被拦住（不能退化成「后端按空选择=全部条目」）。
+  await check('世界书精简：没预览就提交仍提示先预览', async () => {
+    const base = createFakeApi({ pending: 0 });
+    let called = false;
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (String(path).startsWith('/jobs/wi-rewrite')) {
+          called = true;
+          return { success: true, run_id: 'run-wi' };
+        }
+        return base.api.api(path, options);
+      },
+    };
+    const { createTaskPanel } = await import('../frontend/views/task.js');
+    const { createClient } = await import('../frontend/api.js');
+    const panel = createTaskPanel(
+      patched, createClient(patched), { providerId: 'p1', model: 'm1', notifyReview: () => {} }, 'polish',
+    );
+    await panel.refresh();
+    panel.applyContext({
+      source: 'context',
+      target: { kind: 'card', id: 'a.json', mode: 'cards' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const start = collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes('开始'));
+    assert.ok(start, '缺少「开始精简」按钮');
+    start.click();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const texts = collect(panel.element, () => true).map((node) => String(node.textContent || ''));
+    assert.equal(texts.some((text) => text.includes('请先点「预览」读取条目')), true, '没预览要提示先预览');
+    assert.equal(called, false, '没预览时不该真的提交作业');
+  });
+
+  // 预览之后换作用域：旧勾选属于旧作用域，提交必须要求重新预览。
+  await check('世界书精简：预览后换作用域，提交要求重新预览', async () => {
+    const base = createFakeApi({ pending: 0 });
+    let called = false;
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (String(path).startsWith('/jobs/wi-rewrite')) {
+          called = true;
+          return { success: true, run_id: 'run-wi' };
+        }
+        return base.api.api(path, options);
+      },
+    };
+    const { createTaskPanel } = await import('../frontend/views/task.js');
+    const { createClient } = await import('../frontend/api.js');
+    const panel = createTaskPanel(
+      patched, createClient(patched), { providerId: 'p1', model: 'm1', notifyReview: () => {} }, 'polish',
+    );
+    await panel.refresh();
+    panel.applyContext({
+      source: 'context',
+      target: { kind: 'card', id: 'a.json', mode: 'cards' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent) === '预览')
+      .click();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+
+    // 换作用域（卡 → 分类），不重新预览
+    panel.applyContext({
+      source: 'context',
+      target: { kind: 'folder', mode: 'cards', path: '科幻' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    // 换作用域时旧预览必须撤掉：旧条目的勾选框留在屏幕上会让人以为它仍有效。
+    assert.equal(
+      collect(panel.element, (node) => node.dataset && node.dataset.uid).length,
+      0,
+      '换作用域后旧预览的勾选框应被清掉',
+    );
+    collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes('开始'))
+      .click();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const texts = collect(panel.element, () => true).map((node) => String(node.textContent || ''));
+    assert.equal(texts.some((text) => text.includes('请先点「预览」读取条目')), true, '换作用域要提示重新预览');
+    assert.equal(called, false, '换作用域后旧勾选不能直接提交');
+  });
+
+  // 预览是异步的：A 的响应迟到时，绝不能把 A 的条目当成本作用域（B）的条目提交。
+  // 旧实现没有请求令牌，A 的响应会覆盖 B 的预览，且 `previewedScope` 已是 B，
+  // 于是提交会带着「B 的书名 + A 的 uid」发出去 —— 直接写错书。
+  await check('世界书精简：迟到的旧预览响应不能用于提交', async () => {
+    const base = createFakeApi({ pending: 0 });
+    let submitted = null;
+    let releaseFirst = null;
+    let entriesCalls = 0;
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (String(path).startsWith('/wi/entries')) {
+          entriesCalls += 1;
+          if (entriesCalls === 1) {
+            // 第一次预览：挂起，等测试主动放行（模拟「先发后到」）
+            return new Promise((resolve) => {
+              releaseFirst = () => resolve({
+                success: true,
+                books: [{
+                  source: { source_type: 'embedded', card_id: 'a.json' },
+                  readable: true,
+                  total: 1,
+                  items: [{ uid: '1', name: 'A 的条目', tokens: 10, enabled: true, skip_reason: '', skip_label: '' }],
+                }],
+                items: [{ uid: '1', name: 'A 的条目', tokens: 10, enabled: true, skip_reason: '', skip_label: '' }],
+                total: 1,
+                sources: 1,
+                books_total: 1,
+                books_truncated: false,
+              });
+            });
+          }
+          return {
+            success: true,
+            books: [{
+              source: { source_type: 'embedded', card_id: 'b.json' },
+              readable: true,
+              total: 1,
+              items: [{ uid: '7', name: 'B 的条目', tokens: 20, enabled: true, skip_reason: '', skip_label: '' }],
+            }],
+            items: [{ uid: '7', name: 'B 的条目', tokens: 20, enabled: true, skip_reason: '', skip_label: '' }],
+            total: 1,
+            sources: 1,
+            books_total: 1,
+            books_truncated: false,
+          };
+        }
+        if (String(path).startsWith('/jobs/wi-rewrite')) {
+          submitted = (options && options.body) || null;
+          return { success: true, run_id: 'run-late' };
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createTaskPanel } = await import('../frontend/views/task.js');
+    const { createClient } = await import('../frontend/api.js');
+    const panel = createTaskPanel(
+      patched, createClient(patched), { providerId: 'p1', model: 'm1', notifyReview: () => {} }, 'polish',
+    );
+    await panel.refresh();
+    const previewBtn = () => collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent) === '预览');
+    const startBtn = () => collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes('开始'));
+
+    // 作用域 A：预览挂起
+    panel.applyContext({ source: 'context', target: { kind: 'card', id: 'a.json', mode: 'cards' } });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    previewBtn().click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(releaseFirst, '第一次预览没有挂起（用例前提不成立）');
+
+    // 切到作用域 B 并预览成功
+    panel.applyContext({ source: 'context', target: { kind: 'card', id: 'b.json', mode: 'cards' } });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    previewBtn().click();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    // 现在放行 A 的迟到响应
+    releaseFirst();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // 屏幕上必须是 B 的条目（A 的旧响应被丢弃）
+    const texts = collect(panel.element, () => true).map((node) => String(node.textContent || ''));
+    assert.equal(
+      texts.some((text) => text.includes('A 的条目')),
+      false,
+      '迟到的旧预览不该覆盖当前作用域的条目',
+    );
+    assert.equal(texts.some((text) => text.includes('B 的条目')), true, 'B 的条目应仍在屏幕上');
+
+    startBtn().click();
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.ok(submitted, 'B 的预览有效时提交应被接受');
+    assert.deepEqual(submitted.entry_uids, ['7'], '提交必须是 B 的 uid');
+    assert.equal(submitted.worldbook_source[0].card_id, 'b.json', '提交的书写必须是 B');
+  });
+
   // C13：删标签不可逆 —— 每条建议前有勾选框，且**默认不勾**。
   await check('分析的「建议删除标签」默认不勾选', async () => {
     const { createReview } = await import('../frontend/views/review.js');
