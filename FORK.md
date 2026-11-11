@@ -4,7 +4,7 @@
 
 - **上游**：ST-Manager 官方 AI 插件 `stm-ai-assistant`
 - **基线**：基于上游 **v0.3.0** 修改
-- **本副本版本**：**0.4.1**（见 `manifest.json`）
+- **本副本版本**：**0.5.0**（见 `manifest.json`）
 - **许可**：**Apache License 2.0**，详见 [`LICENSE`](LICENSE)
 
 > 本副本**未获上游作者背书**，也不代表上游立场。上游版权归原作者所有；
