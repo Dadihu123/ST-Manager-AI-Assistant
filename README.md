@@ -1,5 +1,7 @@
 # AI 角色卡分析助手（stm-ai-assistant）
 
+**版本 0.5.1** · ST-Manager 官方 AI 插件，按 **Apache-2.0** 分发。
+
 ST-Manager 的 AI 插件。批量把角色卡变成「一句话概览 + 结构化标签」，并把这件事做得可审计、可回滚、不重复扣费：
 
 - **服务端调用 LLM**：API Key 只存在服务端 `secrets.json`，永不下发浏览器。

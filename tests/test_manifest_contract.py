@@ -173,10 +173,15 @@ def test_manifest_id_and_version(manifest):
 
 
 def test_version_matches_docs(manifest):
-    """`manifest.version` 必须与 README / CHANGELOG / FORK.md 声称的版本一致。
+    """`manifest.version` 必须与 README 声称的版本一致。
 
-    README 写「本副本是版本 0.4.0」、manifest 却是 0.3.0 时，用户和宿主都无从判断
+    README 写「版本 0.4.0」、manifest 却是 0.3.0 时，用户和宿主都无从判断
     装的是哪一版；发布流程也依赖这个数字。
+
+    历史说明：这里原先还要求 `FORK.md` 存在并在文中声明版本号（Apache-2.0 §4(b)
+    对修改版的分发要求）。本插件现在是**官方发布版本**、不再是非官方修改版，
+    `FORK.md` 已随那次改动删除，因此不再要求该文件；`manifest.license` 仍是
+    `Apache-2.0`，许可证声明由 `LICENSE` 承担。
     """
     version = manifest['version']
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -184,10 +189,9 @@ def test_version_matches_docs(manifest):
     readme = open(os.path.join(root, 'README.md'), encoding='utf-8').read()
     assert f'版本 {version}' in readme, f'README 应声明版本 {version}'
 
-    fork = os.path.join(root, 'FORK.md')
-    assert os.path.isfile(fork), 'CHANGELOG 声明新增 FORK.md（Apache-2.0 §4(b) 要求），文件必须存在'
-    fork_text = open(fork, encoding='utf-8').read()
-    assert version in fork_text, f'FORK.md 应声明本副本版本 {version}'
+    # `license` 仍是 Apache-2.0 时随附的 LICENSE 必须在（发布包缺它会失去授权依据）
+    if str(manifest.get('license') or '') == 'Apache-2.0':
+        assert os.path.isfile(os.path.join(root, 'LICENSE')), 'LICENSE 文件必须存在'
 
 
 def test_api_version_and_min_app_version(manifest):
