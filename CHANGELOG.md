@@ -37,6 +37,28 @@
   联动并标注「与其他书同 uid，勾选联动」，不再让人以为可以只改其中一本。
 - 提交被前端拦下时（没预览 / 没勾选），预览清单不再被提前清空——用户看得到错误、
   也还看得到能勾的条目；只有真正提交成功后清单才让位给进度。
+- **资源目录世界书被当成「那张卡的内嵌书」读**：宿主 `api.worldbook.sources()`
+  给资源目录书填的 `card_id` 是「资源目录所属角色卡」，而宿主
+  `_resolve_worldbook_source` 只要看到 `card_id` 非空就按内嵌书解析。插件原样转发，
+  于是选中资源书时预览/作业都作用在**另一本书**上（实测：资源书 2 条被读成
+  该卡内嵌书 120 条），写回也会写错书。现在只有 `embedded` 才转发 `card_id`
+  （`scope.sourceCardId()`），global / resource 一律按 `file_path` 解析。
+- **每次写回都往用户的世界书 .json 里塞 `source_revision`**：它是宿主 `read` 注入的
+  运行时字段（`setdefault`），不属于世界书内容。写进文件后，宿主下次读取时
+  `setdefault` 不会覆盖这个陈旧值，于是**第二次**改写同一本**文件型世界书**
+  （global / resource；内嵌书读回来不带该键，不受影响）必定 `revision_conflict`，
+  「刷新后重试」也永远失败。三条写回路径（审批落地、自动落地、动作写回）现在都会
+  剥掉该字段。
+  **注意**：本修复只阻止新的污染。修复前已经被写过的书里仍留着那个陈旧的
+  `source_revision`，会继续报「请刷新后重试」—— 需要手工删掉该书 JSON 里的
+  `source_revision` 键（或从备份恢复）才能恢复。
+- **默认 Provider 没填密钥时自检误报「缺少 API Key」**：用户可以把默认留在没密钥的
+  provider 上（内置 openai），另加一个有密钥的（deepseek 等）并在面板里显式选它。
+  自检只看默认 provider，会把「明明跑得通」报成缺密钥，引导用户去填一个用不上的密钥。
+  现在默认 provider 没密钥时会再看任一有密钥的，并回传实际可用的 `provider_id`；
+  面板据此提示「默认 Provider 没有密钥，改用 X 可以正常运行」而不是报错。
+  补回归用例（`tests/test_routes.py`、`tests/test_wi_multi_book.py`、
+  `tests_frontend/smoke.mjs`）。
 
 <!-- release: 0.5.0 -->
 ## 0.5.0（2026-11-11）

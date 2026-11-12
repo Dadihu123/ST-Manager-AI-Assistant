@@ -250,7 +250,7 @@ function bookScope(books, label, customLabel = '') {
   const items = books.map((book) => ({
     source_type: book.source_type,
     file_path: book.file_path || '',
-    card_id: book.card_id || '',
+    card_id: sourceCardId(book),
     category: book.category || '',
     name: book.name || '',
   }));
@@ -263,6 +263,28 @@ function bookScope(books, label, customLabel = '') {
     empty: items.length === 0,
     huge: items.length > 50,
   };
+}
+
+/**
+ * 世界书来源里**该不该带 `card_id`**。
+ *
+ * 宿主 `core/plugins/api.py::_resolve_worldbook_source` 的判断是
+ * `if source_type in ('embedded', 'card') or card_id:` —— 只要 `card_id` 非空，
+ * **无论 `source_type` 写的是什么**，都会按「角色卡内嵌世界书」去解析。
+ *
+ * 但宿主 `api.worldbook.sources()` 给**资源目录世界书**也填了 `card_id`
+ * （那是资源目录所属角色卡的 `owner_card_id`，见 `pluginHost.js:1383`）。
+ * 原样转发就会把「资源书 2 条」读成「那张卡的内嵌书 120 条」：预览与作业都
+ * 作用在**另一本书**上，写回时同样的错位会把候选写进内嵌书。
+ *
+ * 所以只有 `embedded` 才带 `card_id`；global / resource 一律留空，
+ * 让宿主按 `file_path` 解析。
+ */
+export function sourceCardId(book) {
+  if (!book || typeof book !== 'object') return '';
+  const type = String(book.source_type || book.type || '').toLowerCase();
+  if (type !== 'embedded' && type !== 'card') return '';
+  return String(book.card_id || '');
 }
 
 /**
@@ -321,7 +343,9 @@ export function serializeScope(scope) {
       sources: scope.items.map((item) => ({
         source_type: item.source_type,
         file_path: item.file_path,
-        card_id: item.card_id,
+        // 只有内嵌书才允许带 card_id（见 `sourceCardId` 的注释：宿主见到
+        // card_id 就按内嵌书解析，资源书会被整个读错）。
+        card_id: sourceCardId(item),
       })),
     };
   }

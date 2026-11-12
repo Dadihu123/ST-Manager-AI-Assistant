@@ -350,11 +350,25 @@ export async function activate(api) {
       const providerReady = checks.provider && checks.provider.ok;
       const keyReady = checks.api_key && checks.api_key.ok;
       const bridgeReady = checks.summary_bridge && checks.summary_bridge.ok;
+      // 有密钥的可能不是默认 provider（用户把默认留在没填密钥的那个上，
+      // 另加一个有密钥的在面板里显式选）。这种情况不该报「缺少 API Key」——
+      // 任务跑得通，报警只会让用户去填一个用不上的密钥。
+      const keyedProvider = (checks.api_key && checks.api_key.provider_id) || '';
+      const defaultId = (checks.provider && checks.provider.default_id) || '';
+      const keyIsDefault = !keyedProvider || keyedProvider === defaultId;
 
       if (!providerReady) {
         api.host.toast('尚未配置 Provider，请到「AI 助手 → 设置」完成配置', 5000, 'settings-help-entry');
       } else if (!keyReady) {
         api.host.toast('Provider 缺少 API Key，请到「AI 助手 → 设置」填写', 5000, 'settings-help-entry');
+      } else if (!keyIsDefault) {
+        // 默认 provider 没有密钥、但在用别的：提示「该选哪个」，而不是报错。
+        api.host.toast(
+          `默认 Provider「${defaultId}」没有 API Key；改用「${keyedProvider}」可以正常运行，`
+            + '或在面板里显式选择它',
+          6000,
+          'settings-help-entry',
+        );
       }
       if (!bridgeReady) {
         api.host.toast('概览写入通道不可用，结果将只保存在插件内', 5000, 'settings-help-entry');

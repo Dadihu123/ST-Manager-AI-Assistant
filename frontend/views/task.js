@@ -40,6 +40,7 @@ import {
   normalizeTarget,
   readHostSelection,
   resolveScope,
+  sourceCardId,
 } from '../scope.js';
 import { getTask, taskActionLabel } from '../tasks.js';
 
@@ -1007,7 +1008,9 @@ function buildPolishOptions(host, state, client, select) {
         worldbook_source: books.map((book) => ({
           source_type: book.source_type || 'global',
           file_path: book.file_path || '',
-          card_id: book.card_id || '',
+          // 只有内嵌书才给 card_id：宿主见到 card_id 就按内嵌书解析，
+          // 资源目录书的 card_id 是「资源目录所属卡」，转发会把书读错。
+          card_id: sourceCardId(book),
         })),
       };
     },
@@ -1138,7 +1141,8 @@ function buildPolishOptions(host, state, client, select) {
         .map((book) => ({
           source_type: book.source_type || 'global',
           file_path: book.file_path || '',
-          card_id: book.card_id || '',
+          // 同上：只有内嵌书带 card_id（资源书的 card_id 属于「资源目录所属卡」）。
+          card_id: sourceCardId(book),
         }));
 
       // 落地策略：用户动过就以用户为准；没动过则按待处理条目数自动切

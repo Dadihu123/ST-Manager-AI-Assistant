@@ -529,6 +529,47 @@ def test_run_wi_rewrite_writes_back_after_validation(env, monkeypatch):
     assert '设定内容。' * 15 in writes[0]['data']['entries'][0]['content']
 
 
+def test_run_wi_rewrite_does_not_persist_source_revision(env, monkeypatch):
+    """自动落地写回**不能**把宿主注入的 `source_revision` 写进世界书文件。
+
+    这条路径是批量处理的默认路径（勾选 > 5 条 → 落地策略 enforce → apply_mode=auto），
+    比审批路径更容易踩到。`source_revision` 是 `api.worldbook.read` 的运行时字段
+    （读文件后 `setdefault` 注入），写进用户的 .json 之后，宿主下次读取时
+    `setdefault` 不会覆盖文件里的陈旧值，于是**第二次**改写这本书必失败
+    （expected_revision 陈旧 ≠ 实际文件 revision → revision_conflict，
+    且「刷新后重试」拿到的还是同一个陈旧值）。
+    """
+    api, store = env
+    book = _book([{
+        'uid': '1', 'comment': '世界观', 'keys': ['世界'],
+        'content': '魔法来自「元素之心」。' + '设定内容。' * 40,
+    }])
+    api.worldbook.read = lambda source: book
+    writes = []
+    api.worldbook.write = lambda source, data, expected_revision='': (
+        writes.append({'source': source, 'data': data, 'expected': expected_revision}) or
+        {'success': True, 'source_revision': 'rev-2'}
+    )
+    api.backups.snapshot_card = lambda card_id, remark='': None
+
+    monkeypatch.setattr(jobs.llm_module if hasattr(jobs, 'llm_module') else jobs.llm, 'chat',
+                        lambda messages, **kwargs: {
+                            'content': '魔法来自「元素之心」。' + '设定内容。' * 15,
+                            'usage': {'prompt_tokens': 100, 'completion_tokens': 30},
+                        })
+
+    ctx = FakeCtx([{'key': '1', 'payload': {'card_id': 'Alice.png', 'entry_uid': '1'}}],
+                  payload={'provider_id': 'openai', 'apply_mode': 'auto'})
+    jobs.run_wi_rewrite(ctx, api=api, store=store)
+
+    assert writes, '应该写回一次'
+    assert 'source_revision' not in writes[0]['data'], (
+        'source_revision 是宿主注入的运行时字段，不能写进世界书文件'
+    )
+    # 乐观锁仍要按读到的 revision 传，别顺手把并发保护改没了
+    assert writes[0]['expected'] == 'rev-1'
+
+
 # ------------------------------------------------------------------ C21 检查器策略
 #
 # §6.2 的判定矩阵。三条硬规则：

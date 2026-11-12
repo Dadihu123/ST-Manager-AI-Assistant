@@ -78,6 +78,29 @@ def test_health_reports_missing_api_key(tmp_path):
     assert payload['checks']['api_key']['ok'] is False
 
 
+def test_health_key_check_accepts_non_default_provider(tmp_path):
+    """默认 provider 没密钥、另有一个有密钥 → 自检必须判就绪。
+
+    真实场景：用户把默认留在一个没填密钥的 provider 上（内置 openai），
+    另外加一个有密钥的（deepseek 之类）并在面板里显式选它。只看默认 provider
+    会报「缺少 API Key」，用户会去填一个根本用不上的密钥。
+    """
+    client, _api, _store = build_app(secrets={}, tmp_path=tmp_path)
+    # 两个 provider：默认的 p1 无密钥，p2 有专属密钥
+    client.post('/providers', json={'provider': {
+        'id': 'p2', 'name': 'P2', 'base_url': 'https://api.deepseek.com/v1', 'model': 'm2',
+    }})
+    client.post('/providers/p2/secrets', json={'api_key': 'sk-p2'})
+
+    payload = client.get('/health').get_json()
+    checks = payload['checks']
+    assert checks['api_key']['ok'] is True, '有任一 provider 配了密钥就算就绪'
+    assert checks['api_key']['provider_id'] == 'p2'
+    assert checks['api_key']['is_default'] is False, '要让 UI 知道可用的是非默认 provider'
+
+    client.post('/providers/p2/secrets', json={'api_key': ''})
+
+
 def test_cards_lists_from_database(tmp_path):
     rows = [{'id': 'Alice.png', 'char_name': 'Alice', 'tags': '["奇幻"]'}]
     client, _api, _store = build_app(db_rows=rows, tmp_path=tmp_path)

@@ -72,10 +72,12 @@ def build_client(workdir, books):
         return books.get(key)
 
     written = {}
+    written_payloads = {}
 
     def write_worldbook(source, data, expected_revision=''):
         key = source.get('file_path') or source.get('card_id') or ''
         written[key] = [entry.get('content') for entry in data.get('entries') or []]
+        written_payloads[key] = data
         return {'success': True, 'source_revision': 'r2', 'msg': '', 'error': ''}
 
     api.worldbook.read = read_worldbook
@@ -180,6 +182,48 @@ def test_apply_writes_back_to_uid_zero_entry(workdir, monkeypatch):
     assert payload['success'] is True
     assert payload['applied'] == 1
     assert written['lorebooks/zero.json'] == ['rewritten-0', 'zz1']
+
+
+def test_apply_does_not_persist_source_revision(workdir, monkeypatch):
+    """写回世界书时**不能**把宿主注入的 `source_revision` 写进文件。
+
+    它是 `api.worldbook.read` 的运行时字段（读文件后 `setdefault` 注入），
+    不属于世界书内容。写进用户的 .json 会污染文件；更糟的是**第二次**改写
+    这本书必失败：宿主再次读文件时 `setdefault` 不会覆盖文件里那个陈旧值，
+    于是 `expected_revision`（陈旧）≠ 实际文件 revision，写回报
+    `revision_conflict`，用户「刷新后重试」拿到的还是同一个陈旧值。
+    """
+    client, api, store, _written = build_client(workdir, ZERO_BOOKS)
+    items = [{
+        'key': '0', 'status': 'done',
+        'result': {
+            'entry_uid': '0', 'candidate': 'rewritten-0',
+            'worldbook_source': ZERO_SOURCE,
+        },
+    }]
+    monkeypatch.setattr(routes_module, '_load_job_items', lambda *a, **k: items)
+
+    captured = {}
+
+    def capture_write(source, data, expected_revision=''):
+        captured['data'] = data
+        captured['expected'] = expected_revision
+        return {'success': True, 'source_revision': 'r2', 'msg': '', 'error': ''}
+
+    api.worldbook.write = capture_write
+
+    app = client.application
+    with app.test_request_context('/jobs/run/apply', method='POST', json={}):
+        payload = routes_module._apply_wi_rewrite(
+            api, store, 'run-zero', {'payload': {}}, {},
+        ).get_json()
+
+    assert payload['applied'] == 1
+    assert 'source_revision' not in captured['data'], (
+        'source_revision 是宿主注入的运行时字段，不能写进世界书文件'
+    )
+    # 但乐观锁仍然要按读到的 revision 传
+    assert captured['expected'] == 'r1'
 
 
 def test_trimming_entry_uid_handles_zero_and_missing():

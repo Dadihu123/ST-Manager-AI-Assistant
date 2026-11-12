@@ -623,16 +623,32 @@ def register_routes(api, store) -> None:
     @api.http.route('/health', ['GET'])
     @_handle_errors
     def get_health():
-        """自检：概览 bridge、密钥、provider 是否就绪。"""
+        """自检：概览 bridge、密钥、provider 是否就绪。
+
+        密钥检查**不能只看默认 provider**：用户完全可以把默认留在一个没填密钥的
+        provider（比如内置的 openai）上，另外加一个有密钥的（deepseek 之类），
+        然后在面板里显式选它。只看默认 provider 会报「缺少 API Key」，而实际上
+        任务跑得通 —— 用户会照着提示去填一个根本用不上的密钥。
+        所以：默认 provider 没有密钥时，再看**任意一个**有密钥的 provider，
+        有就判就绪，并把实际可用的那个回传（面板据此决定要不要报警）。
+        """
         providers = store.describe_providers()
         default_provider = None
         for item in providers:
             if item.get('is_default'):
                 default_provider = item
 
-        key_ready = bool(
-            default_provider and (default_provider.get('has_api_key') or default_provider.get('has_fallback_key'))
-        )
+        def _key_ready(item):
+            return bool(item and (item.get('has_api_key') or item.get('has_fallback_key')))
+
+        key_ready = _key_ready(default_provider)
+        keyed_provider = default_provider if key_ready else None
+        if not key_ready:
+            for item in sorted(providers, key=lambda entry: str(entry.get('id') or '')):
+                if _key_ready(item):
+                    keyed_provider = item
+                    key_ready = True
+                    break
         bridge = summary_bridge.read_summary(api, '__probe__')
 
         return _ok(
@@ -647,7 +663,12 @@ def register_routes(api, store) -> None:
                     'base_url': (default_provider or {}).get('base_url', ''),
                     'model': (default_provider or {}).get('model', ''),
                 },
-                'api_key': {'ok': key_ready},
+                'api_key': {
+                    'ok': key_ready,
+                    # 真正有密钥的那个 provider：可能不是默认的那个。
+                    'provider_id': (keyed_provider or {}).get('id', ''),
+                    'is_default': bool(keyed_provider and keyed_provider.get('is_default')),
+                },
             },
         )
 
@@ -2600,6 +2621,15 @@ def _apply_wi_rewrite(api, store, run_id: str, job, payload) -> dict:
                 logger.warning('世界书应用前快照失败', exc_info=True)
 
         updated = dict(book)
+        # `source_revision` 是**宿主注入的运行时字段**（`api.worldbook.read` 里
+        # `payload.setdefault('source_revision', build_file_source_revision(path))`），
+        # 不是世界书自身的元数据。把它连同 entries 一起写回去会：
+        #   1. 往用户的 .json 里塞一个 `source_revision` 键（污染文件）；
+        #   2. 让**第二次**改写这本书时必失败——宿主读文件后 `setdefault` 不会
+        #      覆盖文件里那个陈旧值，于是 expected_revision（陈旧）≠ 实际文件
+        #      revision，写回报 `revision_conflict`，用户只能「刷新后重试」，
+        #      而刷新拿到的是同一个陈旧值，重试仍然失败。
+        updated.pop('source_revision', None)
         updated['entries'] = updated_entries
 
         outcome = api.worldbook.write(

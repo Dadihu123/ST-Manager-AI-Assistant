@@ -1086,8 +1086,19 @@ def run_wi_rewrite(ctx, *, api, store) -> None:
     write_errors = []
     for bucket in pending_writes.values():
         try:
+            # `source_revision` 是宿主 `api.worldbook.read` 注入的**运行时字段**
+            # （读文件后 `setdefault`），不属于世界书内容：
+            #   - 写进用户的 .json 会污染文件；
+            #   - 更糟的是这本书**第二次**改写必失败：宿主再次读文件时 `setdefault`
+            #     不会覆盖文件里那个陈旧值，于是 expected_revision（陈旧）≠ 实际
+            #     文件 revision，写回报 revision_conflict，「刷新后重试」也一直是
+            #     同一个陈旧值。
+            # 这一条是**自动落地的主路径**（批量默认 enforce+auto），必须和
+            # `routes._apply_wi_rewrite` / `actions._action_write_worldbook` 一致。
+            payload_book = dict(bucket['book'])
+            payload_book.pop('source_revision', None)
             result = api.worldbook.write(
-                bucket['source'], bucket['book'],
+                bucket['source'], payload_book,
                 expected_revision=str(bucket['book'].get('source_revision') or ''),
             )
             if result.get('success'):

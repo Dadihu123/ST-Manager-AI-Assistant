@@ -1183,6 +1183,104 @@ async function main() {
     assert.equal(submitted.worldbook_source[0].card_id, 'b.json', '提交的书写必须是 B');
   });
 
+  // 资源目录世界书：宿主 `api.worldbook.sources()` 会给它填 `card_id`
+  // （= 资源目录所属角色卡），而宿主 `_resolve_worldbook_source` 见到非空
+  // `card_id` 就按「角色卡内嵌书」解析。原样转发 → 预览/作业都作用在
+  // **那张卡的内嵌书**上（实测：资源书 2 条被读成内嵌书 120 条），写回也会
+  // 写错书。这里锁定：global / resource 一律不带 card_id，只有 embedded 带。
+  await check('世界书精简：资源目录书不能被 card_id 劫持成内嵌书', async () => {
+    const { sourceCardId, serializeScope } = await import('../frontend/scope.js');
+    assert.equal(sourceCardId({ source_type: 'resource', card_id: '创世回廊1.5.json' }), '',
+      '资源目录书不该带 card_id');
+    assert.equal(sourceCardId({ source_type: 'global', card_id: 'whatever' }), '',
+      '全局书不该带 card_id');
+    assert.equal(sourceCardId({ source_type: 'embedded', card_id: 'a.png' }), 'a.png',
+      '内嵌书必须带 card_id');
+
+    const serialized = serializeScope({
+      kind: 'wi-selection',
+      mode: 'worldinfo',
+      items: [
+        { source_type: 'resource', file_path: '/res/创世回廊1.5_2/lorebooks/x.json', card_id: '创世回廊1.5.json' },
+        { source_type: 'global', file_path: '/lib/lorebooks/y.json', card_id: '' },
+        { source_type: 'embedded', file_path: '', card_id: 'a.png' },
+      ],
+    });
+    assert.equal(serialized.sources[0].card_id, '', 'serializeScope 也要剥掉资源书的 card_id');
+    assert.equal(serialized.sources[0].file_path, '/res/创世回廊1.5_2/lorebooks/x.json');
+    assert.equal(serialized.sources[2].card_id, 'a.png', '内嵌书的 card_id 要在');
+  });
+
+  // 端到端同一件事：预览与提交的 worldbook_source 都不能带资源书的 card_id。
+  await check('世界书精简：资源书的预览与提交请求都剥掉 card_id', async () => {
+    const base = createFakeApi({ pending: 0 });
+    const seen = [];
+    let submitted = null;
+    const patched = {
+      ...base.api,
+      worldbook: {
+        ...base.api.worldbook,
+        sources: ({ category = '' } = {}) => ([{
+          id: 'resource::创世回廊1.5.json::资源测试世界书.json',
+          source_type: 'resource',
+          file_path: '/res/创世回廊1.5_2/lorebooks/资源测试世界书.json',
+          card_id: '创世回廊1.5.json',
+          category,
+          name: '资源测试世界书',
+        }]),
+      },
+      api: (path, options = {}) => {
+        seen.push([path, options && options.body]);
+        if (String(path).startsWith('/wi/entries')) {
+          const body = (options && options.body) || {};
+          return {
+            success: true,
+            books: (body.worldbook_source || []).map((source) => ({
+              source, readable: true, total: 1, source_revision: 'r',
+              items: [{ uid: '0', name: '资源条目甲', tokens: 20, enabled: true, skip_reason: '', skip_label: '' }],
+            })),
+            items: [{ uid: '0', name: '资源条目甲', tokens: 20, enabled: true, skip_reason: '', skip_label: '' }],
+            total: 1, sources: 1, books_total: 1, books_truncated: false,
+          };
+        }
+        if (String(path).startsWith('/jobs/wi-rewrite')) {
+          submitted = (options && options.body) || null;
+          return { success: true, run_id: 'run-resource', total: 1 };
+        }
+        return base.api.api(path, options);
+      },
+    };
+
+    const { createTaskPanel } = await import('../frontend/views/task.js');
+    const { createClient } = await import('../frontend/api.js');
+    const panel = createTaskPanel(
+      patched, createClient(patched), { providerId: 'p1', model: 'm1', notifyReview: () => {} }, 'polish',
+    );
+    await panel.refresh();
+    panel.applyContext({
+      source: 'context',
+      target: { kind: 'selection', mode: 'worldinfo', ids: ['resource::创世回廊1.5.json::资源测试世界书.json'] },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const btn = (text) => collect(panel.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes(text));
+    btn('预览').click();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const entriesCall = seen.find(([path]) => String(path).startsWith('/wi/entries'));
+    assert.ok(entriesCall, '没发出预览请求');
+    assert.equal(entriesCall[1].worldbook_source[0].card_id, '',
+      '预览请求不能带资源书的 card_id（否则宿主读成内嵌书）');
+    assert.equal(entriesCall[1].worldbook_source[0].source_type, 'resource');
+
+    btn('开始').click();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.ok(submitted, '没发出提交请求');
+    assert.equal(submitted.worldbook_source[0].card_id, '',
+      '提交请求也不能带资源书的 card_id（否则作业与写回都落到内嵌书）');
+    assert.deepEqual(submitted.entry_uids, ['0']);
+  });
+
   // C13：删标签不可逆 —— 每条建议前有勾选框，且**默认不勾**。
   await check('分析的「建议删除标签」默认不勾选', async () => {
     const { createReview } = await import('../frontend/views/review.js');

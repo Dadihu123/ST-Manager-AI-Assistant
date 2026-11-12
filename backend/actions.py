@@ -196,8 +196,13 @@ def _action_write_worldbook(api, store, card_id, value, params, context) -> dict
     except Exception:  # noqa: BLE001
         logger.warning('世界书改写前快照失败', exc_info=True)
 
+    # `source_revision` 是宿主 `read` 注入的运行时字段，不属于世界书内容：
+    # 连同 entries 一起 write 回去会污染用户的 .json，并让这本书**第二次**
+    # 改写必定 revision_conflict（宿主读文件时 setdefault 不会覆盖陈旧值）。
+    payload = dict(current)
+    payload.pop('source_revision', None)
     result = api.worldbook.write(
-        source, current, expected_revision=str(current.get('source_revision') or ''),
+        source, payload, expected_revision=str(current.get('source_revision') or ''),
     )
     ok = bool(result.get('success'))
     return {
