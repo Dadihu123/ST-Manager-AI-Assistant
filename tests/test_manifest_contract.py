@@ -197,14 +197,15 @@ def test_version_matches_docs(manifest):
 def test_api_version_and_min_app_version(manifest):
     """v3：`api_version` 与 `manifest_version` 都固定为 3（不保留 v2 兼容）。
 
-    `min_app_version` 钉住**能力依赖**：本插件自 0.4.1 起要求宿主
-    `api.worldbook.sources()` 回传 `id`（用来和 `api.host.selection()` 的选中集
-    对交集）。宿主 1.1.0 才加上该字段，所以下限必须是 1.1.0——写成 1.0.0 时
-    旧主程序会静默装上、「精简选中世界书」报「无法识别选中的世界书」。
+    `min_app_version` 钉住**能力依赖**：宿主 1.1.0 起，
+    `api.worldbook.sources()` 回传 `id`，供插件与 `api.host.selection()` 的选中集
+    求交；宿主 1.2.1 起，`api.cards.write_note()` 支持 `expected_text` 条件写入，
+    供本地备注合成检测并发编辑。较旧主程序若仍装载插件，可能覆盖并发保存的备注，
+    因此最低版本必须为 1.2.1。
     """
     assert manifest['api_version'] == 3
     assert manifest['manifest_version'] == 3
-    assert manifest['min_app_version'] == '1.1.0'
+    assert manifest['min_app_version'] == '1.2.1'
 
 
 def test_legacy_keys_are_gone(manifest, frontend, contributions):

@@ -297,7 +297,9 @@ export function createProfiles(api, client, context) {
     advanced.append(field(
       'apply_actions（JSON）', fields.apply_actions,
       '模型答完后按顺序执行的动作：write_card_note / apply_tags / write_card_fields / '
-      + 'write_worldbook / queue_suggestions / move_cards',
+      + 'write_worldbook / queue_suggestions / move_cards。'
+      + 'write_card_note 可用 params.mode 单独钉死本地备注写法'
+      + '（append / prepend / replace / skip），省略则跟随设置里的全局选项',
     ));
 
     const selectorBox = buildSelectorSection(profile);

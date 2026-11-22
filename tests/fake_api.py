@@ -222,7 +222,9 @@ class _FakeCards:
     def read_notes(self, card_ids):
         return {str(cid): self.read_note(cid) for cid in (card_ids or [])}
 
-    def write_note(self, card_id, text):
+    def write_note(self, card_id, text, *, expected_text=None):
+        if expected_text is not None and self.read_note(card_id) != str(expected_text):
+            return False
         self._api._notes[str(card_id)] = str(text or '')
         return True
 

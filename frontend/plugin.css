@@ -179,6 +179,61 @@
   font-style: italic;
 }
 
+/* 「概览写到本地备注」的单选组：与 checkboxes 同一视觉重量，但横向换行。
+ * 默认折叠的 AI 段说明放在 hint 里，这里只保证四个选项挤在一行时也能读。 */
+.plugin-stm-ai-assistant-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.78rem;
+  color: var(--content-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.plugin-stm-ai-assistant-write-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.plugin-stm-ai-assistant-row.is-note-mode {
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+/* 条目里「卡片现有本地备注」：让用户在落地前看到自己写的东西还在不在。
+ * 用左侧竖线而不是背景色块 —— 它是一条附注，不该抢 AI 概览的视觉层级。 */
+.plugin-stm-ai-assistant-local-note {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-subtle, rgba(127, 127, 127, 0.35));
+}
+
+.plugin-stm-ai-assistant-local-note-label {
+  font-size: 0.72rem;
+  color: var(--content-muted);
+}
+
+.plugin-stm-ai-assistant-local-note-text {
+  font-size: 0.78rem;
+  color: var(--content-secondary);
+  white-space: pre-wrap;
+  /* 长备注收一格，避免把整条结果撑高（每条都撑开的话 50 条就没法看了） */
+  max-height: 4.5rem;
+  overflow: hidden;
+}
+
+/* 设置页的写入方式：字段本身是宽块，说明跟在下面而不是右侧。 */
+.plugin-stm-ai-assistant-note-mode-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 /* ------------------------------------------------------------ 涓嬫媺妗嗭紙styledSelect锛? * 澶嶅埢涓荤▼搴?components/styled_select.html + components.css .icon-select 鐨勭粨鏋勪笌浜や簰锛? * 绫诲悕鍔犳彃浠跺墠缂€浠ユ弧瓒?F11锛涜瑙?token 鍏ㄩ儴澶嶇敤涓荤▼搴忋€?*/
 
 .plugin-stm-ai-assistant-select {

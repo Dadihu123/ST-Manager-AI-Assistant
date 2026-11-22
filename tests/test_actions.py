@@ -10,6 +10,7 @@ from conftest import load_backend_submodule
 
 pytest.importorskip('flask', reason='装配层依赖 flask')
 actions = load_backend_submodule('actions')
+note_merge = load_backend_submodule('core.note_merge')
 errors = load_backend_submodule('core.errors')
 
 from fake_api import FakeApi  # noqa: E402
@@ -36,11 +37,130 @@ def run(action_list, result, api, store, card_id='Alice.png', context=None):
 
 
 def test_write_card_note_writes_note(api, store):
+    """本地备注为空时，默认策略（append）写入的是一段带标记的 AI 内容。"""
     outcome = run([{'from': 'summary', 'action': 'write_card_note'}],
                   {'summary': '一段概览'}, api, store)
 
     assert outcome['applied'] is True
-    assert api._notes['Alice.png'] == '一段概览'
+    written = api._notes['Alice.png']
+    assert '一段概览' in written
+    # 必须带分隔标记：重复打标要靠它认出「上一段 AI 内容」并替换掉
+    assert note_merge.NOTE_BLOCK_START in written
+    assert note_merge.NOTE_BLOCK_END in written
+
+
+def test_write_card_note_keeps_existing_user_note_by_default(api, store):
+    """回归：AI 简介**不得**再冲掉用户手写的本地备注。"""
+    api._notes['Alice.png'] = '我自己写的备注'
+
+    outcome = run([{'from': 'summary', 'action': 'write_card_note'}],
+                  {'summary': 'AI 概览'}, api, store)
+
+    assert outcome['applied'] is True
+    written = api._notes['Alice.png']
+    assert written.startswith('我自己写的备注'), '用户备注必须在前面且原样保留'
+    assert 'AI 概览' in written
+    assert outcome['actions'][0]['kept_chars'] == len('我自己写的备注')
+
+
+def test_write_card_note_prepend_mode(api, store):
+    api._notes['Alice.png'] = '用户备注'
+    outcome = run([{'from': 'summary', 'action': 'write_card_note'}],
+                  {'summary': 'AI 概览'}, api, store,
+                  context={'note_mode': 'prepend'})
+
+    assert outcome['applied'] is True
+    written = api._notes['Alice.png']
+    assert written.endswith('用户备注')
+    assert 'AI 概览' in written
+
+
+def test_write_card_note_replace_mode_overwrites(api, store):
+    """只有显式选「覆盖」时，旧行为才会发生。"""
+    api._notes['Alice.png'] = '用户备注'
+    outcome = run([{'from': 'summary', 'action': 'write_card_note'}],
+                  {'summary': 'AI 概览'}, api, store,
+                  context={'note_mode': 'replace'})
+
+    assert outcome['applied'] is True
+    written = api._notes['Alice.png']
+    assert '用户备注' not in written, '覆盖模式就是要把原内容换掉'
+    assert 'AI 概览' in written
+    assert outcome['actions'][0]['kept_chars'] == 0
+
+
+def test_write_card_note_skip_mode_writes_nothing(api, store):
+    api._notes['Alice.png'] = '用户备注'
+    outcome = run([{'from': 'summary', 'action': 'write_card_note'}],
+                  {'summary': 'AI 概览'}, api, store,
+                  context={'note_mode': 'skip'})
+
+    assert outcome['applied'] is False, '跳过就不能报成「已落地」'
+    assert outcome['actions'][0]['skipped'] == 'mode_skip'
+    assert outcome['actions'][0]['changed'] is False
+    assert outcome['actions'][0]['origin'] == ''
+    assert api._notes['Alice.png'] == '用户备注', '跳过时一个字都不能动'
+    assert any('不写简介' in item for item in outcome['warnings'])
+
+
+def test_write_card_note_repeated_runs_do_not_stack(api, store):
+    """重复打标只替换上一次的 AI 段，不会叠加出十份简介。"""
+    api._notes['Alice.png'] = '用户备注'
+    for _ in range(3):
+        run([{'from': 'summary', 'action': 'write_card_note'}],
+            {'summary': 'AI 概览 v1'}, api, store)
+    run([{'from': 'summary', 'action': 'write_card_note'}],
+        {'summary': 'AI 概览 v2'}, api, store)
+
+    written = api._notes['Alice.png']
+    assert written.count('AI 概览 v1') == 0, '旧简介必须被替换掉'
+    assert written.count('AI 概览 v2') == 1
+    assert written.count('用户备注') == 1, '用户备注不得被重复写入或丢失'
+
+
+def test_write_card_note_unchanged_content_is_not_rewritten(api, store):
+    """同一份简介再打一次标：备注已经就是这个内容，不该再写盘。"""
+    run([{'from': 'summary', 'action': 'write_card_note'}],
+        {'summary': '同一段概览'}, api, store)
+    first = api._notes['Alice.png']
+
+    writes = []
+    original = api.cards.write_note
+    api.cards.write_note = lambda card_id, text: writes.append(text) or original(card_id, text)
+    try:
+        outcome = run([{'from': 'summary', 'action': 'write_card_note'}],
+                      {'summary': '同一段概览'}, api, store)
+    finally:
+        api.cards.write_note = original
+
+    assert writes == [], '内容没变就不该写盘'
+    assert outcome['actions'][0]['skipped'] == 'unchanged'
+    assert outcome['actions'][0]['changed'] is False
+    assert outcome['actions'][0]['origin'] == 'card_note'
+    assert api._notes['Alice.png'] == first
+
+
+def test_write_card_note_does_not_data_loss_when_read_fails(api, store):
+    """读不到当前备注时**不能**当成空备注写 —— 那正好会覆盖用户内容。"""
+    api._notes['Alice.png'] = '用户备注'
+    original = api.cards.read_note
+
+    def boom(card_id):
+        raise RuntimeError('备注读取失败')
+
+    api.cards.read_note = boom
+    try:
+        outcome = run([{'from': 'summary', 'action': 'write_card_note'}],
+                      {'summary': 'AI 概览'}, api, store)
+    finally:
+        api.cards.read_note = original
+
+    assert api._notes['Alice.png'] == '用户备注', '读失败时一个字都不能写进卡片'
+    assert outcome['actions'][0]['ok'] is False
+    assert outcome['actions'][0]['origin'] == 'namespace'
+    # 结果不能就这么丢掉：降级存进插件自己的元数据
+    meta = store.get_card_meta('Alice.png')
+    assert meta.get('summary_origin') == 'namespace'
 
 
 def test_write_card_note_skips_empty_value(api, store):

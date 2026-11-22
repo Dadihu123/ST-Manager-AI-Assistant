@@ -25,8 +25,12 @@ export function createClient(api) {
     status: () => call('/status'),
     health: () => call('/health'),
     settings: () => call('/settings'),
-    saveSettings: (modelCapabilities) =>
-      call('/settings', { method: 'POST', body: { model_capabilities: modelCapabilities } }),
+    /** `modelCapabilities` 之外的 `noteMode` 可选：省略表示这次不改写入策略。 */
+    saveSettings: (modelCapabilities, noteMode = '') => {
+      const body = { model_capabilities: modelCapabilities };
+      if (noteMode) body.note_mode = noteMode;
+      return call('/settings', { method: 'POST', body });
+    },
 
     // 标签池（分类白/黑名单）：GET 同时返回可选的标签分类清单
     tagPool: () => call('/tag-pool'),

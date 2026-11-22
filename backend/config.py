@@ -7,6 +7,7 @@
 import re
 
 from .core import modelcap as modelcap_core
+from .core import note_merge
 from .core import selector as selector_core
 from .core import tagpool as tagpool_core
 
@@ -14,6 +15,10 @@ DEFAULT_CONFIG = {
     'default_profile_id': '',
     'max_tags': 8,
     'summary_max_chars': 300,
+    # 「简介写进本地备注」的合成策略：append / prepend / replace / skip。
+    # 默认 append —— 用户的本地备注是**用户自己写的地方**，不能再被一次打标
+    # 静默覆盖（用户反馈的原始问题）。
+    'note_mode': note_merge.DEFAULT_NOTE_MODE,
     # 全局「标签置信度下限」已删除：门槛改为按分类配置（见 tag_category_rules）。
     # 未单独设置的分类用 tagpool.DEFAULT_CATEGORY_CONFIDENCE（0.5）。
     'batch_size': 5,
@@ -174,6 +179,9 @@ def normalize_config(raw) -> dict:
                             minimum=1, maximum=tagpool_core.MAX_LABEL_COUNT),
         'summary_max_chars': _to_int(data.get('summary_max_chars'),
                                      DEFAULT_CONFIG['summary_max_chars'], minimum=50, maximum=2000),
+        'note_mode': note_merge.normalize_mode(
+            data.get('note_mode', DEFAULT_CONFIG['note_mode']),
+        ),
         'tag_category_rules': tag_rules,
         'batch_size': _to_int(data.get('batch_size'), DEFAULT_CONFIG['batch_size'], minimum=1, maximum=50),
         'concurrency': _to_int(data.get('concurrency'), DEFAULT_CONFIG['concurrency'], minimum=1, maximum=8),

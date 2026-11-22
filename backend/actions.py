@@ -23,6 +23,7 @@
 
 import logging
 
+from . import config as config_module
 from .core.errors import AiAssistantError
 from .core import trimming as trimming_core
 
@@ -33,22 +34,56 @@ logger = logging.getLogger(__name__)
 
 
 def _action_write_card_note(api, store, card_id, value, params, context) -> dict:
-    """把字段值写进主程序的本地备注（概览）。"""
+    """把字段值写进主程序的本地备注（概览）。
+
+    **写哪儿由 `note_mode` 决定**（`append` / `prepend` / `replace` / `skip`）：
+    本地备注是用户自己写的地方，不能被一次打标静默覆盖。合成逻辑在
+    `core/note_merge.py`，`summary_bridge.write_summary()` 是唯一入口。
+
+    优先级：`params['mode']`（task spec 可以针对动作单独钉死）> `context['note_mode']`
+    （本次落地的用户选择）> 配置里的 `note_mode`。
+    """
     from . import summary_bridge  # 局部导入：避免与 jobs 成环
 
     text = str(value or '').strip()
+    mode = str(params.get('mode') or context.get('note_mode') or '').strip()
+    if not mode:
+        # 兜底读配置：直连 `run_actions` 的调用方（CLI、测试）不必都传 mode
+        try:
+            mode = str(config_module.load_config(api).get('note_mode') or '')
+        except Exception:  # noqa: BLE001 - 配置读不到就走默认策略
+            mode = ''
+
     if not text:
-        return {'ok': True, 'applied': False, 'skipped': 'empty', 'message': ''}
+        return {
+            'ok': True, 'applied': False, 'changed': False, 'origin': '',
+            'skipped': 'empty', 'message': '',
+        }
 
     result = summary_bridge.write_summary(
-        api, store, card_id, text, ui_key=context.get('ui_key', ''),
+        api, store, card_id, text, ui_key=context.get('ui_key', ''), mode=mode,
     )
+    skipped = str(result.get('skipped') or '')
+    # 「按策略跳过」不是失败，但也没写任何东西；如实报给用户，
+    # 否则面板会显示「已落地」而卡片备注其实一个字都没变。
+    ok = bool(result.get('ok'))
+    applied = ok and not skipped
+    message = str(result.get('message') or '')
+    if not message and skipped == 'mode_skip':
+        message = '按「不写简介」策略跳过（AI 简介仍可在插件里查看）'
+    elif not message and skipped == 'unchanged':
+        message = '本地备注已是该内容，未重复写入'
+
     return {
-        'ok': bool(result.get('ok')),
-        'applied': bool(result.get('ok')),
-        'skipped': '',
-        'message': str(result.get('message') or ''),
+        'ok': ok,
+        'applied': applied,
+        # 保留 bridge 的实际写入信号；自动历史据此决定是否需要刷新宿主缓存。
+        'changed': bool(result.get('changed')),
+        'skipped': skipped,
+        'message': message,
         'origin': str(result.get('origin') or ''),
+        'mode': str(result.get('mode') or ''),
+        'kept_chars': int(result.get('kept_chars') or 0),
     }
 
 
@@ -342,6 +377,10 @@ def run_actions(actions, result, *, api, store, card_id: str, context=None) -> d
             warnings.append(f'动作 {action} 异常: {exc}')
             outcome = {'ok': False, 'applied': False, 'skipped': '',
                        'message': str(exc)}
+
+        if action == 'write_card_note':
+            outcome.setdefault('changed', False)
+            outcome.setdefault('origin', '')
 
         record = {'action': action, 'from': source}
         record.update(outcome)

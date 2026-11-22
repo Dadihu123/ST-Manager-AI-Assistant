@@ -751,11 +751,12 @@ def test_apply_writes_summary_and_tags(tmp_path, monkeypatch):
                         lambda api_obj, store_obj, card_id, summary, **kwargs: written.update(
                             {card_id: summary}) or {'ok': True, 'origin': 'card_note',
                                                     'ui_key': kwargs.get('ui_key') or card_id,
-                                                    'message': ''})
+                                                    'message': '', 'changed': True})
 
     payload = client.post('/jobs/run-1/apply', json={}).get_json()
 
     assert payload['applied'] == 1
+    assert payload['note_cache_sync_ids'] == ['Alice.png']
     assert written['Alice.png'] == 'AI 生成的概览'
     assert api.applied_tags[0]['add'] == ['奇幻']
 
@@ -804,6 +805,109 @@ def test_apply_force_overrides_stale_check(tmp_path, monkeypatch):
 
     payload = client.post('/jobs/run-1/apply', json={'force': True}).get_json()
     assert payload['applied'] == 1
+
+
+def test_apply_passes_note_mode_from_request(tmp_path, monkeypatch):
+    """落地时 `write.note_mode` 优先于配置：同一个作业可以按不同偏好落地。"""
+    client, api, _store = build_app(db_rows=[job_item_row()], tmp_path=tmp_path)
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+
+    seen = {}
+
+    def fake_write(api_obj, store_obj, card_id, summary, **kwargs):
+        seen.update(kwargs)
+        return {'ok': True, 'origin': 'card_note', 'ui_key': card_id, 'message': '',
+                'mode': kwargs.get('mode', ''), 'kept_chars': 10, 'changed': True,
+                'skipped': ''}
+
+    monkeypatch.setattr(routes_module.summary_bridge, 'write_summary', fake_write)
+
+    payload = client.post(
+        '/jobs/run-1/apply',
+        json={'write': {'note': True, 'tags': False, 'note_mode': 'prepend'}},
+    ).get_json()
+
+    assert payload['applied'] == 1
+    assert seen['mode'] == 'prepend'
+    assert payload['write']['note_mode'] == 'prepend'
+
+
+def test_apply_note_mode_falls_back_to_config(tmp_path, monkeypatch):
+    """省略 `note_mode` 时用配置里的值，而不是硬编码默认。"""
+    client, api, _store = build_app(db_rows=[job_item_row()], tmp_path=tmp_path)
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+    api._config['note_mode'] = 'replace'
+
+    seen = {}
+    monkeypatch.setattr(
+        routes_module.summary_bridge, 'write_summary',
+        lambda api_obj, store_obj, card_id, summary, **kwargs: seen.update(kwargs) or {
+            'ok': True, 'origin': 'card_note', 'ui_key': card_id, 'message': '',
+            'mode': kwargs.get('mode', ''), 'kept_chars': 0, 'changed': True, 'skipped': '',
+        },
+    )
+
+    client.post('/jobs/run-1/apply', json={})
+    assert seen['mode'] == 'replace'
+
+
+def test_apply_reports_note_skipped(tmp_path, monkeypatch):
+    """按策略跳过备注不是失败，但必须如实回报，否则用户以为写进去了。"""
+    client, api, _store = build_app(db_rows=[job_item_row()], tmp_path=tmp_path)
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+    monkeypatch.setattr(
+        routes_module.summary_bridge, 'write_summary',
+        lambda *a, **k: {'ok': True, 'origin': '', 'ui_key': 'x', 'message': '',
+                         'mode': 'skip', 'kept_chars': 0, 'changed': False,
+                         'skipped': 'mode_skip'},
+    )
+
+    payload = client.post('/jobs/run-1/apply', json={}).get_json()
+
+    assert payload['notes_skipped'] == 1
+    assert any(item.get('note_skipped') == 'mode_skip' for item in payload['details'])
+    assert payload['note_cache_sync_ids'] == []
+
+
+@pytest.mark.parametrize('bridge_result', [
+    {'ok': True, 'origin': 'card_note', 'changed': False, 'skipped': 'unchanged'},
+    {'ok': True, 'origin': 'card_note', 'changed': False, 'skipped': 'mode_skip'},
+    {'ok': False, 'origin': 'namespace', 'changed': True, 'skipped': ''},
+])
+def test_apply_reports_only_successful_changed_note_cache_ids(
+    tmp_path, monkeypatch, bridge_result,
+):
+    """缓存同步清单只能包含主程序备注实际成功且发生变化的卡片。"""
+    client, api, _store = build_app(db_rows=[job_item_row()], tmp_path=tmp_path)
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+    result = dict(bridge_result)
+    monkeypatch.setattr(routes_module.summary_bridge, 'write_summary', lambda *a, **k: result)
+
+    payload = client.post('/jobs/run-1/apply', json={}).get_json()
+
+    assert payload['applied'] == 1
+    assert payload['note_cache_sync_ids'] == []
+
+
+def test_apply_empty_summary_does_not_report_note_cache_id(tmp_path, monkeypatch):
+    """没有 AI 简介时根本不写备注，也不能触发缓存同步。"""
+    client, api, _store = build_app(
+        db_rows=[job_item_row(result_overrides={'summary': ''})], tmp_path=tmp_path,
+    )
+    api.job_detail = {'run_id': 'run-1', 'job_type': 'ai.analyze', 'status': 'completed'}
+    called = []
+    monkeypatch.setattr(
+        routes_module.summary_bridge, 'write_summary',
+        lambda *args, **kwargs: called.append(True) or {
+            'ok': True, 'origin': 'card_note', 'changed': True, 'skipped': '',
+        },
+    )
+
+    payload = client.post('/jobs/run-1/apply', json={}).get_json()
+
+    assert payload['applied'] == 1
+    assert called == []
+    assert payload['note_cache_sync_ids'] == []
 
 
 def test_apply_ignores_pending_items(tmp_path):
@@ -1716,7 +1820,7 @@ def test_note_cache_sync_only_touches_ui_layer(tmp_path, monkeypatch):
 
     本测试锁死安全契约：请求必须带 `ui_only`，且绝不能携带任何正文键。
     """
-    client, _api, _store = build_app(
+    client, api, _store = build_app(
         cards={'Alice.png': dict(CARD)}, tmp_path=tmp_path,
     )
     calls = []
@@ -1742,6 +1846,7 @@ def test_note_cache_sync_only_touches_ui_layer(tmp_path, monkeypatch):
     # —— 核心契约：只动 UI 层 ——
     assert data.get('ui_only') is True, '必须走 ui_only 通道，不碰卡片正文'
     assert 'ui_summary' in data
+    assert data['expected_ui_summary'] == data['ui_summary']
 
     forbidden = (
         'description', 'personality', 'scenario', 'first_mes', 'mes_example',
@@ -1751,10 +1856,14 @@ def test_note_cache_sync_only_touches_ui_layer(tmp_path, monkeypatch):
     leaked = [key for key in forbidden if key in data]
     assert not leaked, f'补 UI 缓存时绝不能携带卡片正文字段，泄漏了：{leaked}'
 
-    # 保存失败要如实回报（并且尝试回滚快照）
+    # 保存失败要如实回报；UI-only 同步不应回滚卡片快照。
     monkeypatch.setattr(
         routes_module, '_http_post_json',
         lambda url, data, timeout=15: (_ for _ in ()).throw(RuntimeError('boom')),
+    )
+    monkeypatch.setattr(
+        api.backups, 'snapshot_card',
+        lambda *args, **kwargs: pytest.fail('UI-only 同步失败不应创建或恢复卡片快照'),
     )
     failed = client.post('/cards/note-cache-sync', json={
         'base_url': 'http://127.0.0.1:5000',
@@ -1762,6 +1871,7 @@ def test_note_cache_sync_only_touches_ui_layer(tmp_path, monkeypatch):
     }).get_json()
     assert failed['synced'] == 0
     assert failed['failed'] and failed['failed'][0]['card_id'] == 'Alice.png'
+    assert 'restored' not in failed
 
 
 
@@ -1769,6 +1879,67 @@ def test_note_cache_sync_requires_base_url(tmp_path):
     client, _api, _store = build_app(cards={'Alice.png': dict(CARD)}, tmp_path=tmp_path)
     payload = client.post('/cards/note-cache-sync', json={'card_ids': ['Alice.png']}).get_json()
     assert payload['success'] is False
+
+
+def test_note_cache_sync_by_run_filters_to_changed_analyze_notes(tmp_path, monkeypatch):
+    card_ids = [
+        'changed.png', 'skip.png', 'unchanged.png', 'namespace.png',
+        'other-job.png', 'legacy.png',
+    ]
+    cards = {card_id: dict(CARD) for card_id in card_ids}
+    client, _api, store = build_app(cards=cards, tmp_path=tmp_path)
+    entries = [
+        {
+            'entry_id': 'changed', 'card_id': 'changed.png', 'run_id': 'run-auto',
+            'job_type': 'ai.analyze', 'summary_origin': 'card_note',
+            'summary_changed': True,
+        },
+        {
+            'entry_id': 'skip', 'card_id': 'skip.png', 'run_id': 'run-auto',
+            'job_type': 'ai.analyze', 'summary_origin': '', 'summary_changed': False,
+        },
+        {
+            'entry_id': 'unchanged', 'card_id': 'unchanged.png', 'run_id': 'run-auto',
+            'job_type': 'ai.analyze', 'summary_origin': 'card_note',
+            'summary_changed': False,
+        },
+        {
+            'entry_id': 'namespace', 'card_id': 'namespace.png', 'run_id': 'run-auto',
+            'job_type': 'ai.analyze', 'summary_origin': 'namespace',
+            'summary_changed': True,
+        },
+        {
+            'entry_id': 'other-job', 'card_id': 'other-job.png', 'run_id': 'run-auto',
+            'job_type': 'ai.polish', 'summary_origin': 'card_note',
+            'summary_changed': True,
+        },
+        {
+            'entry_id': 'legacy', 'card_id': 'legacy.png', 'run_id': 'run-auto',
+            'job_type': 'ai.analyze',
+        },
+    ]
+    for entry in entries:
+        assert store.record_history({**entry, 'applied_at': 1_760_000_000})
+
+    sync_calls = []
+
+    def fake_post(url, payload, timeout=15):
+        sync_calls.append((url, payload))
+        if 'get_card_detail' in url:
+            return {'success': True, 'card': {'char_name': CARD['name']}}
+        return {'success': True}
+
+    monkeypatch.setattr(routes_module, '_http_post_json', fake_post)
+    result = client.post('/cards/note-cache-sync', json={
+        'base_url': 'http://127.0.0.1:5000', 'run_id': 'run-auto',
+    }).get_json()
+
+    assert result['success'] is True
+    assert result['total'] == 1
+    assert result['synced'] == 1
+    assert [payload['id'] for url, payload in sync_calls if url.endswith('/api/update_card')] == [
+        'changed.png',
+    ]
 
 
 # ------------------------------------------------------------------ AI 打标历史记录

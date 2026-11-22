@@ -1,6 +1,6 @@
 # AI 角色卡分析助手（stm-ai-assistant）
 
-**版本 0.5.1** · ST-Manager 官方 AI 插件，按 **Apache-2.0** 分发。
+**版本 0.6.0** · ST-Manager 官方 AI 插件，按 **Apache-2.0** 分发。
 
 ST-Manager 的 AI 插件。批量把角色卡变成「一句话概览 + 结构化标签」，并把这件事做得可审计、可回滚、不重复扣费：
 
@@ -26,13 +26,13 @@ git clone <本仓库地址> "<ST-Manager>/data/plugins/stm-ai-assistant"
 3. 入口坞（屏幕右侧的图标条）会出现「AI 助手」入口；点击打开宿主提供的**居中弹层**。
    也可以在命令面板里搜「AI 助手」。
 
-> **需要主程序 `PLUGIN_API_VERSION = 3` 且 `APP_VERSION >= 1.1.0`**（本插件
-> `api_version = 3`、`min_app_version = 1.1.0`）。旧主程序会分别以
+> **需要主程序 `PLUGIN_API_VERSION = 3` 且 `APP_VERSION >= 1.2.1`**（本插件
+> `api_version = 3`、`min_app_version = 1.2.1`）。旧主程序会分别以
 > `PluginApiVersionError` / `PluginManifestError`（`min_app_version` 门槛）拒绝加载，
 > 安装阶段也会在下载归档之前就被拒。
-> 1.1.0 的下限来自 `api.worldbook.sources()` 回传 `id`：插件要拿它和
-> `api.host.selection()` 的选中集对交集，否则「精简选中的世界书」会报
-> 「无法识别选中的世界书」。
+> 1.1.0 起 `api.worldbook.sources()` 回传 `id`，用于与 `api.host.selection()`
+> 的选中集求交；1.2.1 起 `api.cards.write_note()` 支持 `expected_text` 条件写入，
+> 用于合并 AI 简介时检测并发备注编辑，避免覆盖用户刚保存的内容。
 >
 > 主程序以 `st_plugin_stm_ai_assistant` 模块名加载 `backend/`，**不注入 `sys.path`**，因此插件内部一律使用相对导入。
 > 插件私有数据（档案、缓存、用量）写在 `data/plugins/stm-ai-assistant/data/`，卸载时由主程序按需清理。
@@ -548,6 +548,7 @@ tokens.by_block = {
 | `default_profile_id` | string | `""` | 未显式指定时使用的档案 id；留空表示按模型自动匹配 |
 | `max_tags` | integer | `8` | 最大标签数（总上限）。各分类「设置数量」之和不应超过它；未单独设置的分类只受它约束 |
 | `summary_max_chars` | integer | `300` | 概览字数上限 |
+| `note_mode` | enum | `append` | AI 简介写进本地备注的方式：`append`（接在后面，保留原备注）/ `prepend`（接在前面）/ `replace`（覆盖）/ `skip`（不写）。见「本地备注写哪儿」 |
 | `tag_pool_categories_include` | string | `""` | 只取这些**标签分类**（逗号分隔）。留空 = 不限制 |
 | `tag_pool_categories_exclude` | string | `""` | 排除这些标签分类（逗号分隔）。被排除的分类是「冻结」的：不给 AI 看、不会建议删除、落地也不会删 |
 | `tag_category_rules` | string(JSON) | `""` | 每分类规则：`{"分类": {"confidence_min": 0.6, "max_tags": 3}}`；由设置页维护，一般不用手填 |
@@ -683,12 +684,31 @@ tokens.by_block = {
 
 | action | 做什么 |
 |---|---|
-| `write_card_note` | 写主程序的本地备注（概览） |
+| `write_card_note` | 写主程序的本地备注（概览）；**写哪儿由 `note_mode` 决定**，详见下节 |
 | `apply_tags` | 把标签合并进卡片（黑名单/未知标签由主程序过滤） |
 | `write_card_fields` | 改写卡片正文字段（写前自动快照；`params.fields` 白名单） |
 | `write_worldbook` | 改写世界书条目（读-改-写 + 修订号乐观并发） |
 | `queue_suggestions` | 新标签进建议队列（**不自动建标签**） |
 | `move_cards` | 移动到分类目录（可选自动建目录） |
+
+#### 本地备注写哪儿：`note_mode`
+
+本地备注（`ui_data[<ui_key>].summary`，卡片网格上叫「概览」）是**用户自己写的地方**，
+所以插件不再默认整字段覆盖它。四种策略（`backend/core/note_merge.py`）：
+
+| `note_mode` | 结果 |
+|---|---|
+| `append`（默认） | 用户备注在前，AI 简介作为可折叠的一段追加在后 |
+| `prepend` | AI 简介在前，用户备注原样在后 |
+| `replace` | 只留 AI 简介（旧行为，用户显式选择时才发生） |
+| `skip` | 不写本地备注（AI 简介仍在插件里可查） |
+
+AI 段总是被 `<!-- stm-ai-assistant:summary:start -->` / `…:end -->` 标记包起来
+（内容是 `<details><summary>AI 简介</summary>…</details>`）。**重复打标只替换上一段
+AI 内容**，不会叠加；用户在标记之外写的任何内容都保留。
+
+策略优先级：`apply_actions[].params.mode` > 落地请求的 `write.note_mode` > 配置
+`note_mode`。设置页与审批页都能改；落地请求里带的值只影响这一次。
 
 **单动作失败不中断其余**：概览写不进去不该让标签也丢掉。
 执行结果逐条回传（`actions[]`），失败项带 `ok=false` 与原因。

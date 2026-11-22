@@ -40,6 +40,35 @@ const TASK_OF_JOB = {
 };
 
 /**
+ * 「AI 简介写进本地备注」的四种方式（审批页单选）。
+ *
+ * 与后端 `core/note_merge.py` 的 `NOTE_MODES` 一一对应；顺序即展示顺序。
+ * 默认 `append` —— 不覆盖用户自己写的备注。
+ */
+const NOTE_MODES = [
+  {
+    value: 'append',
+    label: '接在后面',
+    hint: '你的备注保留在前，AI 简介作为可折叠的一段追加在后面（默认）。',
+  },
+  {
+    value: 'prepend',
+    label: '接在前面',
+    hint: 'AI 简介放在最前，你原来的备注原样留在后面。',
+  },
+  {
+    value: 'replace',
+    label: '覆盖',
+    hint: '⚠ 会连同你写的备注一起替换掉。',
+  },
+  {
+    value: 'skip',
+    label: '不写',
+    hint: '不碰本地备注，AI 简介只在插件里可查。',
+  },
+];
+
+/**
  * 作业条目的稳定键。
  *
  * 主程序的作业条目字段是 `key`（`job_store._row_to_item`），插件前端以前统一读
@@ -75,6 +104,10 @@ export function createReview(api, client, context) {
     // 「写什么」在落地时决定：打标任务的概览 / 标签各一个开关。
     writeNote: true,
     writeTags: true,
+    /** 概览写进本地备注的方式（后端配置的初值，落地前可改）。 */
+    noteMode: 'append',
+    /** 用户手动选择后，队列刷新不能再用配置初值覆盖本页选择。 */
+    noteModeTouched: false,
   };
 
   const alertHost = el('div', 'plugin-stm-ai-assistant-alert-host');
@@ -136,6 +169,10 @@ export function createReview(api, client, context) {
       const data = await client.reviewQueue(state.filterRunId);
       state.items = Array.isArray(data.items) ? data.items : [];
       state.runs = Array.isArray(data.runs) ? data.runs : [];
+      // 首次初始化时跟随设置页；用户改选后刷新队列不能覆盖本页选择。
+      if (data.note_mode && !state.noteModeTouched) {
+        state.noteMode = String(data.note_mode);
+      }
     } catch (error) {
       clear(listHost);
       listHost.append(banner(`读取结果失败：${error.message}`, 'error'));
@@ -194,8 +231,9 @@ export function createReview(api, client, context) {
     rejectAllBtn.disabled = state.busy || pending === 0;
   }
 
-  /** 打标落地时的「写什么」开关。 */
+  /** 打标落地时的「写什么」开关 + 简介写入本地备注的方式。 */
   function renderWriteToggles() {
+    const wrap = el('div', 'plugin-stm-ai-assistant-write-block');
     const row = el('div', 'plugin-stm-ai-assistant-row is-write-toggles');
     row.append(el('span', 'plugin-stm-ai-assistant-note', '落地时写入：'));
     [
@@ -209,11 +247,44 @@ export function createReview(api, client, context) {
       input.dataset.marqueeIgnore = 'true';
       input.addEventListener('change', () => {
         state[item.key] = input.checked;
+        noteRow.hidden = !state.writeNote;
       });
       box.append(input, el('span', '', item.label));
       row.append(box);
     });
-    return row;
+
+    // 简介写哪儿：本地备注是用户自己写的地方，落地前让他能再确认一次。
+    // 默认值来自配置（`state.noteMode` 由 refresh 从 /review/queue 带回）。
+    const noteRow = el('div', 'plugin-stm-ai-assistant-row is-note-mode');
+    noteRow.append(el('span', 'plugin-stm-ai-assistant-note', '概览写到本地备注：'));
+    NOTE_MODES.forEach((item) => {
+      const label = el('label', 'plugin-stm-ai-assistant-radio');
+      const input = el('input');
+      input.type = 'radio';
+      input.name = 'plugin-stm-ai-assistant-note-mode';
+      input.value = item.value;
+      input.checked = state.noteMode === item.value;
+      input.dataset.marqueeIgnore = 'true';
+      input.addEventListener('change', () => {
+        if (input.checked) {
+          state.noteMode = item.value;
+          state.noteModeTouched = true;
+        }
+        modeHint.textContent = item.hint;
+      });
+      label.append(input, el('span', '', item.label));
+      noteRow.append(label);
+    });
+    const modeHint = el(
+      'span',
+      'plugin-stm-ai-assistant-field-hint',
+      (NOTE_MODES.find((item) => item.value === state.noteMode) || NOTE_MODES[0]).hint,
+    );
+    noteRow.append(modeHint);
+    noteRow.hidden = !state.writeNote;
+
+    wrap.append(row, noteRow);
+    return wrap;
   }
 
   // ---------------------------------------------------------------- 条目
@@ -479,7 +550,7 @@ export function createReview(api, client, context) {
    * - `ai.analyze`：`write.note` / `write.tags` + 可选 `remove_tags`
    * - `ai.wi_rewrite` / `ai.classify`：只需 `items`
    */
-  function buildApplyBody(runId, keys, jobTypeByRun, removalsByRun) {
+  function buildApplyBody(runId, keys, jobTypeByRun, removalsByRun, writeSnapshot) {
     const jobType = String(jobTypeByRun.get(runId) || '');
     const items = keys;
 
@@ -516,7 +587,12 @@ export function createReview(api, client, context) {
     if (jobType === 'ai.analyze' || !jobType) {
       const body = {
         items,
-        write: { note: state.writeNote, tags: state.writeTags },
+        write: {
+          note: writeSnapshot.note,
+          tags: writeSnapshot.tags,
+          // 只在要写概览时才带策略：不写概览时这条参数没有意义
+          ...(writeSnapshot.note ? { note_mode: writeSnapshot.noteMode } : {}),
+        },
       };
       const removals = removalsByRun.get(runId);
       if (removals && removals.size) body.remove_tags = [...removals];
@@ -533,7 +609,12 @@ export function createReview(api, client, context) {
       api.host.toast('没有已接受的结果', 2800, 'close');
       return;
     }
-    const confirmed = await confirmApply(done);
+    const writeSnapshot = {
+      note: Boolean(state.writeNote),
+      tags: Boolean(state.writeTags),
+      noteMode: String(state.noteMode || 'append'),
+    };
+    const confirmed = await confirmApply(done, writeSnapshot);
     if (!confirmed) return;
 
     const groups = new Map();
@@ -575,6 +656,8 @@ export function createReview(api, client, context) {
     let failed = 0;
     let skipped = 0;
     let stale = 0;
+    let notesSkipped = 0;
+    const noteCacheSyncIds = [];
     let handled = 0;
     const details = [];
     let createdCategories = 0;
@@ -584,12 +667,18 @@ export function createReview(api, client, context) {
     try {
       for (const [runId, keys] of groups) {
         try {
-          const body = buildApplyBody(runId, keys, jobTypeByRun, removalsByRun);
+          const body = buildApplyBody(
+            runId, keys, jobTypeByRun, removalsByRun, writeSnapshot,
+          );
           const data = await client.applyJob(runId, body);
           applied += Number(data.applied || 0);
           skipped += Number(data.skipped || 0);
           stale += Number(data.stale || 0);
           failed += Number(data.failed || 0);
+          notesSkipped += Number(data.notes_skipped || 0);
+          if (Array.isArray(data.note_cache_sync_ids)) {
+            noteCacheSyncIds.push(...data.note_cache_sync_ids.map((id) => String(id || '').trim()));
+          }
           (data.details || []).forEach((detail) => details.push(detail));
           createdCategories += (data.created_categories || []).length;
           createdTags += (data.created_tags || []).length;
@@ -609,6 +698,7 @@ export function createReview(api, client, context) {
 
     state.lastApply = {
       applied, skipped, stale, failed, details,
+      notes_skipped: notesSkipped,
       created_categories: createdCategories,
       created_tags: createdTags,
       merges_executed: mergesExecuted,
@@ -632,10 +722,10 @@ export function createReview(api, client, context) {
     // **只有打标作业**需要补这一步：它写的是卡片概览，而卡片网格的「本地备注」
     // 图标读主程序缓存。classify / wi_rewrite / propose 的结果不是卡片正文，
     // 传它们的 key 去整卡保存只会制造 card_unreadable 噪声，甚至误存被移动的卡。
-    const cardIds = done
-      .filter((item) => String(item.job_type || '') === 'ai.analyze')
-      .map((item) => String((item.result || {}).card_id || ''))
-      .filter(Boolean);
+    //
+    // 「不写备注」策略下也不做：这时候备注一个字没变，没缓存要刷；
+    // 而整卡保存本身有风险（会覆写卡片文件），能不跑就不跑。
+    const cardIds = [...new Set(noteCacheSyncIds)].filter(Boolean);
     if (cardIds.length) {
       // 不阻塞落地：后台让主程序按完整数据保存一次，刷新备注图标缓存
       client.syncCardNoteCache({
@@ -663,9 +753,11 @@ export function createReview(api, client, context) {
   }
 
   /** 落地前一次确认：把「将发生什么」写清楚，而不是点了就写。 */
-  async function confirmApply(done) {
-    const notes = done.filter((item) => String((item.result || {}).summary || '').trim()).length;
-    const tagCount = state.writeTags ? done.length : 0;
+  async function confirmApply(done, writeSnapshot) {
+    const notes = writeSnapshot.note
+      ? done.filter((item) => String((item.result || {}).summary || '').trim()).length
+      : 0;
+    const tagCount = writeSnapshot.tags ? done.length : 0;
     let removalCount = 0;
     const uniqueRemovals = new Set();
     done.forEach((item) => {
@@ -675,16 +767,47 @@ export function createReview(api, client, context) {
     });
     removalCount = uniqueRemovals.size;
     const removalPart = removalCount ? `并删除 ${removalCount} 个勾选的标签。` : '';
-    const message = `将写 ${notes} 张卡片的概览、为 ${tagCount} 张写入已有标签，`
-      + `${removalPart}此操作会修改主程序数据。`;
+    const notePart = !writeSnapshot.note
+      ? '不写卡片概览'
+      : (writeSnapshot.noteMode === 'skip'
+        ? '不写入卡片概览（AI 简介仍保留在插件结果中）'
+        : `写 ${notes} 张卡片的概览`);
+    const message = `将${notePart}、为 ${tagCount} 张写入已有标签，`
+      + `${removalPart}此操作会修改主程序数据。`
+      + noteModeConfirmPart(done, notes, writeSnapshot.noteMode);
     if (typeof api.ui.confirm === 'function') {
       return Boolean(await api.ui.confirm({
         title: '确认落地',
         message,
+        // 「覆盖」会真的抹掉用户自己写的东西，确认按钮要是危险色
+        danger: notes > 0 && writeSnapshot.noteMode === 'replace',
         confirmLabel: '确认写入',
       }));
     }
     return window.confirm(`${message}继续？`);
+  }
+
+  /**
+   * 「概览会怎么落到本地备注」那一段确认文案。
+   *
+   * 覆盖模式必须点名有多少张卡**已经有备注会被替换** —— 只说「会覆盖」用户
+   * 感觉不到是自己写的东西要没了。
+   */
+  function noteModeConfirmPart(done, notes, noteMode) {
+    if (!notes) return '';
+    if (noteMode === 'skip') return '';
+    if (noteMode === 'replace') {
+      const withNote = done.filter(
+        (item) => String(item.local_note || '').trim()
+          && String((item.result || {}).summary || '').trim(),
+      ).length;
+      return withNote
+        ? `\n\n⚠ 其中 ${withNote} 张卡片已有你自己写的本地备注，覆盖后会丢失（不可撤销）。`
+        : '\n\n本地备注的写入方式是「覆盖」。';
+    }
+    return noteMode === 'prepend'
+      ? '\n\nAI 简介会接在本地备注前面，你写的部分保留。'
+      : '\n\nAI 简介会接在本地备注后面，你写的部分保留。';
   }
 
   function renderDetail() {
@@ -693,9 +816,18 @@ export function createReview(api, client, context) {
     const data = state.lastApply;
     detailHost.append(banner(
       `已落地 ${data.applied} 条 · 已应用过 ${data.skipped || 0} · `
-      + `内容已变化 ${data.stale || 0} · 失败 ${data.failed || 0}`,
+      + `内容已变化 ${data.stale || 0} · 失败 ${data.failed || 0}`
+      + (data.notes_skipped ? ` · 概览未写 ${data.notes_skipped} 条` : ''),
       data.failed ? 'warn' : 'ok',
     ));
+    if (data.notes_skipped) {
+      // 「按策略跳过 / 内容未变」不是失败，但用户得知道备注没动。
+      detailHost.append(banner(
+        `有 ${data.notes_skipped} 条卡片的本地备注没有改动：`
+        + '要么按「不写」策略跳过，要么备注里已经是这段内容（不重复写入）。',
+        'warn',
+      ));
+    }
     (data.details || []).slice(0, 12).forEach((detail) => {
       const text = String(detail.message || detail.error || detail.warning || '').trim();
       if (text) detailHost.append(el('div', 'plugin-stm-ai-assistant-warning', text));
@@ -748,10 +880,24 @@ export function createReview(api, client, context) {
 
 // ---------------------------------------------------------------- 按类型渲染
 
-export function renderAnalyzeItem(result) {
+export function renderAnalyzeItem(result, item = null) {
   const wrap = el('div', 'plugin-stm-ai-assistant-review-body');
   const summary = String(result.summary || '').trim();
   if (summary) wrap.append(el('p', 'plugin-stm-ai-assistant-review-summary', summary));
+
+  // 卡片现在的本地备注（只显示**用户自己写的那部分**，AI 段由后端剥掉了）。
+  // 「覆盖」模式下这条提示是用户唯一能发现「我要把别人的备注抹掉」的地方。
+  const localNote = String((item && item.local_note) || '').trim();
+  if (localNote) {
+    const noteBox = el('div', 'plugin-stm-ai-assistant-local-note');
+    noteBox.append(el(
+      'span',
+      'plugin-stm-ai-assistant-local-note-label',
+      '卡片现有本地备注（你自己的内容）：',
+    ));
+    noteBox.append(el('span', 'plugin-stm-ai-assistant-local-note-text', localNote));
+    wrap.append(noteBox);
+  }
 
   const tags = Array.isArray(result.tags) ? result.tags : [];
   if (tags.length) {

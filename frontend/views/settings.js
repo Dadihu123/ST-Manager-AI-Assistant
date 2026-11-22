@@ -24,6 +24,8 @@ const API_STYLES = [
   { value: 'anthropic_messages', label: 'Anthropic Messages（/messages）' },
 ];
 
+const DEFAULT_NOTE_MODE = 'append';
+
 /** 协议 → 该协议的鉴权/字段差异提示，显示在协议选择器下方。 */
 const API_STYLE_HINTS = {
   openai_chat: '鉴权用 Authorization: Bearer；支持 stop 停止序列。',
@@ -162,6 +164,28 @@ export function createSettings(api, client, context) {
       { value: 'high', label: 'high（高）' },
     ];
 
+    // ---- AI 简介写进本地备注的方式 ----
+    // 本地备注是**用户自己写的地方**，不能被一次打标静默冲掉；这里的选项
+    // 就是让用户自己决定「写哪儿」。默认 append（保留原备注）。
+    const modeOptions = Array.isArray(data.note_modes) && data.note_modes.length
+      ? data.note_modes
+      : [
+        { value: 'append', label: '接在本地备注后面（保留原备注）' },
+        { value: 'prepend', label: '接在本地备注前面（保留原备注）' },
+        { value: 'replace', label: '覆盖本地备注（原备注会丢失）' },
+        { value: 'skip', label: '不写本地备注（简介只在插件里看）' },
+      ];
+    const noteModeSelect = select(modeOptions, data.note_mode || DEFAULT_NOTE_MODE);
+    const defaultMode = (data.defaults || {}).note_mode || DEFAULT_NOTE_MODE;
+    const noteModeHint = el(
+      'p',
+      'plugin-stm-ai-assistant-field-hint',
+      modeHintText(noteModeSelect.value),
+    );
+    noteModeSelect.addEventListener('change', () => {
+      noteModeHint.textContent = modeHintText(noteModeSelect.value);
+    });
+
     const fields = {};
     fields.context_length = numberInput(
       caps.context_length || (data.defaults || {}).context_length || 262144,
@@ -188,26 +212,60 @@ export function createSettings(api, client, context) {
       field('思考等级', fields.reasoning_effort, '仅「启用推理」时生效'),
     );
 
+    // 写入方式单独一行：它的说明较长（关系到会不会丢用户备注），不塞进 grid
+    const noteField = field(
+      'AI 简介写进本地备注的方式',
+      noteModeSelect,
+      `默认「${(modeOptions.find((item) => item.value === defaultMode) || {}).label || defaultMode}」。`
+      + '无论选哪一项，重复打标都只替换上一次的 AI 那段，不会叠加；'
+      + '你在 AI 段之外写的内容始终保留。',
+    );
+    noteField.classList.add('plugin-stm-ai-assistant-field--wide');
+    const noteRow = el('div', 'plugin-stm-ai-assistant-note-mode-row');
+    noteRow.append(noteField, noteModeHint);
+
     const actions = el('div', 'plugin-stm-ai-assistant-row');
     actions.append(
       fields.reasoning_enabled,
-      button('保存模型能力', 'is-primary', () => saveCapabilities(fields)),
-      button('恢复默认', 'is-secondary', () => resetCapabilities(fields)),
+      button('保存模型能力', 'is-primary', () => saveCapabilities(fields, noteModeSelect)),
+      button('恢复默认', 'is-secondary', () => {
+        resetCapabilities(fields, noteModeSelect);
+        noteModeHint.textContent = modeHintText(noteModeSelect.value);
+      }),
     );
 
-    capabilityBox.append(grid, actions);
+    capabilityBox.append(grid, noteRow, actions);
   }
 
-  async function saveCapabilities(fields) {
+  /** 写入方式的「会发生什么」一句话说明（切换下拉时同步更新）。 */
+  function modeHintText(mode) {
+    switch (String(mode || '')) {
+      case 'prepend':
+        return 'AI 简介会作为一段可折叠的「AI 简介」放在最前面，你原来的备注原样留在后面。';
+      case 'replace':
+        return '⚠ AI 简介会整个替换本地备注：你自己写的内容会丢失。'
+          + '想保留原备注就改成「接在备注后面」。';
+      case 'skip':
+        return '不碰本地备注。AI 简介仍然保存在插件里（审批页与历史记录可查），只是不会写进卡片。';
+      default:
+        return 'AI 简介会作为一段可折叠的「AI 简介」追加在后面，你原来的备注原样保留在前面。';
+    }
+  }
+
+  async function saveCapabilities(fields, noteModeSelect = null) {
     const payload = {
       context_length: Number(fields.context_length.querySelector('input').value) || 0,
       max_output_tokens: Number(fields.max_output_tokens.querySelector('input').value) || 0,
       reasoning_enabled: fields.reasoning_enabled.querySelector('input').checked,
       reasoning_effort: fields.reasoning_effort.value,
     };
+    const noteMode = noteModeSelect ? String(noteModeSelect.value || '') : '';
     try {
-      const data = await client.saveSettings(payload);
-      state.settings = Object.assign({}, state.settings, { model_capabilities: data.model_capabilities });
+      const data = await client.saveSettings(payload, noteMode);
+      state.settings = Object.assign({}, state.settings, {
+        model_capabilities: data.model_capabilities,
+        note_mode: data.note_mode || noteMode,
+      });
       renderCapabilities();
       api.host.toast('模型能力已保存', 2400, 'check');
     } catch (error) {
@@ -215,12 +273,15 @@ export function createSettings(api, client, context) {
     }
   }
 
-  function resetCapabilities(fields) {
+  function resetCapabilities(fields, noteModeSelect = null) {
     const defaults = (state.settings && state.settings.defaults) || {};
     fields.context_length.querySelector('input').value = defaults.context_length || 262144;
     fields.max_output_tokens.querySelector('input').value = defaults.max_output_tokens || 32768;
     fields.reasoning_enabled.querySelector('input').checked = true;
     fields.reasoning_effort.value = defaults.reasoning_effort || 'auto';
+    if (noteModeSelect) {
+      noteModeSelect.value = defaults.note_mode || DEFAULT_NOTE_MODE;
+    }
   }
 
   // ---------------------------------------------------------------- 标签池

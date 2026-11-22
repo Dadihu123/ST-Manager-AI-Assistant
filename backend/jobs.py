@@ -710,6 +710,7 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         },
         'applied': False,
         'summary_origin': '',
+        'summary_changed': False,
     }
 
     # ---- C11：schema 里声明过的字段一律放行 ----
@@ -843,6 +844,10 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
         context={
             'ui_key': ui_key,
             'accepted_tags': accepted_tags,
+            # 「简介写进本地备注」的合成策略（append / prepend / replace / skip）。
+            # 在这里折进上下文而不是改 task spec：它是**用户偏好**，不是
+            # 「这个任务怎么落地」的一部分，换档案不该把它重置掉。
+            'note_mode': str(config.get('note_mode') or ''),
             # C13：删标签是**不可逆**的，只有调用方显式要求（`apply_removals`）
             # 才在 auto 模式落地；review 模式由审批页逐条勾选后走 apply 路由。
             'removable_tags': (
@@ -862,6 +867,11 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
             result_payload['tags_applied'] = list(record['added'])
         if record.get('action') == 'write_card_note':
             result_payload['summary_origin'] = str(record.get('origin') or '')
+            result_payload['summary_changed'] = bool(
+                record.get('ok') is True
+                and record.get('origin') == summary_bridge.ORIGIN_CARD_NOTE
+                and record.get('changed') is True
+            )
 
     applied = bool(action_outcome['applied'])
 
@@ -876,6 +886,7 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
             'tags_applied': result_payload['tags_applied'],
             'tags_suggested': result_payload['tags_suggested'],
             'summary_origin': result_payload['summary_origin'],
+            'summary_changed': result_payload['summary_changed'],
             'summary': summary_text,
             'last_run_id': ctx.run_id,
         })
@@ -915,6 +926,9 @@ def analyze_one(*, api, store, config, ctx, card_id, ui_key, content_hash, mode,
                 'new_tags': result_payload.get('new_tags') or [],
                 'tag_removals': result_payload.get('tag_removals') or [],
                 'profile_id': str(profile.get('id') or ''),
+                'job_type': JOB_ANALYZE,
+                'summary_origin': result_payload['summary_origin'],
+                'summary_changed': result_payload['summary_changed'],
                 'accepted': True,
                 'applied_at': applied_at,
             })

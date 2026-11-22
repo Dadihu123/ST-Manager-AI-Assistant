@@ -25,6 +25,7 @@ from .core import agent as agent_core
 from .core import classify as classify_core
 from .core import hashing
 from .core import modelcap as modelcap_core
+from .core import note_merge as note_merge_core
 from .core import prefilter as prefilter_core
 from .core import proposal as proposal_core
 from .core import prompt as prompt_core
@@ -142,6 +143,32 @@ def _load_job_items(api, run_id: str, *, limit: int = APPLY_ITEM_LIMIT) -> list:
         return []
 
     return [item for item in (items or []) if isinstance(item, dict)]
+
+
+def _local_note_preview(api, item, cache) -> str:
+    """取一条结果对应卡片的「本地备注」摘要，供审批页提示。
+
+    长备注只回前 300 字：审批页只需要让用户看出「这里已经有我自己写的东西」，
+    把全文塞进队列会让 500 条结果变成几 MB 的响应。
+
+    `cache` 是**同一次请求内**的去重表：同一个作业里同一张卡不会出现两次，
+    但如果用户对同一张卡跑过多轮作业，省下的读取仍然可观。
+    """
+    result = item.get('result') if isinstance(item.get('result'), dict) else {}
+    card_id = str(result.get('card_id') or item.get('item_key') or item.get('key') or '')
+    if not card_id:
+        return ''
+    if card_id in cache:
+        return cache[card_id]
+    try:
+        text = str(api.cards.read_note(card_id) or '')
+    except Exception:  # noqa: BLE001 - 读不到就不显示，不该让审批页 500
+        text = ''
+    # 展示的是「用户自己写的那部分」：AI 段由插件自己写进去，重复展示只会干扰判断
+    kept = note_merge_core.strip_block(text)
+    preview = kept if len(kept) <= 300 else kept[:300] + '…'
+    cache[card_id] = preview
+    return preview
 
 
 def _visible_review_items(api, store, run_id: str, items: list) -> list:
@@ -317,6 +344,8 @@ def _card_cache_payload(api, card_id: str) -> dict:
         # 只写 UI 层：概览。其余正文一律不传，宿主不会改动卡片文件。
         'ui_only': True,
         'ui_summary': note,
+        # 与主程序 ui_data 锁内比较，避免读备注后被用户并发编辑而覆盖。
+        'expected_ui_summary': note,
         # 显式声明「只改概览」，避免宿主把其它 UI 字段当成未修改而清空。
         'ui_only_fields': ['ui_summary'],
     }
@@ -682,11 +711,20 @@ def register_routes(api, store) -> None:
         caps = modelcap_core.normalize_capabilities(config)
         return _ok(
             model_capabilities=caps,
+            # 「简介写进本地备注」的策略：设置页据此渲染下拉，并说明默认值。
+            note_mode=note_merge_core.normalize_mode(config.get('note_mode')),
+            note_modes=[
+                {'value': 'append', 'label': '接在本地备注后面（保留原备注）'},
+                {'value': 'prepend', 'label': '接在本地备注前面（保留原备注）'},
+                {'value': 'replace', 'label': '覆盖本地备注（原备注会丢失）'},
+                {'value': 'skip', 'label': '不写本地备注（简介只在插件里看）'},
+            ],
             defaults={
                 'context_length': modelcap_core.DEFAULT_CONTEXT_LENGTH,
                 'max_output_tokens': modelcap_core.DEFAULT_MAX_OUTPUT_TOKENS,
                 'reasoning_enabled': True,
                 'reasoning_effort': modelcap_core.DEFAULT_REASONING_EFFORT,
+                'note_mode': note_merge_core.DEFAULT_NOTE_MODE,
             },
             limits={
                 'context_length': {'min': modelcap_core.MIN_CONTEXT_LENGTH,
@@ -711,15 +749,24 @@ def register_routes(api, store) -> None:
         caps = modelcap_core.normalize_capabilities(
             dict(config_module.load_config(api), **incoming),
         )
+        # 「简介写进本地备注」的策略与模型能力一起保存（同一张设置页）。
+        # 只有显式传了才写 —— 省略表示「这次不改」，不能把它顺手重置成默认。
+        patch = dict(caps)
+        note_mode = ''
+        if 'note_mode' in payload:
+            note_mode = note_merge_core.normalize_mode(payload.get('note_mode'))
+            patch['note_mode'] = note_mode
         try:
-            saved = bool(api.config.set(caps))
+            saved = bool(api.config.set(patch))
         except Exception:  # noqa: BLE001 - 配置写入失败不该 500
             logger.warning('保存模型能力失败', exc_info=True)
             saved = False
         if not saved:
             return _fail(CODE_INVALID_PAYLOAD, '配置未写入（主程序拒绝了本次保存）',
                          http_status=400)
-        return _ok(model_capabilities=caps)
+        return _ok(model_capabilities=caps,
+                   note_mode=note_mode or note_merge_core.normalize_mode(
+                       config_module.load_config(api).get('note_mode')))
 
     # ---------------------------------------------------------- 标签池（分类白/黑名单）
 
@@ -870,12 +917,13 @@ def register_routes(api, store) -> None:
     @api.http.route('/cards/note-cache-sync', ['POST'])
     @_handle_errors
     def sync_card_note_cache():
-        """让主程序走一次「完整保存」，刷新卡片网格的本地备注缓存。
+        """让主程序走一次 UI-only 保存，刷新卡片网格的本地备注缓存。
 
         为什么需要：卡片网格的备注图标读的是卡片缓存里的 `ui_summary`，
         只有主程序自己的保存流程会把它一起重建；`write_note` 只写 ui_data。
 
-        安全措施：每张卡先打快照，保存失败或返回非成功时自动回滚快照。
+        备注值通过 `expected_ui_summary` 在主程序 ui_data 锁内做 CAS；冲突或
+        保存失败只报告失败，不回滚卡片快照，避免把并发编辑恢复成旧状态。
         """
         payload = _body()
         base_url = str(payload.get('base_url') or '').rstrip('/')
@@ -891,30 +939,27 @@ def register_routes(api, store) -> None:
             card_ids = [
                 str(entry.get('card_id') or '').strip()
                 for entry in store.history_entries_for_run(run_id)
+                if entry.get('job_type') == JOB_ANALYZE
+                and entry.get('summary_origin') == summary_bridge.ORIGIN_CARD_NOTE
+                and entry.get('summary_changed') is True
                 if str(entry.get('card_id') or '').strip()
             ]
         card_ids = list(dict.fromkeys(card_ids))[:50]
 
         synced = []
         failed = []
-        restored = []
         for card_id in card_ids:
             data = _card_cache_payload(api, card_id)
             if not data:
                 failed.append({'card_id': card_id, 'error': 'card_unreadable'})
                 continue
-            snapshot = None
-            try:
-                snapshot = api.backups.snapshot_card(card_id, remark='ai-note-cache')
-            except Exception:  # noqa: BLE001 - 快照失败也继续，失败时会提示
-                snapshot = None
             try:
                 result = _http_post_json(base_url + '/api/update_card', data)
                 if not isinstance(result, dict) or result.get('success') is False:
                     raise RuntimeError(
                         str((result or {}).get('msg') or 'update_card not successful')
                     )
-                # 保存后回读校验：字段被清空/改错就回滚快照，宁可图标不亮也不能丢卡。
+                # 保存后回读校验：字段被清空/改错就报告失败；UI-only 路径不回滚卡片文件。
                 detail = _http_post_json(
                     base_url + '/api/get_card_detail', {'id': card_id},
                 )
@@ -941,16 +986,10 @@ def register_routes(api, store) -> None:
             except Exception as exc:  # noqa: BLE001
                 logger.warning('note cache sync failed: %s', exc)
                 failed.append({'card_id': card_id, 'error': str(exc)[:200]})
-                if snapshot:
-                    try:
-                        api.backups.restore_card_snapshot(card_id, snapshot)
-                        restored.append(card_id)
-                    except Exception:  # noqa: BLE001
-                        logger.warning('回滚卡片快照失败: %s', card_id, exc_info=True)
 
         return _ok(
             synced=len(synced), failed=failed,
-            restored=restored, total=len(card_ids),
+            total=len(card_ids),
         )
 
     @api.http.route('/cards', ['GET'])
@@ -1958,6 +1997,7 @@ def register_routes(api, store) -> None:
         run_filter = str(request.args.get('run_id') or '').strip()
         items_out = []
         runs_out = []
+        seen_notes = {}
         for record in store.list_runs():
             if len(items_out) >= 500:
                 break
@@ -1993,6 +2033,10 @@ def register_routes(api, store) -> None:
                 entry['task'] = task
                 entry['run_created_at'] = created_at
                 entry['seq'] = int(item.get('seq') or position)
+                # 打标结果要带上「卡片现在的本地备注」：用户据此判断落地会不会
+                # 动到自己写的东西（覆盖模式下尤其重要）。
+                if job_type == jobs_module.JOB_ANALYZE:
+                    entry['local_note'] = _local_note_preview(api, entry, seen_notes)
                 items_out.append(entry)
             runs_out.append({
                 'run_id': run_id,
@@ -2001,7 +2045,11 @@ def register_routes(api, store) -> None:
                 'count': len(visible),
                 'created_at': created_at,
             })
-        return _ok(items=items_out, runs=runs_out, total=len(items_out))
+        config = config_module.load_config(api)
+        return _ok(
+            items=items_out, runs=runs_out, total=len(items_out),
+            note_mode=note_merge_core.normalize_mode(config.get('note_mode')),
+        )
 
     @api.http.route('/jobs/<run_id>/items/<path:item_key>/manual-tags', ['POST'])
     @_handle_errors
@@ -2095,6 +2143,11 @@ def register_routes(api, store) -> None:
         else:
             apply_tags_enabled = bool(payload.get('apply_tags', True))
         write_note_enabled = bool(write_spec.get('note', True))
+        # 「简介写进本地备注」的合成策略：请求体里的 `write.note_mode` 优先，
+        # 省略则用配置。用户偏好，不在提交时就烧死（见 write.note 的注释）。
+        note_mode = note_merge_core.normalize_mode(
+            write_spec.get('note_mode', config_module.load_config(api).get('note_mode')),
+        )
         # 只落地被勾选的条目（省略 = 全部 done）
         only_keys = set()
         raw_items = payload.get('items')
@@ -2106,6 +2159,9 @@ def register_routes(api, store) -> None:
         skipped = 0
         stale = 0
         failed = 0
+        # 卡片备注按策略跳过 / 内容未变的条数（不是失败，但要如实回报）
+        skipped_notes = 0
+        note_cache_sync_ids = []
         details = []
 
         # C13 兜底：即使结果里带着「删除某条冻结分类的标签」，落地时也不执行。
@@ -2177,12 +2233,26 @@ def register_routes(api, store) -> None:
                 summary_text = str(result.get('summary') or '').strip()
                 tags = result.get('tags') if isinstance(result.get('tags'), list) else []
 
+                # 「简介写进本地备注」的策略：本次请求可以覆盖，省略则用配置。
+                # 落地时决定（和 write.note / write.tags 同一个原则）：
+                # 同一个作业可以被不同偏好各落地一次，不该在提交时就把策略烧死。
                 if summary_text and write_note_enabled:
                     bridge_result = summary_bridge.write_summary(
-                        api, store, card_id, summary_text, ui_key=ui_key)
+                        api, store, card_id, summary_text, ui_key=ui_key, mode=note_mode)
                     if not bridge_result.get('ok'):
                         details.append({'card_id': card_id,
                                         'warning': f'概览降级写入: {bridge_result.get("message", "")}'})
+                    elif bridge_result.get('skipped'):
+                        # 「按策略跳过 / 内容未变」不是失败，但备注也确实没变，
+                        # 不告诉用户就成了一次无声的空操作。
+                        skipped_notes += 1
+                        details.append({'card_id': card_id,
+                                        'note_skipped': bridge_result['skipped'],
+                                        'message': str(bridge_result.get('message') or '')})
+                    elif (bridge_result.get('origin') == summary_bridge.ORIGIN_CARD_NOTE
+                          and bridge_result.get('changed') is True):
+                        # 只有主程序备注确实写成功且内容发生变化，才需要刷新卡片缓存。
+                        note_cache_sync_ids.append(card_id)
 
                 if apply_tags_enabled:
                     tag_library = read_tag_library(api)
@@ -2295,8 +2365,11 @@ def register_routes(api, store) -> None:
             )
 
         return _ok(applied=applied, skipped=skipped, stale=stale, failed=failed,
+                   notes_skipped=skipped_notes,
+                   note_cache_sync_ids=list(dict.fromkeys(note_cache_sync_ids)),
                    details=details[:50], total=len(items), warnings=warnings,
-                   write={'note': write_note_enabled, 'tags': apply_tags_enabled})
+                   write={'note': write_note_enabled, 'tags': apply_tags_enabled,
+                          'note_mode': note_mode})
 
     @api.http.route('/jobs/<run_id>/cancel', ['POST'])
     @_handle_errors

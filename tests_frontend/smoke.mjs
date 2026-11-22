@@ -596,6 +596,71 @@ async function main() {
     assert.equal(settings.element.hidden, false);
   });
 
+  await check('设置页恢复备注策略默认值后保存 append', async () => {
+    const base = createFakeApi({ pending: 0 });
+    let savedBody = null;
+    const initialSettings = {
+      success: true,
+      model_capabilities: {
+        context_length: 262144,
+        max_output_tokens: 32768,
+        reasoning_enabled: true,
+        reasoning_effort: 'auto',
+      },
+      defaults: {
+        context_length: 262144,
+        max_output_tokens: 32768,
+        reasoning_enabled: true,
+        reasoning_effort: 'auto',
+        note_mode: 'append',
+      },
+      note_mode: 'replace',
+      note_modes: [
+        { value: 'append', label: '接在后面' },
+        { value: 'prepend', label: '接在前面' },
+        { value: 'replace', label: '覆盖' },
+        { value: 'skip', label: '不写' },
+      ],
+    };
+    const patched = {
+      ...base.api,
+      api: (path, options = {}) => {
+        if (path === '/settings') {
+          if (options.method === 'POST') {
+            savedBody = options.body;
+            return {
+              success: true,
+              model_capabilities: initialSettings.model_capabilities,
+              note_mode: options.body.note_mode,
+            };
+          }
+          return initialSettings;
+        }
+        return base.api.api(path, options);
+      },
+    };
+    const { createSettings } = await import('../frontend/views/settings.js');
+    const { createClient } = await import('../frontend/api.js');
+    const settings = createSettings(patched, createClient(patched), {});
+    await settings.refresh();
+
+    const modeSelect = collect(settings.element, (node) => node.classList
+      && node.classList.contains('plugin-stm-ai-assistant-select'))
+      .find((node) => node.value === 'replace');
+    assert.ok(modeSelect, '初始备注策略应为 replace');
+    modeSelect.value = 'replace';
+
+    const buttons = collect(settings.element, (node) => node.tagName === 'BUTTON');
+    buttons.find((node) => String(node.textContent).trim() === '恢复默认').click();
+    assert.equal(modeSelect.value, 'append', '恢复默认必须把备注策略重置为 append');
+
+    collect(settings.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).trim() === '保存模型能力').click();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(savedBody, '保存按钮必须提交设置');
+    assert.equal(savedBody.note_mode, 'append', '保存请求必须包含恢复后的 append');
+  });
+
   await check('设置页：标签池的 ? 说明、每分类规则与保存校验', async () => {
     // 单独一套假 API：`/tag-pool` 返回两个分类，其中「成人」是隔离分类
     const base = createFakeApi({ pending: 0 });
@@ -2576,6 +2641,188 @@ async function main() {
     assert.deepEqual(applyBody.merges[0], { from: ['旧'], to: '新' });
   });
 
+
+  await check('审批面板：概览写入方式可选，默认接在备注后面', async () => {
+    const base = createFakeApi({ pending: 1 });
+    let applyBody = null;
+    let confirmMessage = '';
+    const seenPaths = [];
+    const patched = {
+      ...base.api,
+      ui: {
+        ...((base.api && base.api.ui) || {}),
+        confirm: async ({ message }) => { confirmMessage = message; return true; },
+      },
+      api: (path, options = {}) => {
+        seenPaths.push(String(path));
+        if (String(path).startsWith('/review/queue')) {
+          return {
+            success: true,
+            note_mode: 'append',
+            items: [{
+              key: 'a.json', status: 'done', run_id: 'run-ana', job_type: 'ai.analyze',
+              task: 'analyze', seq: 0,
+              // 卡片现有备注：用户自己写的那部分（后端已剥掉 AI 段）
+              local_note: '我写的备注',
+              result: { card_id: 'a.json', summary: 'AI 概览', tags: [] },
+            }],
+            runs: [{ run_id: 'run-ana', job_type: 'ai.analyze', task: 'analyze', count: 1 }],
+            total: 1,
+          };
+        }
+        if (String(path).includes('/apply')) {
+          applyBody = options.body;
+          return { success: true, applied: 1, notes_skipped: 0 };
+        }
+        return base.api.api(path, options);
+      },
+    };
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
+    await review.refresh();
+
+    // 四种方式都要有单选，且当前选中项来自后端配置（append）
+    const radios = collect(review.element, (n) => n.tagName === 'INPUT'
+      && n.type === 'radio');
+    assert.equal(radios.length, 4, '应有四个写入方式选项');
+    const checked = radios.find((n) => n.checked);
+    assert.ok(checked, '必须有一个默认选中项');
+    assert.equal(checked.value, 'append', '默认必须是「接在后面」，不能是覆盖');
+
+    // 卡片现有备注必须显示出来（覆盖模式下这是用户唯一的警示）。
+    // 桩不实现 textContent 的向下拼接，这里自己收集子树文本。
+    const text = collect(review.element, () => true)
+      .map((node) => String(node.textContent || ''))
+      .join('\n');
+    assert.ok(text.includes('我写的备注'), '应显示卡片现有的本地备注');
+
+    // 切到「不写」再落地。fake DOM 的 dispatchEvent 是空实现，直接调监听器。
+    const skipRadio = radios.find((n) => n.value === 'skip');
+    skipRadio.checked = true;
+    (skipRadio._listeners.get('change') || []).forEach((fn) => fn({
+      preventDefault() {}, stopPropagation() {}, target: skipRadio,
+    }));
+
+    // 服务端仍返回配置默认 append；刷新重建工具栏后，应保留用户手选的 skip。
+    await review.refresh();
+    const refreshedRadios = collect(review.element, (n) => n.tagName === 'INPUT'
+      && n.type === 'radio');
+    assert.equal(refreshedRadios.find((n) => n.checked)?.value, 'skip',
+      '刷新后 radio 选中态必须保留 skip');
+
+    const applyBtn = collect(review.element, (n) => n.tagName === 'BUTTON')
+      .find((n) => String(n.textContent).includes('落地已接受'));
+    applyBtn.click();
+    await new Promise((r) => setTimeout(r, 150));
+
+    assert.ok(applyBody, '必须真的发出落地请求');
+    assert.equal(applyBody.write.note_mode, 'skip', '选中的写入方式要进请求体');
+    assert.ok(confirmMessage.includes('不写入卡片概览'), 'skip 确认文案必须说明不会写入概览');
+    assert.ok(!confirmMessage.includes('将写 1 张卡片的概览'), 'skip 确认文案不能宣称会写概览');
+    assert.ok(!seenPaths.some((path) => path.includes('/cards/note-cache-sync')),
+      'skip 落地后即使刷新回 append，也不能同步未修改的备注缓存');
+  });
+
+  await check('审批面板：关闭概览开关后不触发备注缓存同步', async () => {
+    const base = createFakeApi({ pending: 1 });
+    let applyBody = null;
+    const seenPaths = [];
+    const patched = {
+      ...base.api,
+      ui: { ...base.api.ui, confirm: async () => true },
+      api: (path, options = {}) => {
+        seenPaths.push(String(path));
+        if (String(path).startsWith('/review/queue')) {
+          return {
+            success: true,
+            note_mode: 'append',
+            items: [{
+              key: 'a.json', status: 'done', run_id: 'run-ana', job_type: 'ai.analyze',
+              task: 'analyze', seq: 0,
+              result: { card_id: 'a.json', summary: 'AI 概览', tags: [] },
+            }],
+            runs: [{ run_id: 'run-ana', job_type: 'ai.analyze', task: 'analyze', count: 1 }],
+            total: 1,
+          };
+        }
+        if (String(path).includes('/apply')) {
+          applyBody = options.body;
+          return { success: true, applied: 1 };
+        }
+        return base.api.api(path, options);
+      },
+    };
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
+    await review.refresh();
+
+    const noteToggle = collect(review.element, (node) => node.tagName === 'INPUT'
+      && node.type === 'checkbox')[0];
+    assert.ok(noteToggle, '缺少概览写入开关');
+    noteToggle.checked = false;
+    (noteToggle._listeners.get('change') || []).forEach((fn) => fn({
+      preventDefault() {}, stopPropagation() {}, target: noteToggle,
+    }));
+
+    const applyBtn = collect(review.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes('落地已接受'));
+    applyBtn.click();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    assert.ok(applyBody, '必须真的发出落地请求');
+    assert.equal(applyBody.write.note, false, '关闭概览开关必须体现在请求体');
+    assert.equal(Object.hasOwn(applyBody.write, 'note_mode'), false,
+      '不写概览时不应提交无意义的 note_mode');
+    assert.ok(!seenPaths.some((path) => path.includes('/cards/note-cache-sync')),
+      'write.note=false 后不能同步备注缓存');
+  });
+
+  await check('审批面板：备注缓存同步只使用后端确认成功且变更的卡片', async () => {
+    const base = createFakeApi({ pending: 1 });
+    let syncBody = null;
+    const patched = {
+      ...base.api,
+      ui: { ...base.api.ui, confirm: async () => true },
+      api: (path, options = {}) => {
+        if (String(path).startsWith('/review/queue')) {
+          return {
+            success: true,
+            note_mode: 'append',
+            items: [{
+              key: 'a.json', status: 'done', run_id: 'run-ana', job_type: 'ai.analyze',
+              task: 'analyze', seq: 0,
+              result: { card_id: 'a.json', summary: 'AI 概览', tags: [] },
+            }],
+            runs: [{ run_id: 'run-ana', job_type: 'ai.analyze', task: 'analyze', count: 1 }],
+            total: 1,
+          };
+        }
+        if (String(path).includes('/apply')) {
+          return { success: true, applied: 1, note_cache_sync_ids: ['confirmed.json'] };
+        }
+        if (String(path).includes('/cards/note-cache-sync')) {
+          syncBody = options.body;
+          return { success: true, synced: 1, failed: [] };
+        }
+        return base.api.api(path, options);
+      },
+    };
+    const { createReview } = await import('../frontend/views/review.js');
+    const { createClient } = await import('../frontend/api.js');
+    const review = createReview(patched, createClient(patched), { notifyReview: () => {} });
+    await review.refresh();
+
+    const applyBtn = collect(review.element, (node) => node.tagName === 'BUTTON')
+      .find((node) => String(node.textContent).includes('落地已接受'));
+    applyBtn.click();
+    await new Promise((resolve) => setTimeout(resolve, 180));
+
+    assert.ok(syncBody, '后端返回变更清单后必须触发缓存同步');
+    assert.deepEqual(syncBody.card_ids, ['confirmed.json'],
+      '缓存同步只能使用后端确认成功且变更的卡片 ID');
+  });
 
   await check('落地只刷新一次、且备注同步只针对打标作业', async () => {
     const base = createFakeApi({ pending: 1 });

@@ -87,9 +87,11 @@ def stub_bridge(monkeypatch):
     """打桩概览 bridge：默认成功写入主程序侧。"""
     written = {}
 
-    def fake_write_summary(api_obj, store_obj, card_id, summary, *, ui_key=''):
+    def fake_write_summary(api_obj, store_obj, card_id, summary, *, ui_key='', mode=''):
         written[str(card_id)] = str(summary)
-        return {'ok': True, 'origin': 'ui_data', 'ui_key': ui_key or card_id, 'message': ''}
+        return {'ok': True, 'origin': 'card_note', 'ui_key': ui_key or card_id, 'message': '',
+                'mode': mode, 'kept_chars': 0, 'summary_chars': len(str(summary)),
+                'changed': True, 'skipped': ''}
 
     monkeypatch.setattr(jobs_module.summary_bridge, 'write_summary', fake_write_summary)
     monkeypatch.setattr(jobs_module.summary_bridge, 'resolve_key', lambda api_obj, card_id: str(card_id))
@@ -175,7 +177,8 @@ def test_auto_mode_writes_summary_and_merges_tags(api, store, stub_llm, stub_bri
 
     result = ctx.reports[0]['result']
     assert result['applied'] is True
-    assert result['summary_origin'] == 'ui_data'
+    assert result['summary_origin'] == 'card_note'
+    assert result['summary_changed'] is True
     assert result['tags_applied'] == ['奇幻']
     # 「骑士」不在标签库中 → 只进建议队列，不写入卡片
     assert result['tags_suggested'] == ['北境', '骑士']
@@ -183,6 +186,45 @@ def test_auto_mode_writes_summary_and_merges_tags(api, store, stub_llm, stub_bri
         {'name': '北境', 'reason': '标签库中不存在'},
         {'name': '骑士', 'reason': '标签库中不存在'},
     ]
+    history = store.history_entries_for_run(ctx.run_id)
+    assert len(history) == 1
+    assert history[0]['job_type'] == 'ai.analyze'
+    assert history[0]['summary_origin'] == 'card_note'
+    assert history[0]['summary_changed'] is True
+
+
+@pytest.mark.parametrize(('bridge_result', 'expected_changed'), [
+    ({'ok': True, 'origin': 'card_note', 'changed': True, 'skipped': ''}, True),
+    ({'ok': True, 'origin': '', 'changed': False, 'skipped': 'mode_skip'}, False),
+    ({'ok': True, 'origin': 'card_note', 'changed': False, 'skipped': 'unchanged'}, False),
+    ({'ok': False, 'origin': 'namespace', 'changed': True, 'skipped': ''}, False),
+])
+def test_auto_records_only_changed_card_note_for_cache_sync(
+    api, store, stub_llm, monkeypatch, bridge_result, expected_changed,
+):
+    monkeypatch.setattr(
+        jobs_module.summary_bridge, 'write_summary',
+        lambda *a, **k: dict(bridge_result),
+    )
+    monkeypatch.setattr(
+        jobs_module.summary_bridge, 'resolve_key', lambda api_obj, card_id: str(card_id),
+    )
+
+    ctx = run_job(api, store, payload={'apply_mode': 'auto'})
+    result = ctx.reports[0]['result']
+    note_action = next(
+        action for action in result['actions']
+        if action['action'] == 'write_card_note'
+    )
+    history = store.history_entries_for_run(ctx.run_id)
+
+    assert note_action['changed'] is bridge_result['changed']
+    assert note_action['origin'] == bridge_result['origin']
+    assert result['summary_origin'] == bridge_result['origin']
+    assert result['summary_changed'] is expected_changed
+    assert len(history) == 1  # 标签动作仍会产生历史，不代表备注发生了变化。
+    assert history[0]['summary_origin'] == bridge_result['origin']
+    assert history[0]['summary_changed'] is expected_changed
 
 
 def test_saved_limits_reach_prompt_and_truncation(api, store, monkeypatch, stub_bridge):
@@ -428,6 +470,8 @@ def test_bridge_failure_degrades_to_namespace(api, store, stub_llm, monkeypatch)
     note = [a for a in result['actions'] if a['action'] == 'write_card_note'][0]
     assert note['ok'] is False
     assert note['origin'] == 'namespace'
+    assert note['changed'] is False
+    assert result['summary_changed'] is False
 
 
 # ------------------------------------------------------------------ review / dry-run
